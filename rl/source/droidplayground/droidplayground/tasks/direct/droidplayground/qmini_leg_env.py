@@ -32,7 +32,7 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     robot_cfg: ArticulationCfg = QMINI_CFG.replace(prim_path="/World/envs/env_.*/Robot")
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=1.0, replicate_physics=True)
 
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg

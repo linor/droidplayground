@@ -41,8 +41,8 @@ QMINI_CFG = ArticulationCfg(
             velocity_limit_sim=10.8,        # rad/s, 103 rpm
 
             # velocity drive: stiffness = 0, damping = velocity gain
-            stiffness=0.0,
-            damping=4,
+            stiffness=50.0,
+            damping=0.0,
         )
     }
 )
