@@ -13,6 +13,7 @@ from isaaclab.utils import configclass
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from droidplayground.assets.qmini import QMINI_CFG
+from .phase_modulator import PhaseModulator
 
 @configclass
 class QminiLegEnvCfg(DirectRLEnvCfg):
@@ -21,7 +22,7 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     episode_length_s = 5.0
     # - spaces definition
     action_space = 3
-    observation_space = 4
+    observation_space = 8
     state_space = 0
     action_scale = 0.5
 
@@ -44,6 +45,26 @@ class QminiLegEnv(DirectRLEnv):
         for joint_id, joint_name in enumerate(self.robot.joint_names):
             print(f"  {joint_id:2d}: {joint_name}")
 
+        self.num_phases = 1
+        self.phase_frequency = 0.5  # Hz: one complete cycle every 2 seconds
+
+        self.phase_modulator = PhaseModulator(
+            time_step=self.step_dt,
+            num_envs=self.num_envs,
+            device=self.device,
+        )     
+
+        all_env_ids = torch.arange(
+            self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        self.phase_modulator.reset(
+            env_ids=all_env_ids,
+            deterministic=self.render_mode is not None,
+        )   
+
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         # add ground plane
@@ -61,13 +82,26 @@ class QminiLegEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
+        self.phase_modulator.compute()
+
+        self.actions[:, 0] = 0.0
+        self.actions[:, 2] = 0.0        
 
     def _get_observations(self):
+        phase = self.phase_modulator.phase
+
+        observations = torch.cat(
+            (
+                torch.sin(phase),                    # 1
+                torch.cos(phase),                    # 1
+                self.robot.data.joint_pos[:, :3],   # 3
+                self.robot.data.joint_vel[:, :3],   # 3
+            ),
+            dim=-1,
+        )
+        
         return {
-            "policy": torch.zeros(
-                (self.num_envs, self.cfg.observation_space),
-                device=self.device,
-            )
+            "policy": observations
         }
 
     def _apply_action(self) -> None:
@@ -85,11 +119,21 @@ class QminiLegEnv(DirectRLEnv):
         )
 
     def _get_rewards(self) -> torch.Tensor:
-        return torch.ones(
-            self.num_envs,
-            dtype=torch.float32,
-            device=self.device,
+        phase = self.phase_modulator.phase[:, 0]
+
+        target_position = 0.5 * torch.sin(phase)
+        actual_position = self.robot.data.joint_pos[:, 1]
+        actual_velocity = self.robot.data.joint_vel[:, 1]
+
+        tracking_error = actual_position - target_position
+
+        tracking_reward = torch.exp(
+            -5.0 * tracking_error.square()
         )
+
+        velocity_penalty = 0.001 * actual_velocity.square()
+
+        return tracking_reward - velocity_penalty
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         terminated = torch.zeros(
@@ -105,3 +149,11 @@ class QminiLegEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
+
+        self.phase_modulator.reset(
+            env_ids=env_ids,
+            deterministic=self.render_mode is not None,
+        )
+
+
+        
