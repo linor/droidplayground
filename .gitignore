@@ -68,3 +68,6 @@ tests/
 
 # Isaac Lab
 IsaacLab/
+
+# Unitree Actuator
+unitree_actuator_sdk/
