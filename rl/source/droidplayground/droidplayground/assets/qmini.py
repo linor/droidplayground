@@ -54,8 +54,8 @@ QMINI_CFG = ArticulationCfg(
         # If the joint oscillates, increase damping first. If it's sluggish but stable, increase stiffness.
         "hip_pitch": DCMotorCfg(
             joint_names_expr=[".*pitch"],
-            stiffness=140.0,
-            damping=5.0,
+            stiffness=2.0,
+            damping=0.05,
             effort_limit=18.0,
             saturation_effort=23.7,
             velocity_limit=30.0,
@@ -64,8 +64,8 @@ QMINI_CFG = ArticulationCfg(
 
         "knee": DCMotorCfg(
             joint_names_expr=[".*knee"],
-            stiffness=180.0,
-            damping=6.0,
+            stiffness=2.0,
+            damping=0.05,
             effort_limit=18.0,
             saturation_effort=23.7,
             velocity_limit=30.0,
@@ -74,8 +74,8 @@ QMINI_CFG = ArticulationCfg(
 
         "ankle": DCMotorCfg(
             joint_names_expr=[".*ankle"],
-            stiffness=90.0,
-            damping=3.0,
+            stiffness=2.0,
+            damping=0.05,
             effort_limit=18.0,
             saturation_effort=23.7,
             velocity_limit=30.0,
