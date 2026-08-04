@@ -19,16 +19,16 @@ from .motion_player import MotionPlayer
 @configclass
 class QminiLegEnvCfg(DirectRLEnvCfg):
     # env
-    decimation = 2
+    decimation = 4
     episode_length_s = 5.0
     # - spaces definition
     action_space = 3
-    observation_space = 9
+    observation_space = 7
     state_space = 0
     action_scale = 0.5
 
     # simulation
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation)
 
     # robot(s)
     robot_cfg: ArticulationCfg = QMINI_CFG.replace(prim_path="/World/envs/env_.*/Robot")
@@ -59,28 +59,20 @@ class QminiLegEnv(DirectRLEnv):
                 # time, [hip, knee, ankle]
 
                 # leg lifted
-                (0.0, [20, -50, 30]),
+                (0.0, [-20, 50, 30]),
 
                 # leg passing through
-                (0.4, [5, -20, 10]),
+                (0.4, [-5, 20, 10]),
 
                 # leg extended
-                (0.8, [-15, 10, 5]),
+                (0.8, [15, -10, 5]),
 
                 # return swing
-                (1.2, [5, -20, 10]),
+                (1.2, [-5, 20, 10]),
 
                 # back to lifted
-                (1.6, [20, -50, 30]),
+                (1.6, [-20, 50, 30]),
             ],
-            # Same motion, half the speed.
-            # keyframes=[
-            #     (0.0, [20, -50, -30]),
-            #     (0.6, [5, -20, -10]),
-            #     (1.2, [-15, 10, -5]),
-            #     (1.8, [5, -20, -10]),
-            #     (2.4, [20, -50, -30]),
-            # ],
             device=self.device,
             degrees=True,
         )
@@ -134,7 +126,7 @@ class QminiLegEnv(DirectRLEnv):
 
     def _get_observations(self):
         # phase = self.phase_modulator.phase
-        reference = self.motion.sample(self.motion_time)
+        # reference = self.motion.sample(self.motion_time)
 
         # observations = torch.cat(
         #     (
@@ -149,7 +141,8 @@ class QminiLegEnv(DirectRLEnv):
             (
                 self.robot.data.joint_pos[:, :3],
                 self.robot.data.joint_vel[:, :3],
-                reference,
+                # reference,
+                self.motion_time.unsqueeze(1)
             ),
             dim=-1
         )
@@ -166,12 +159,13 @@ class QminiLegEnv(DirectRLEnv):
         #     self.robot.data.default_joint_pos[:, joint_ids]
         #     + self.cfg.action_scale * self.actions[:, :num_actions]
         # )
-        reference = self.motion.sample(self.motion_time)
+        # reference = self.motion.sample(self.motion_time)
 
-        position_targets = (
-            reference
-            + 0.15*self.actions
-        )
+        # position_targets = (
+        #     reference
+        #     + 0.15*self.actions
+        # )
+        position_targets = (self.actions)
 
         self.robot.set_joint_position_target(
             position_targets,
