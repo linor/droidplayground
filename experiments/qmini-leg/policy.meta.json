@@ -1,5 +1,5 @@
 {
-  "obs_dim": 9,
+  "obs_dim": 7,
   "action_dim": 3,
   "joint_order": [
     "hip",

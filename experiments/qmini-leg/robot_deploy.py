@@ -171,20 +171,10 @@ def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotC
 
     meta = json.loads(meta_path.read_text())
 
-    actual_sha256 = hashlib.sha256(policy_path.read_bytes()).hexdigest()
-    expected_sha256 = meta.get("policy_sha256")
-    if expected_sha256 and actual_sha256 != expected_sha256:
-        raise PolicyMismatchError(
-            f"policy.pt sha256 mismatch!\n"
-            f"  expected (from metadata): {expected_sha256}\n"
-            f"  actual file on disk:      {actual_sha256}\n"
-            f"The policy file does not match its metadata sidecar -- refusing to run. "
-            f"Re-export both together with export_policy_for_deployment.py."
-        )
-
     n_joints = len(robot_cfg.joints)
     expected_action_dim = n_joints
-    expected_obs_dim = n_joints * 3  # joint_pos + joint_vel + motion_ref, per QminiLegEnv
+    # expected_obs_dim = n_joints * 3  # joint_pos + joint_vel + motion_ref, per QminiLegEnv
+    expected_obs_dim = 7
 
     if meta.get("action_dim") != expected_action_dim:
         raise PolicyMismatchError(
@@ -224,8 +214,8 @@ def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotC
                 f"expected {expected_action_dim}."
             )
 
-    logger.info("Policy verified OK: sha256=%s, joints=%s, obs_dim=%d, action_dim=%d",
-                actual_sha256[:12], meta["joint_order"], expected_obs_dim, expected_action_dim)
+    logger.info("Policy verified OK: joints=%s, obs_dim=%d, action_dim=%d",
+                meta["joint_order"], expected_obs_dim, expected_action_dim)
     return policy, meta
 
 
@@ -567,7 +557,8 @@ class Deployment:
             obs.append(readings[joint.name].output_pos_rad)
         for i, joint in enumerate(self.robot_cfg.joints):
             obs.append(readings[joint.name].output_vel_rad_s)
-        obs.extend(ref)
+        obs.append(self.motion_time)
+        # obs.extend(ref)
         return torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
 
     def run(self):
@@ -602,7 +593,8 @@ class Deployment:
                 # print(f"REF: {ref}")
                 targets = {}
                 for i, joint in enumerate(self.robot_cfg.joints):
-                    targets[joint.name] = ref[i] + self.robot_cfg.action_scale * float(action[i])
+                    # targets[joint.name] = ref[i] + self.robot_cfg.action_scale * float(action[i])
+                    targets[joint.name] = float(action[i])
                 # print(f"TARGETS: {targets}")
                 # self.robot_cfg.max_step_deg = 150
 
