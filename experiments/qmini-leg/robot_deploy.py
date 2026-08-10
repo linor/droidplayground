@@ -238,6 +238,16 @@ class MotionReference:
         ]
         self.length = self.times[-1]  # assumes first/last keyframe match, i.e. a closed loop
 
+    @classmethod
+    def from_json(cls, path: Path) -> "MotionReference":
+        """Load keyframes from the shared keyframes.json (see that file's
+        _warning field) instead of a hardcoded DEFAULT_KEYFRAMES_DEG copy.
+        Kept as a separate constructor rather than changing __init__'s
+        signature so DEFAULT_KEYFRAMES_DEG below still works unmodified for
+        anyone not yet using the shared file."""
+        raw = json.loads(Path(path).read_text())
+        return cls(raw["keyframes"], degrees=raw.get("degrees", True))
+
     def sample(self, t: float):
         t = t % self.length
         for i in range(len(self.times) - 1):
@@ -503,13 +513,23 @@ def setup_logging(log_dir: Path):
 
 
 def write_csv_header(csv_writer, joint_names):
-    header = ["t", "motion_time"]
+    # NOTE: this must match build_obs()'s actual layout exactly (pos x N,
+    # then vel x N, then a single motion_time scalar -- NOT an obs_ref per
+    # joint, which build_obs() computes but never appends). The previous
+    # version of this header didn't match, which silently shifted every
+    # column after it by 2. If you've since added `ref` back into build_obs
+    # (the commented-out `obs.extend(ref)` line), update this to match.
+    header = ["t_wall", "motion_time"]  # t_wall = measured perf_counter() time since run() started
     for name in joint_names:
-        header += [f"obs_pos_{name}", f"obs_vel_{name}", f"obs_ref_{name}"]
+        header += [f"obs_pos_{name}"]
+    for name in joint_names:
+        header += [f"obs_vel_{name}"]
+    header += ["obs_motion_time"]
     for name in joint_names:
         header += [f"action_{name}"]
     for name in joint_names:
         header += [f"target_deg_{name}", f"actual_deg_{name}", f"temp_{name}", f"err_{name}"]
+    header += ["policy_ms", "bus_ms"]  # per-step timing breakdown, see analyze_delay.py
     csv_writer.writerow(header)
 
 
@@ -518,16 +538,53 @@ def write_csv_header(csv_writer, joint_names):
 # ---------------------------------------------------------------------------
 
 class Deployment:
-    def __init__(self, robot_cfg: RobotConfig, policy, port: str, log_dir: Path):
+    def __init__(
+        self,
+        robot_cfg: RobotConfig,
+        policy,
+        port: str,
+        log_dir: Path,
+        keyframes_path: Optional[Path] = None,
+        open_loop_ref: bool = False,
+        startup_pose: str = "auto",
+        startup_move_duration: float = 2.0,
+    ):
         self.robot_cfg = robot_cfg
         self.policy = policy
+        self.open_loop_ref = open_loop_ref
         self.logger, self.csv_writer, self.csv_file, csv_path = setup_logging(log_dir)
         self.logger.info("Logging control loop to %s", csv_path)
         write_csv_header(self.csv_writer, robot_cfg.joint_names)
+        if open_loop_ref:
+            self.logger.warning(
+                "Running in --open-loop-ref mode: the policy is loaded but NOT "
+                "used, joint targets are the raw motion reference. This is for "
+                "sim/real matching (tune_pid_isaaclab.py), not normal operation."
+            )
 
         self.bus = MotorBus(port, robot_cfg.joints, self.logger)
-        self.motion = MotionReference(DEFAULT_KEYFRAMES_DEG, degrees=True)
+        if keyframes_path is not None:
+            self.motion = MotionReference.from_json(keyframes_path)
+            self.logger.info("Loaded keyframes from %s", keyframes_path)
+        else:
+            self.motion = MotionReference(DEFAULT_KEYFRAMES_DEG, degrees=True)
+            self.logger.warning(
+                "Using hardcoded DEFAULT_KEYFRAMES_DEG, not the shared "
+                "keyframes.json -- pass --keyframes to avoid sim/real drift."
+            )
         self.motion_time = 0.0
+
+        # "auto" resolves to "keyframe" if a keyframes file/reference was
+        # explicitly requested (--keyframes or --open-loop-ref), else
+        # "zero" -- matching how QminiLegEnv trains from a zero joint_pos
+        # init_state (see qmini.py's ArticulationCfg.InitialStateCfg) when
+        # there's no reference trajectory involved.
+        if startup_pose == "auto":
+            startup_pose = "keyframe" if (keyframes_path is not None or open_loop_ref) else "zero"
+        if startup_pose not in ("zero", "keyframe", "none"):
+            raise ValueError(f"Unknown --startup-pose '{startup_pose}', expected zero|keyframe|none|auto")
+        self.startup_pose_mode = startup_pose
+        self.startup_move_duration = startup_move_duration
 
         self._stop = False
         signal.signal(signal.SIGINT, self._handle_stop_signal)
@@ -536,6 +593,60 @@ class Deployment:
     def _handle_stop_signal(self, signum, frame):
         self.logger.warning("Received signal %s -- stopping and releasing motors.", signum)
         self._stop = True
+
+    def _startup_pose_targets(self) -> dict:
+        if self.startup_pose_mode == "zero":
+            return {j.name: 0.0 for j in self.robot_cfg.joints}
+        elif self.startup_pose_mode == "keyframe":
+            ref = self.motion.sample(0.0)
+            return {joint.name: ref[i] for i, joint in enumerate(self.robot_cfg.joints)}
+        else:
+            raise ValueError(f"_startup_pose_targets() called with mode='none'")
+
+    def move_to_pose(self, target_output_rad: dict, duration: float):
+        """
+        Smoothly ramps every joint from its CURRENT position (freshly read,
+        not assumed) to target_output_rad over `duration` seconds, at
+        robot_cfg.control_dt and each joint's normal kp/kd. Splits the move
+        into enough steps that no single step should exceed half of
+        robot_cfg.max_step_deg, extending the move beyond `duration` if the
+        requested duration would require bigger steps than that -- slower
+        and safe beats fast and tripping the StepLimitExceeded abort
+        partway through a startup move.
+        """
+        dt = self.robot_cfg.control_dt
+        readings = {j.name: self.bus.read_motor(j) for j in self.robot_cfg.joints}
+        current = {name: r.output_pos_rad for name, r in readings.items()}
+
+        max_step_rad = math.radians(self.robot_cfg.max_step_deg)
+        max_delta = max(abs(target_output_rad[name] - current[name]) for name in current)
+        min_steps_for_safety = max(1, math.ceil(max_delta / (max_step_rad * 0.5)))
+        n_steps = max(min_steps_for_safety, max(1, int(round(duration / dt))))
+        actual_duration = n_steps * dt
+
+        self.logger.info(
+            "Moving to '%s' startup pose over %.2fs (%d steps @ %.0fms, largest joint delta %.1f deg)...",
+            self.startup_pose_mode, actual_duration, n_steps, dt * 1000, math.degrees(max_delta),
+        )
+
+        try:
+            for step in range(1, n_steps + 1):
+                step_start = time.perf_counter()
+                alpha = step / n_steps
+                targets = {
+                    name: current[name] + alpha * (target_output_rad[name] - current[name])
+                    for name in current
+                }
+                self.bus.send_targets(targets, self.robot_cfg.max_step_deg, self.logger)
+                elapsed = time.perf_counter() - step_start
+                if elapsed < dt:
+                    time.sleep(dt - elapsed)
+        except StepLimitExceeded as e:
+            self.logger.error("SAFETY ABORT during startup move: %s", e)
+            self.bus.release_all()
+            raise
+
+        self.logger.info("Startup pose reached.")
 
     def startup_sequence(self):
         self.logger.info("Calibrating from current motor positions...")
@@ -550,6 +661,9 @@ class Deployment:
             self.logger.info("User declined startup confirmation. Exiting without enabling motors.")
             sys.exit(0)
 
+        if self.startup_pose_mode != "none":
+            self.move_to_pose(self._startup_pose_targets(), self.startup_move_duration)
+
     def build_obs(self, readings: dict) -> torch.Tensor:
         ref = self.motion.sample(self.motion_time)
         obs = []
@@ -563,49 +677,46 @@ class Deployment:
 
     def run(self):
         dt = self.robot_cfg.control_dt
-        # dt = 0.05
-        # dt = 1 / 120
         step = 0
+        run_start = time.perf_counter()
         try:
             new_readings = {j.name: self.bus.read_motor(j) for j in self.robot_cfg.joints}
             while not self._stop:
                 loop_start = time.perf_counter()
 
-                # readings = {j.name: self.bus.read_motor(j) for j in self.robot_cfg.joints}
                 readings = new_readings
-                # print(f"READINGS: {readings}")
 
                 print(f"HIP: {math.degrees(readings['hip'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['ankle'].output_pos_rad):10.5f}")
 
                 obs = self.build_obs(readings)
-                # print(f"OBS: {obs}")
-
-                with torch.no_grad():
-                    action = self.policy(obs).squeeze(0).numpy()
-                # print(f"ACTION: {action}")
-                action = action.clip(-1.0, 1.0)
-                # print(f"ACTION (CLIPPED): {action}")
-                # action = [0,0,0]
-                # self.robot_cfg.action_scale = 0.05
 
                 ref = self.motion.sample(self.motion_time)
-                # print(f"TIME: {self.motion_time}")
-                # print(f"REF: {ref}")
-                targets = {}
-                for i, joint in enumerate(self.robot_cfg.joints):
-                    # targets[joint.name] = ref[i] + self.robot_cfg.action_scale * float(action[i])
-                    targets[joint.name] = float(action[i])
-                # print(f"TARGETS: {targets}")
-                # self.robot_cfg.max_step_deg = 150
 
+                policy_start = time.perf_counter()
+                if self.open_loop_ref:
+                    # Bypass the policy entirely -- targets are the raw
+                    # reference trajectory. Used to capture a real-robot
+                    # trace to compare against tune_pid_isaaclab.py.
+                    action = [0.0] * len(self.robot_cfg.joints)
+                    targets = {joint.name: ref[i] for i, joint in enumerate(self.robot_cfg.joints)}
+                else:
+                    with torch.no_grad():
+                        action = self.policy(obs).squeeze(0).numpy()
+                    action = action.clip(-1.0, 1.0)
+                    targets = {joint.name: float(action[i]) for i, joint in enumerate(self.robot_cfg.joints)}
+                policy_ms = (time.perf_counter() - policy_start) * 1000.0
+
+                bus_start = time.perf_counter()
                 try:
                     new_readings = self.bus.send_targets(targets, self.robot_cfg.max_step_deg, self.logger)
                 except StepLimitExceeded as e:
                     self.logger.error("SAFETY ABORT: %s", e)
                     self.bus.release_all()
                     raise
+                bus_ms = (time.perf_counter() - bus_start) * 1000.0
 
-                self._log_step(step, readings, obs, action, targets, new_readings)
+                t_wall = loop_start - run_start
+                self._log_step(step, t_wall, readings, obs, action, targets, new_readings, policy_ms, bus_ms)
 
                 self.motion_time = (self.motion_time + dt) % self.motion.length
                 step += 1
@@ -615,14 +726,22 @@ class Deployment:
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 elif elapsed > dt * 1.5:
-                    self.logger.warning("Control loop overrun: %.1f ms (target %.1f ms)", elapsed * 1000, dt * 1000)
+                    self.logger.warning(
+                        "Control loop overrun: %.1f ms (target %.1f ms) -- policy %.1f ms, bus %.1f ms",
+                        elapsed * 1000, dt * 1000, policy_ms, bus_ms,
+                    )
         finally:
             self.bus.release_all()
             self.csv_file.close()
             self.logger.info("Deployment stopped, motors released, log file closed.")
 
-    def _log_step(self, step, readings, obs, action, targets, new_readings):
-        row = [step * self.robot_cfg.control_dt, self.motion_time]
+    def _log_step(self, step, t_wall, readings, obs, action, targets, new_readings, policy_ms, bus_ms):
+        # NOTE: 't' is now the measured wall-clock time since run() started,
+        # NOT step * control_dt. If your loop is overrunning control_dt
+        # (watch the "Control loop overrun" warnings), those two diverge --
+        # use this column, not the step index, when aligning against sim
+        # traces or computing achieved control rate.
+        row = [t_wall, self.motion_time]
         obs_list = obs.squeeze(0).tolist()
         row += obs_list
         row += list(action)
@@ -634,6 +753,7 @@ class Deployment:
                 r.temperature if r.temperature is not None else "",
                 r.error_flag if r.error_flag is not None else "",
             ]
+        row += [policy_ms, bus_ms]
         self.csv_writer.writerow(row)
         if step % 50 == 0:
             self.csv_file.flush()
@@ -642,10 +762,42 @@ class Deployment:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, required=True, help="robot_config.json")
-    parser.add_argument("--policy", type=Path, required=True, help="policy.pt (TorchScript)")
-    parser.add_argument("--policy-meta", type=Path, required=True, help="policy.meta.json")
+    parser.add_argument(
+        "--policy", type=Path, default=None,
+        help="policy.pt (TorchScript). Required unless --open-loop-ref is set.",
+    )
+    parser.add_argument(
+        "--policy-meta", type=Path, default=None,
+        help="policy.meta.json. Required unless --open-loop-ref is set.",
+    )
     parser.add_argument("--port", type=str, required=True, help="e.g. /dev/ttyUSB0")
     parser.add_argument("--log-dir", type=Path, default=Path("./logs"))
+    parser.add_argument(
+        "--keyframes", type=Path, default=None,
+        help="Path to shared keyframes.json. If omitted, falls back to the "
+             "hardcoded DEFAULT_KEYFRAMES_DEG (logs a warning).",
+    )
+    parser.add_argument(
+        "--open-loop-ref", action="store_true",
+        help="Bypass the policy and command the raw motion reference "
+             "directly. Use this to capture a real-robot trace for "
+             "tune_pid_isaaclab.py -- NOT for normal operation.",
+    )
+    parser.add_argument(
+        "--startup-pose", type=str, default="auto", choices=["auto", "zero", "keyframe", "none"],
+        help="Pose to smoothly move to after calibration, before the "
+             "control loop starts. 'auto' (default) picks 'keyframe' "
+             "(keyframes[0]) if --keyframes/--open-loop-ref is set, else "
+             "'zero'. 'none' skips the move (old behavior -- the first "
+             "policy/reference action jumps straight from calibration "
+             "pose, subject to --max-step-deg).",
+    )
+    parser.add_argument(
+        "--startup-move-duration", type=float, default=2.0,
+        help="Seconds to spend ramping to --startup-pose. Extended "
+             "automatically if that would require per-step moves close to "
+             "--max-step-deg.",
+    )
     args = parser.parse_args()
 
     logger = logging.getLogger("robot_deploy.startup")
@@ -653,9 +805,20 @@ def main():
 
     robot_cfg = RobotConfig.load(args.config)
 
-    policy, meta = load_and_verify_policy(args.policy, args.policy_meta, robot_cfg, logger)
+    if args.open_loop_ref:
+        if args.policy or args.policy_meta:
+            logger.info("--open-loop-ref set: ignoring --policy/--policy-meta, the policy will not be called.")
+        policy = None
+    else:
+        if not args.policy or not args.policy_meta:
+            parser.error("--policy and --policy-meta are required unless --open-loop-ref is set.")
+        policy, meta = load_and_verify_policy(args.policy, args.policy_meta, robot_cfg, logger)
 
-    deployment = Deployment(robot_cfg, policy, args.port, args.log_dir)
+    deployment = Deployment(
+        robot_cfg, policy, args.port, args.log_dir,
+        keyframes_path=args.keyframes, open_loop_ref=args.open_loop_ref,
+        startup_pose=args.startup_pose, startup_move_duration=args.startup_move_duration,
+    )
     try:
         deployment.startup_sequence()
         deployment.run()

@@ -10,6 +10,61 @@ from droidplayground.assets import ASSET_USD_DIRECTORY
 # Configuration
 ##
 
+# Output-side (joint-space) stiffness/damping/armature per actuator group.
+# These are also the values a real GO-M8010-6 deployment must convert to
+# rotor-side via kp_rotor = kp_output / gear_ratio**2 (see robot_deploy.py's
+# MotorBus.send_targets). Keep this dict as the single source of truth for
+# "current best sim gains" -- both QMINI_CFG below and build_qmini_cfg()
+# read from it.
+DEFAULT_GAINS = {
+    "hip_pitch": dict(stiffness=75.0, damping=0.3, armature=0.002),
+    "knee": dict(stiffness=45.0, damping=0.5, armature=0.002),
+    "ankle": dict(stiffness=30.0, damping=0.25, armature=0.002),
+}
+
+
+def build_qmini_cfg(gains: dict | None = None) -> ArticulationCfg:
+    """Return a QMINI ArticulationCfg with actuator gains optionally overridden.
+
+    Use this instead of the module-level QMINI_CFG constant whenever you need
+    to change stiffness/damping/armature after import time -- e.g. sweeping
+    values in tune_pid_isaaclab.py, or sampling per-episode randomized gains
+    in QminiLegEnv's domain randomization.
+
+    Args:
+        gains: optional dict keyed by actuator group name
+            ("hip_pitch" | "knee" | "ankle"), each value a dict with any of
+            "stiffness" / "damping" / "armature". Fields not given for a
+            group fall back to DEFAULT_GAINS for that group. Example:
+
+                build_qmini_cfg({
+                    "hip_pitch": {"stiffness": 75.0, "damping": 0.3},
+                    "knee":      {"stiffness": 45.0, "damping": 0.5},
+                    "ankle":     {"stiffness": 30.0, "damping": 0.25},
+                })
+
+    NOTE: not run against a real isaaclab install in this session -- this
+    relies on DCMotorCfg / ArticulationCfg supporting .replace(**kwargs) the
+    same way QMINI_CFG.replace(prim_path=...) is used elsewhere in this repo
+    (qmini_leg_env.py, isaac_sim_unitree_backend.py). If your isaaclab
+    version's configclass doesn't support .replace() the way I'm assuming,
+    swap this for dataclasses.replace(actuator_cfg, **overrides).
+    """
+    merged = {name: dict(vals) for name, vals in DEFAULT_GAINS.items()}
+    if gains:
+        for name, overrides in gains.items():
+            if name not in merged:
+                raise KeyError(
+                    f"Unknown actuator group '{name}', expected one of {list(merged)}"
+                )
+            merged[name].update(overrides)
+
+    new_actuators = {}
+    for name, actuator_cfg in QMINI_CFG.actuators.items():
+        new_actuators[name] = actuator_cfg.replace(**merged[name])
+    return QMINI_CFG.replace(actuators=new_actuators)
+
+
 QMINI_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=f"{ASSET_USD_DIRECTORY}/qmini_urdf.usda",
@@ -52,36 +107,31 @@ QMINI_CFG = ArticulationCfg(
         # armature = 0.002  # kg·m²
 
         # If the joint oscillates, increase damping first. If it's sluggish but stable, increase stiffness.
+        # Gains come from DEFAULT_GAINS above -- edit that dict, not these
+        # literals, so build_qmini_cfg()'s "fall back to defaults" behavior
+        # stays consistent with what QMINI_CFG itself spawns with.
         "hip_pitch": DCMotorCfg(
             joint_names_expr=[".*pitch"],
-            stiffness=2.0,
-            damping=0.05,
             effort_limit=18.0,
             saturation_effort=23.7,
             velocity_limit=30.0,
-            armature = 0.002,  # kg·m²
+            **DEFAULT_GAINS["hip_pitch"],
         ),
 
         "knee": DCMotorCfg(
             joint_names_expr=[".*knee"],
-            stiffness=2.0,
-            damping=0.05,
             effort_limit=18.0,
             saturation_effort=23.7,
             velocity_limit=30.0,
-            armature = 0.002,  # kg·m²
+            **DEFAULT_GAINS["knee"],
         ),
 
         "ankle": DCMotorCfg(
             joint_names_expr=[".*ankle"],
-            stiffness=2.0,
-            damping=0.05,
             effort_limit=18.0,
             saturation_effort=23.7,
             velocity_limit=30.0,
-            armature = 0.002,  # kg·m²
-        )
-
-
+            **DEFAULT_GAINS["ankle"],
+        ),
     }
 )

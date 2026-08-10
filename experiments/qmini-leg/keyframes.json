@@ -1,0 +1,13 @@
+{
+  "_comment": "Canonical reference trajectory, extracted verbatim from qmini_leg_env.py's MotionPlayer keyframes (the training source of truth). Joint order is [hip, knee, ankle], values in degrees, time in seconds. Load this same file from robot_deploy.py's MotionReference and from tune_pid_isaaclab.py instead of hand-typing separate copies -- see the note below about a sign mismatch found between qmini_leg_env.py and robot_deploy.py's current hardcoded copies.",
+  "_warning": "robot_deploy.py's DEFAULT_KEYFRAMES_DEG currently reads [20,-50,30] at t=0, while qmini_leg_env.py's MotionPlayer reads [-20,50,30] at t=0 -- i.e. hip/knee are sign-flipped between the two. This may be intentional (matching the 'invert' flags in robot_config.json: hip invert=true, knee/ankle invert=false), but it's exactly the kind of mismatch that silently breaks sim-to-real trajectory comparisons. Verify which convention is correct for your MotionPlayer before trusting either sim or real logs, then delete the losing copy and load this file from both places.",
+  "degrees": true,
+  "joint_order": ["hip", "knee", "ankle"],
+  "keyframes": [
+    [0.0, [-20, 50, 30]],
+    [0.4, [-5, 20, 10]],
+    [0.8, [15, -10, 5]],
+    [1.2, [-5, 20, 10]],
+    [1.6, [-20, 50, 30]]
+  ]
+}

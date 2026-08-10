@@ -87,13 +87,13 @@ from droidplayground.assets.qmini import QMINI_CFG  # noqa: E402
 # ".*pitch" / ".*knee" / ".*ankle".
 # ---------------------------------------------------------------------------
 JOINT_NAME_MAP = {
-    "hip": "hip_pitch_joint",     # <-- verify against self.robot.joint_names printout
-    "knee": "knee_joint",         # <-- verify
-    "ankle": "ankle_joint",       # <-- verify
+    "hip": "Revolute_left_pitch",
+    "knee": "Revolute_left_knee",
+    "ankle": "Revolute_left_ankle",
 }
 
-PHYSICS_DT = 1 / 120.0
-DECIMATION = 2  # matches QminiLegEnvCfg.decimation
+PHYSICS_DT = 1 / 200.0
+DECIMATION = 4  # matches QminiLegEnvCfg.decimation
 
 
 class MotorType:

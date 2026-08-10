@@ -36,6 +36,25 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=1.0, replicate_physics=True)
 
+    # --- sim-to-real robustness ---------------------------------------
+    # Extra zero-order-hold action delay, in control steps (each step =
+    # decimation * sim.dt = 20ms at the defaults above), sampled per-env
+    # per-episode from this (min, max) range. Set this from what
+    # analyze_delay.py measures on the real robot -- e.g. if it reports
+    # ~25-60ms of target->actual lag, that's roughly 1-3 steps here.
+    action_delay_range_steps: tuple[int, int] = (0, 3)
+
+    # Per-episode multiplicative randomization applied to each actuator
+    # group's stiffness/damping/armature, as a fraction of qmini.py's
+    # DEFAULT_GAINS (or whatever build_qmini_cfg() gains this env was built
+    # with). (0.7, 1.3) means each episode samples a value in
+    # [0.7x, 1.3x] of the base gain, independently per env and per group.
+    gain_randomization_range: dict = {
+        "stiffness": (0.7, 1.3),
+        "damping": (0.7, 1.3),
+        "armature": (0.8, 1.2),
+    }
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 
@@ -83,6 +102,46 @@ class QminiLegEnv(DirectRLEnv):
             dtype=torch.float32,
         )
 
+        # NOTE on ordering: like self.motion_time above, these are created
+        # AFTER super().__init__() returns, but _reset_idx() (which uses
+        # them) is written assuming they already exist. This only works if
+        # your DirectRLEnv doesn't call _reset_idx during __init__ itself
+        # (i.e. reset() is called externally afterward) -- true for
+        # self.motion_time in the code as you gave it to me, so I'm
+        # following the same assumption here. If your Isaac Lab version
+        # does trigger an implicit reset inside __init__, guard
+        # _randomize_action_delay/_randomize_actuator_gains with an
+        # `if not hasattr(self, "_action_buffer"): return`.
+
+        # --- action delay buffer ---------------------------------------
+        # Circular buffer of the last `_action_buffer_len` raw actions per
+        # env. _apply_action reads back `action_delay_steps[env]` steps
+        # behind the write pointer, so each env sees a per-episode-fixed
+        # zero-order-hold delay instead of the instantaneous action Isaac
+        # Lab would otherwise apply. See action_delay_range_steps in cfg.
+        self._action_buffer_len = max(1, self.cfg.action_delay_range_steps[1] + 1)
+        self._action_buffer = torch.zeros(
+            self.num_envs, self._action_buffer_len, self.cfg.action_space,
+            device=self.device, dtype=torch.float32,
+        )
+        self._action_delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._buffer_ptr = 0
+        self._delayed_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+
+        # --- default (unrandomized) actuator gains, captured once so
+        # per-episode randomization always scales from the same baseline
+        # instead of compounding across resets. Verify these tensor shapes
+        # against your installed Isaac Lab version -- assumed here to be
+        # (num_envs, num_joints_in_group), matching how DCMotorCfg's scalar
+        # stiffness/damping/armature get broadcast at Articulation init.
+        self._default_actuator_gains = {}
+        for name, actuator in self.robot.actuators.items():
+            self._default_actuator_gains[name] = {
+                "stiffness": actuator.stiffness.clone(),
+                "damping": actuator.damping.clone(),
+                "armature": actuator.armature.clone(),
+            }
+
         # all_env_ids = torch.arange(
         #     self.num_envs,
         #     dtype=torch.long,
@@ -123,6 +182,17 @@ class QminiLegEnv(DirectRLEnv):
 
         # self.actions[:, 0] = 0.0
         # self.actions[:, 2] = 0.0
+
+        # --- action delay ------------------------------------------------
+        # Write this step's action into the circular buffer, then read back
+        # each env's own delayed action (fixed for the episode, resampled
+        # on reset -- see _reset_idx). _apply_action uses
+        # self._delayed_actions instead of self.actions directly.
+        self._action_buffer[:, self._buffer_ptr, :] = self.actions
+        read_idx = (self._buffer_ptr - self._action_delay_steps) % self._action_buffer_len
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        self._delayed_actions = self._action_buffer[env_ids, read_idx, :]
+        self._buffer_ptr = (self._buffer_ptr + 1) % self._action_buffer_len
 
     def _get_observations(self):
         # phase = self.phase_modulator.phase
@@ -165,7 +235,12 @@ class QminiLegEnv(DirectRLEnv):
         #     reference
         #     + 0.15*self.actions
         # )
-        position_targets = (self.actions)
+
+        # Was: position_targets = (self.actions) -- now goes through the
+        # per-env action-delay buffer computed in _pre_physics_step, so the
+        # policy has to be robust to the same lag analyze_delay.py measures
+        # on the real robot instead of assuming instantaneous actuation.
+        position_targets = self._delayed_actions[:, :num_actions]
 
         self.robot.set_joint_position_target(
             position_targets,
@@ -279,4 +354,26 @@ class QminiLegEnv(DirectRLEnv):
             len(env_ids),
             device=self.device,
         ) * self.motion.length
+
+        self._randomize_action_delay(env_ids)
+        self._randomize_actuator_gains(env_ids)
+
+    def _randomize_action_delay(self, env_ids: Sequence[int]):
+        low, high = self.cfg.action_delay_range_steps
+        n = len(env_ids)
+        self._action_delay_steps[env_ids] = torch.randint(
+            low, high + 1, (n,), device=self.device, dtype=torch.long,
+        )
+        # Clear stale pre-reset actions out of the buffer for these envs so
+        # a delayed readback right after reset can't replay an action from
+        # a different episode.
+        self._action_buffer[env_ids, :, :] = 0.0
+
+    def _randomize_actuator_gains(self, env_ids: Sequence[int]):
+        for name, actuator in self.robot.actuators.items():
+            defaults = self._default_actuator_gains[name]
+            for field, (low, high) in self.cfg.gain_randomization_range.items():
+                base = defaults[field][env_ids]
+                scale = sample_uniform(low, high, base.shape, device=self.device)
+                getattr(actuator, field)[env_ids] = base * scale
 
