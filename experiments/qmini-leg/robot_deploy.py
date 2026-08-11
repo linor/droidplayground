@@ -378,7 +378,9 @@ class MotorBus:
             raw_output_pos = (data.q / self.gear_ratio) * self._direction(joint)
             offset = raw_output_pos + math.radians(joint.offset_deg)
             self.zero_offset_rotor_rad[joint.name] = offset
-            self.last_commanded_output_rad[joint.name] = 0.0
+
+            output_pos_calibrated = raw_output_pos - self.zero_offset_rotor_rad[joint.name]
+            self.last_commanded_output_rad[joint.name] = output_pos_calibrated
 
     def print_startup_table(self):
         print("\n=== Startup motor check (verify direction & zero before enabling) ===")

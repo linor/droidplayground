@@ -1,6 +1,6 @@
 {
   "control_dt": 0.02,
-  "max_step_deg": 75.0,
+  "max_step_deg": 5.0,
   "action_scale": 0.15,
   "joints": [
     {"name": "hip",   "motor_id": 0, "invert": true,  "kp": 75.0, "kd": 0.3,  "offset_deg": -40.0},
