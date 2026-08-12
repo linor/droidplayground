@@ -3,8 +3,8 @@
 robot_deploy.py
 
 Sim-to-real deployment of an Isaac Lab / rsl_rl policy (QminiLegEnv, 3 joints:
-hip, knee, ankle) onto real GO-M8010-6 motors via Unitree's unitree_actuator_sdk
-over a single RS485 bus.
+hip, knee, ankle) onto real GO-M8010-6 motors via Unitree's unitree_actuator_sdk,
+over one or more RS485 busses (see "MULTIPLE SERIAL BUSSES" below).
 
 WHAT THIS SCRIPT DOES
 ----------------------
@@ -18,13 +18,35 @@ WHAT THIS SCRIPT DOES
   3. Runs the control loop: build obs -> policy -> action -> joint targets,
      convert to motor (rotor-side, gear-ratio-scaled) commands, and send.
   4. Before every command, checks the requested step is <= --max-step-deg
-     from the last commanded target. If any joint would move further in a
-     single step, it aborts immediately and releases (torque-off) ALL
-     motors on the bus.
-  5. Releases all motors on normal exit, Ctrl+C, SIGTERM, or any unhandled
+     from the last commanded target, AND that every joint's target is
+     within its configured [min_deg, max_deg] (if set). If any joint would
+     move further in a single step, or outside its limits, it aborts
+     immediately and releases (torque-off) ALL motors on ALL buses.
+  5. After every motor read/command, checks each motor's error flag and
+     temperature against `motor_temp_limit_c` (robot_config.json). Any
+     motor error, or a temperature above the limit, triggers the same
+     immediate release-all abort as a step/joint-limit violation.
+  6. Releases all motors on normal exit, Ctrl+C, SIGTERM, or any unhandled
      exception (try/finally + signal handlers).
-  6. Logs every control step (obs, raw policy action, joint targets, rotor
+  7. Logs every control step (obs, raw policy action, joint targets, rotor
      commands, motor telemetry) to a CSV plus a human-readable event log.
+
+MULTIPLE SERIAL BUSSES
+-----------------------
+Each joint in robot_config.json declares its own `port`. Joints sharing the
+same port string are driven by one MotorBus/SerialPort; joints with
+different ports get their own MotorBus, so a leg spread across two RS485
+adapters (e.g. hip+knee on /dev/ttyUSB0, ankle on /dev/ttyUSB1) works with
+no code changes -- just set each joint's `port` accordingly.
+
+PER-JOINT GEAR RATIO
+---------------------
+Most joints use the bus's base gear ratio (queried from the SDK, or
+DEFAULT_GEAR_RATIO_GO_M8010_6). A joint with a non-default reduction (e.g.
+an extra belt/pulley stage) can set `extra_gear_ratio` in robot_config.json;
+the joint's effective ratio becomes `extra_gear_ratio * base_gear_ratio`
+(mirrors the Qmini firmware's `is_special ? Extra_Gear_Ratio * Gear_Ratio :
+Gear_Ratio`). Omit it (defaults to 1.0) for normal joints.
 
 WHAT YOU MUST ADAPT
 --------------------
@@ -55,20 +77,30 @@ USAGE
     python3 robot_deploy.py \
         --config robot_config.json \
         --policy ./deploy_bundle/policy.pt \
-        --policy-meta ./deploy_bundle/policy.meta.json \
-        --port /dev/ttyUSB0
+        --policy-meta ./deploy_bundle/policy.meta.json
+
+Note: the serial port used to be a --port CLI flag. It's now set per joint
+in robot_config.json (see "MULTIPLE SERIAL BUSSES" above), since a config
+that's wrong for the robot you're pointing it at is exactly the kind of
+mistake that should live in a reviewable file, not a shell history entry.
 
 robot_config.json example:
 {
   "control_dt": 0.02,
   "max_step_deg": 5.0,
   "action_scale": 0.15,
+  "motor_temp_limit_c": 55.0,
   "joints": [
-    {"name": "hip",   "motor_id": 0, "invert": false, "kp": 140.0, "kd": 5.0, "default_pos_deg": -12.4132},
-    {"name": "knee",  "motor_id": 1, "invert": true,  "kp": 180.0, "kd": 6.0, "default_pos_deg": 18.9734},
-    {"name": "ankle", "motor_id": 2, "invert": false, "kp": 90.0,  "kd": 3.0, "default_pos_deg": 14.5602}
+    {"name": "hip",   "motor_id": 0, "port": "/dev/ttyUSB0", "invert": false, "kp": 140.0, "kd": 5.0, "default_pos_deg": -12.4132, "min_deg": -45.0, "max_deg": 45.0},
+    {"name": "knee",  "motor_id": 1, "port": "/dev/ttyUSB0", "invert": true,  "kp": 180.0, "kd": 6.0, "default_pos_deg": 18.9734,  "min_deg": -90.0, "max_deg": 30.0},
+    {"name": "ankle", "motor_id": 2, "port": "/dev/ttyUSB0", "invert": false, "kp": 90.0,  "kd": 3.0, "default_pos_deg": 14.5602,  "min_deg": -45.0, "max_deg": 45.0, "extra_gear_ratio": 1.0}
   ]
 }
+min_deg/max_deg are output-side degrees, optional per side (omit or set
+null for "no limit" on that side) -- but leaving them unset means that
+joint has NO joint-limit safety abort, so set them to your robot's actual
+safe mechanical range before running for real (the numbers above are just
+illustrative, not measured for your hardware).
 
 NOTE ON default_pos_deg: this must exactly match the corresponding joint's
 default_joint_pos in training (qmini.py's ArticulationCfg.InitialStateCfg.joint_pos,
@@ -150,6 +182,7 @@ MAX_PLAUSIBLE_JOINT_JUMP_RAD = math.radians(60.0)
 class JointConfig:
     name: str
     motor_id: int
+    port: Optional[str] = None  # serial port this joint's motor is on, e.g. "/dev/ttyUSB0" (required)
     invert: bool = False
     kp: float = 20.0          # output-side stiffness
     kd: float = 0.5           # output-side damping
@@ -163,6 +196,12 @@ class JointConfig:
     # fixed number, unlike keyframes.json/DEFAULT_KEYFRAMES_DEG below (the
     # full animation, only needed for --open-loop-ref / the obs motion_time
     # phase signal, not for reconstructing policy targets).
+    min_deg: Optional[float] = None  # output-side lower limit; None = no limit enforced (unsafe -- set this!)
+    max_deg: Optional[float] = None  # output-side upper limit; None = no limit enforced (unsafe -- set this!)
+    extra_gear_ratio: float = 1.0
+    # Multiplier on the bus's base gear ratio for joints with a non-standard
+    # reduction (e.g. an extra belt stage): effective ratio = extra_gear_ratio
+    # * base_gear_ratio. Leave at 1.0 for joints on the standard reduction.
 
 
 @dataclass
@@ -170,16 +209,29 @@ class RobotConfig:
     control_dt: float = 0.02
     max_step_deg: float = 5.0
     action_scale: float = 0.15
+    motor_temp_limit_c: float = 55.0
     joints: list = field(default_factory=list)  # list[JointConfig]
 
     @staticmethod
     def load(path: Path) -> "RobotConfig":
         raw = json.loads(path.read_text())
         joints = [JointConfig(**j) for j in raw["joints"]]
+        for j in joints:
+            if not j.port:
+                raise ValueError(
+                    f"Joint '{j.name}' is missing a 'port' in robot_config.json "
+                    f"(e.g. \"/dev/ttyUSB0\") -- ports are configured per joint, "
+                    f"not passed on the command line."
+                )
+            if j.min_deg is not None and j.max_deg is not None and j.min_deg >= j.max_deg:
+                raise ValueError(
+                    f"Joint '{j.name}': min_deg ({j.min_deg}) must be < max_deg ({j.max_deg})."
+                )
         return RobotConfig(
             control_dt=raw.get("control_dt", 0.02),
             max_step_deg=raw.get("max_step_deg", 5.0),
             action_scale=raw.get("action_scale", 0.15),
+            motor_temp_limit_c=raw.get("motor_temp_limit_c", 55.0),
             joints=joints,
         )
 
@@ -349,7 +401,14 @@ class MotorReading:
     error_flag: Optional[int] = None
 
 
-class TelemetryFaultError(Exception):
+class SafetyAbort(Exception):
+    """Base class for any condition that requires immediately releasing
+    (torque-off) every motor on every bus and aborting -- step-limit
+    violations, joint-limit violations, motor errors, over-temperature, and
+    corrupted telemetry all raise a subclass of this."""
+
+
+class TelemetryFaultError(SafetyAbort):
     """Raised when a motor reading implies physically impossible motion --
     almost always a dropped/garbled/timed-out serial reply being silently
     treated as valid telemetry, not a real jump. Handled the same way as
@@ -375,19 +434,25 @@ class MotorBus:
                 f"Check UNITREE_SDK_LIB_PATH at the top of this file."
             )
         self.logger = logger
+        self.port = port
         self.joints: list[JointConfig] = joints
         self.serial = SerialPort(port)
 
         self.motor_type = MotorType.GO_M8010_6
         try:
-            self.gear_ratio = queryGearRatio(self.motor_type)
+            base_gear_ratio = queryGearRatio(self.motor_type)
         except Exception:
             self.logger.warning(
                 "queryGearRatio() unavailable/failed, falling back to "
                 "DEFAULT_GEAR_RATIO_GO_M8010_6=%.3f -- verify this!",
                 DEFAULT_GEAR_RATIO_GO_M8010_6,
             )
-            self.gear_ratio = DEFAULT_GEAR_RATIO_GO_M8010_6
+            base_gear_ratio = DEFAULT_GEAR_RATIO_GO_M8010_6
+
+        # Per-joint effective gear ratio: joints with a non-default
+        # extra_gear_ratio (see JointConfig) get base_gear_ratio scaled by
+        # it; joints left at the default (1.0) just use base_gear_ratio.
+        self.gear_ratio = {j.name: base_gear_ratio * j.extra_gear_ratio for j in self.joints}
 
         self._motor_mode = queryMotorMode(self.motor_type, MotorMode.FOC)
 
@@ -432,10 +497,11 @@ class MotorBus:
         cmd.tau = 0.0
         self.serial.sendRecv(cmd, data)
 
+        gear_ratio = self.gear_ratio[joint.name]
         raw_rotor_pos = data.q
         raw_rotor_vel = data.dq
-        output_pos = (raw_rotor_pos / self.gear_ratio) * self._direction(joint)
-        output_vel = (raw_rotor_vel / self.gear_ratio) * self._direction(joint)
+        output_pos = (raw_rotor_pos / gear_ratio) * self._direction(joint)
+        output_vel = (raw_rotor_vel / gear_ratio) * self._direction(joint)
         output_pos_calibrated = output_pos - self.zero_offset_rotor_rad[joint.name]
 
         self._validate_reading(joint, output_pos_calibrated)
@@ -471,7 +537,7 @@ class MotorBus:
             cmd.tau = 0.0
             self.serial.sendRecv(cmd, data)
 
-            raw_output_pos = (data.q / self.gear_ratio) * self._direction(joint)
+            raw_output_pos = (data.q / self.gear_ratio[joint.name]) * self._direction(joint)
             offset = raw_output_pos + math.radians(joint.offset_deg)
             self.zero_offset_rotor_rad[joint.name] = offset
 
@@ -479,7 +545,7 @@ class MotorBus:
             self.last_commanded_output_rad[joint.name] = output_pos_calibrated
 
     def print_startup_table(self):
-        print("\n=== Startup motor check (verify direction & zero before enabling) ===")
+        print(f"\n=== Startup motor check for bus '{self.port}' (verify direction & zero before enabling) ===")
         print(f"{'joint':<8} {'id':>3} {'raw_deg':>10} {'calib_deg':>10} {'invert':>7}")
         for joint in self.joints:
             r = self.read_motor(joint)
@@ -489,7 +555,7 @@ class MotorBus:
             # calib_deg were always identical and neither showed the
             # robot's actual physical pose -- see r.raw_rotor_pos_rad,
             # which read_motor() keeps around as the true rotor-side value.
-            raw_output_pos = (r.raw_rotor_pos_rad / self.gear_ratio) * self._direction(joint)
+            raw_output_pos = (r.raw_rotor_pos_rad / self.gear_ratio[joint.name]) * self._direction(joint)
             raw_deg = raw_output_pos * RAD2DEG
             # Calibrated (zero-offset applied). Right after
             # calibrate_from_startup_position() this reads ~ -offset_deg
@@ -500,13 +566,22 @@ class MotorBus:
             print(f"{joint.name:<8} {joint.motor_id:>3} {raw_deg:>10.2f} {calib_deg:>10.2f} {str(joint.invert):>7}")
         print("=======================================================================\n")
 
-    def send_targets(self, target_output_rad: dict, max_step_deg: float, logger: logging.Logger):
-        """
-        Sends position targets to all motors on the bus. Raises
-        StepLimitExceeded (without sending anything) if any joint's target
-        differs from its last commanded target by more than max_step_deg.
-        Caller is responsible for catching that and calling release_all().
-        """
+    def check_joint_limits(self, target_output_rad: dict):
+        """Raises JointLimitExceeded if any joint's target falls outside its
+        configured [min_deg, max_deg] (joints with a limit left as None are
+        unconstrained on that side)."""
+        violations = []
+        for joint in self.joints:
+            target_deg = math.degrees(target_output_rad[joint.name])
+            lo, hi = joint.min_deg, joint.max_deg
+            if (lo is not None and target_deg < lo) or (hi is not None and target_deg > hi):
+                violations.append((joint.name, target_deg, lo, hi))
+        if violations:
+            raise JointLimitExceeded(violations)
+
+    def check_step_limits(self, target_output_rad: dict, max_step_deg: float):
+        """Raises StepLimitExceeded if any joint's target differs from its
+        last commanded target by more than max_step_deg."""
         max_step_rad = math.radians(max_step_deg)
         violations = []
         for joint in self.joints:
@@ -514,26 +589,28 @@ class MotorBus:
             last = self.last_commanded_output_rad[joint.name]
             if last is not None and abs(target - last) > max_step_rad:
                 violations.append((joint.name, math.degrees(target - last)))
-
         if violations:
             raise StepLimitExceeded(violations)
 
+    def send_targets(self, target_output_rad: dict):
+        """
+        Sends position targets to all motors on the bus. Does NOT validate
+        the targets -- callers must call check_joint_limits() and
+        check_step_limits() (or Deployment's helpers, which do both across
+        all buses) first, before sending anything to any bus.
+        """
         readings = {}
         for joint in self.joints:
             target = target_output_rad[joint.name]
             direction = self._direction(joint)
+            gear_ratio = self.gear_ratio[joint.name]
 
             # convert calibrated output-side target back to raw rotor units
             uncalibrated_output = target + self.zero_offset_rotor_rad[joint.name]
-            rotor_target = (uncalibrated_output * direction) * self.gear_ratio
+            rotor_target = (uncalibrated_output * direction) * gear_ratio
 
-            r = self.gear_ratio
-            kp_rotor = joint.kp / (r * r)
-            kd_rotor = joint.kd / (r * r)
-            # kp_rotor = 0.05
-            # kd_rotor = 0.001
-            # print(f"KP: {kp_rotor}  KD: {kd_rotor}")
-
+            kp_rotor = joint.kp / (gear_ratio * gear_ratio)
+            kd_rotor = joint.kd / (gear_ratio * gear_ratio)
             # kp_rotor = 0.0
             # kd_rotor = 0.0
             # rotor_target = 0.0
@@ -553,8 +630,8 @@ class MotorBus:
 
             self.last_commanded_output_rad[joint.name] = target
 
-            output_pos = (data.q / self.gear_ratio) * direction - self.zero_offset_rotor_rad[joint.name]
-            output_vel = (data.dq / self.gear_ratio) * direction
+            output_pos = (data.q / gear_ratio) * direction - self.zero_offset_rotor_rad[joint.name]
+            output_vel = (data.dq / gear_ratio) * direction
 
             self._validate_reading(joint, output_pos)
 
@@ -590,11 +667,52 @@ class MotorBus:
         self.logger.info("All motors released (torque off).")
 
 
-class StepLimitExceeded(Exception):
+class StepLimitExceeded(SafetyAbort):
     def __init__(self, violations):
         self.violations = violations
         msg = "; ".join(f"{name}: {delta:+.2f} deg" for name, delta in violations)
         super().__init__(f"Commanded step exceeds max_step_deg: {msg}")
+
+
+class JointLimitExceeded(SafetyAbort):
+    def __init__(self, violations):
+        self.violations = violations
+        parts = []
+        for name, deg, lo, hi in violations:
+            lo_s = "-inf" if lo is None else f"{lo:.2f}"
+            hi_s = "+inf" if hi is None else f"{hi:.2f}"
+            parts.append(f"{name}: {deg:+.2f} deg (limits [{lo_s}, {hi_s}])")
+        super().__init__(f"Commanded target outside joint limits: {'; '.join(parts)}")
+
+
+class MotorErrorDetected(SafetyAbort):
+    def __init__(self, joint_name: str, error_flag):
+        self.joint_name = joint_name
+        self.error_flag = error_flag
+        super().__init__(f"Motor error detected on joint '{joint_name}': error_flag={error_flag}")
+
+
+class MotorOverTemperature(SafetyAbort):
+    def __init__(self, joint_name: str, temperature: float, limit: float):
+        self.joint_name = joint_name
+        self.temperature = temperature
+        self.limit = limit
+        super().__init__(
+            f"Motor over-temperature on joint '{joint_name}': "
+            f"{temperature:.1f}C exceeds motor_temp_limit_c={limit:.1f}C"
+        )
+
+
+def check_motor_safety(readings: dict, temp_limit_c: float):
+    """Raises MotorErrorDetected or MotorOverTemperature if any reading in
+    `readings` (joint_name -> MotorReading) reports a nonzero error flag or
+    a temperature above temp_limit_c. Readings with error_flag/temperature
+    unsupported by the SDK (None) are skipped for that check."""
+    for name, r in readings.items():
+        if r.error_flag:
+            raise MotorErrorDetected(name, r.error_flag)
+        if r.temperature is not None and r.temperature > temp_limit_c:
+            raise MotorOverTemperature(name, r.temperature, temp_limit_c)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +726,12 @@ def setup_logging(log_dir: Path):
     logger = logging.getLogger("robot_deploy")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+    # Don't propagate to the root logger -- main() also attaches a
+    # StreamHandler to this logger below, so propagating on top of that
+    # printed every message to the console twice (once via this logger's
+    # own handler, once via the root logger's, since messages bubble up by
+    # default).
+    logger.propagate = False
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -655,8 +779,9 @@ class Deployment:
         self,
         robot_cfg: RobotConfig,
         policy,
-        port: str,
-        log_dir: Path,
+        logger: logging.Logger,
+        csv_writer,
+        csv_file,
         keyframes_path: Optional[Path] = None,
         open_loop_ref: bool = False,
         startup_pose: str = "auto",
@@ -666,9 +791,23 @@ class Deployment:
         self.robot_cfg = robot_cfg
         self.policy = policy
         self.open_loop_ref = open_loop_ref
-        self.logger, self.csv_writer, self.csv_file, csv_path = setup_logging(log_dir)
-        self.logger.info("Logging control loop to %s", csv_path)
+        self.logger = logger
+        self.csv_writer = csv_writer
+        self.csv_file = csv_file
         write_csv_header(self.csv_writer, robot_cfg.joint_names)
+
+        for joint in robot_cfg.joints:
+            if joint.min_deg is None or joint.max_deg is None:
+                self.logger.warning(
+                    "Joint '%s' has no %s configured in robot_config.json -- "
+                    "that side is UNCONSTRAINED and won't trigger a joint-limit "
+                    "safety abort. Set min_deg/max_deg once you know this "
+                    "joint's safe mechanical range.",
+                    joint.name,
+                    "min_deg/max_deg" if joint.min_deg is None and joint.max_deg is None
+                    else ("min_deg" if joint.min_deg is None else "max_deg"),
+                )
+
         if open_loop_ref:
             self.logger.warning(
                 "Running in --open-loop-ref mode: the policy is loaded but NOT "
@@ -692,7 +831,20 @@ class Deployment:
         self.action_smoothing = action_smoothing
         self._smoothed_targets: dict = {}
 
-        self.bus = MotorBus(port, robot_cfg.joints, self.logger)
+        # One MotorBus per unique port in robot_config.json -- joints that
+        # share a port share a bus, joints with different ports get their
+        # own (see module docstring's "MULTIPLE SERIAL BUSSES" section).
+        joints_by_port: dict = {}
+        for joint in robot_cfg.joints:
+            joints_by_port.setdefault(joint.port, []).append(joint)
+        self.buses = [MotorBus(port, joints, self.logger) for port, joints in joints_by_port.items()]
+        self._joint_bus = {joint.name: bus for bus in self.buses for joint in bus.joints}
+        self.logger.info(
+            "Initialized %d motor bus(es): %s",
+            len(self.buses),
+            "; ".join(f"{bus.port} -> {[j.name for j in bus.joints]}" for bus in self.buses),
+        )
+
         if keyframes_path is not None:
             self.motion = MotionReference.from_json(keyframes_path)
             self.logger.info("Loaded keyframes from %s", keyframes_path)
@@ -735,6 +887,31 @@ class Deployment:
         self.logger.warning("Received signal %s -- stopping and releasing motors.", signum)
         self._stop = True
 
+    # -- multi-bus helpers: dispatch each joint to its owning MotorBus and
+    # merge results, so callers can work in terms of "all robot joints"
+    # without caring how they're split across serial buses. --
+
+    def _read_all_motors(self) -> dict:
+        return {j.name: self._joint_bus[j.name].read_motor(j) for j in self.robot_cfg.joints}
+
+    def _validate_targets_all(self, targets: dict, max_step_deg: float):
+        """Checks joint limits AND step limits on every bus before anything
+        is sent, so a violation on one bus can never be discovered after
+        another bus has already been commanded."""
+        for bus in self.buses:
+            bus.check_joint_limits(targets)
+            bus.check_step_limits(targets, max_step_deg)
+
+    def _send_targets_all(self, targets: dict) -> dict:
+        readings = {}
+        for bus in self.buses:
+            readings.update(bus.send_targets(targets))
+        return readings
+
+    def _release_all(self):
+        for bus in self.buses:
+            bus.release_all()
+
     def _startup_pose_targets(self) -> dict:
         if self.startup_pose_mode == "zero":
             return {j.name: 0.0 for j in self.robot_cfg.joints}
@@ -758,7 +935,8 @@ class Deployment:
         partway through a startup move.
         """
         dt = self.robot_cfg.control_dt
-        readings = {j.name: self.bus.read_motor(j) for j in self.robot_cfg.joints}
+        readings = self._read_all_motors()
+        check_motor_safety(readings, self.robot_cfg.motor_temp_limit_c)
         current = {name: r.output_pos_rad for name, r in readings.items()}
 
         max_step_rad = math.radians(self.robot_cfg.max_step_deg)
@@ -780,21 +958,25 @@ class Deployment:
                     name: current[name] + alpha * (target_output_rad[name] - current[name])
                     for name in current
                 }
-                self.bus.send_targets(targets, self.robot_cfg.max_step_deg, self.logger)
+                self._validate_targets_all(targets, self.robot_cfg.max_step_deg)
+                step_readings = self._send_targets_all(targets)
+                check_motor_safety(step_readings, self.robot_cfg.motor_temp_limit_c)
                 elapsed = time.perf_counter() - step_start
                 if elapsed < dt:
                     time.sleep(dt - elapsed)
-        except (StepLimitExceeded, TelemetryFaultError) as e:
+        except SafetyAbort as e:
             self.logger.error("SAFETY ABORT during startup move: %s", e)
-            self.bus.release_all()
+            self._release_all()
             raise
 
         self.logger.info("Startup pose reached.")
 
     def startup_sequence(self):
         self.logger.info("Calibrating from current motor positions...")
-        self.bus.calibrate_from_startup_position()
-        self.bus.print_startup_table()
+        for bus in self.buses:
+            bus.calibrate_from_startup_position()
+        for bus in self.buses:
+            bus.print_startup_table()
 
         answer = input(
             "Verify the table above: raw_deg should match the robot's actual pose, "
@@ -823,7 +1005,8 @@ class Deployment:
         step = 0
         run_start = time.perf_counter()
         try:
-            new_readings = {j.name: self.bus.read_motor(j) for j in self.robot_cfg.joints}
+            new_readings = self._read_all_motors()
+            check_motor_safety(new_readings, self.robot_cfg.motor_temp_limit_c)
             while not self._stop:
                 loop_start = time.perf_counter()
 
@@ -870,10 +1053,12 @@ class Deployment:
 
                 bus_start = time.perf_counter()
                 try:
-                    new_readings = self.bus.send_targets(targets, self.robot_cfg.max_step_deg, self.logger)
-                except (StepLimitExceeded, TelemetryFaultError) as e:
+                    self._validate_targets_all(targets, self.robot_cfg.max_step_deg)
+                    new_readings = self._send_targets_all(targets)
+                    check_motor_safety(new_readings, self.robot_cfg.motor_temp_limit_c)
+                except SafetyAbort as e:
                     self.logger.error("SAFETY ABORT: %s", e)
-                    self.bus.release_all()
+                    self._release_all()
                     raise
                 bus_ms = (time.perf_counter() - bus_start) * 1000.0
 
@@ -894,7 +1079,7 @@ class Deployment:
                         elapsed * 1000, dt * 1000, policy_ms, bus_ms,
                     )
         finally:
-            self.bus.release_all()
+            self._release_all()
             self.csv_file.close()
             self.logger.info("Deployment stopped, motors released, log file closed.")
 
@@ -933,7 +1118,6 @@ def main():
         "--policy-meta", type=Path, default=None,
         help="policy.meta.json. Required unless --open-loop-ref is set.",
     )
-    parser.add_argument("--port", type=str, required=True, help="e.g. /dev/ttyUSB0")
     parser.add_argument("--log-dir", type=Path, default=Path("./logs"))
     parser.add_argument(
         "--keyframes", type=Path, default=None,
@@ -978,35 +1162,43 @@ def main():
     )
     args = parser.parse_args()
 
-    logger = logging.getLogger("robot_deploy.startup")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
     robot_cfg = RobotConfig.load(args.config)
 
-    if args.open_loop_ref:
-        if args.policy or args.policy_meta:
-            logger.info("--open-loop-ref set: ignoring --policy/--policy-meta, the policy will not be called.")
-        policy = None
-    else:
-        if not args.policy or not args.policy_meta:
-            parser.error("--policy and --policy-meta are required unless --open-loop-ref is set.")
-        policy, meta = load_and_verify_policy(args.policy, args.policy_meta, robot_cfg, logger)
+    # Single logger for the whole run, set up once here -- Deployment no
+    # longer creates its own (see setup_logging()'s propagate=False note:
+    # having two independently-configured loggers in this hierarchy was
+    # exactly why every message after Deployment was constructed used to
+    # print to the console twice).
+    logger, csv_writer, csv_file, csv_path = setup_logging(args.log_dir)
+    logger.info("Logging control loop to %s", csv_path)
 
-    deployment = Deployment(
-        robot_cfg, policy, args.port, args.log_dir,
-        keyframes_path=args.keyframes, open_loop_ref=args.open_loop_ref,
-        startup_pose=args.startup_pose, startup_move_duration=args.startup_move_duration,
-        action_smoothing=args.action_smoothing,
-    )
     try:
+        if args.open_loop_ref:
+            if args.policy or args.policy_meta:
+                logger.info("--open-loop-ref set: ignoring --policy/--policy-meta, the policy will not be called.")
+            policy = None
+        else:
+            if not args.policy or not args.policy_meta:
+                parser.error("--policy and --policy-meta are required unless --open-loop-ref is set.")
+            policy, meta = load_and_verify_policy(args.policy, args.policy_meta, robot_cfg, logger)
+
+        deployment = Deployment(
+            robot_cfg, policy, logger, csv_writer, csv_file,
+            keyframes_path=args.keyframes, open_loop_ref=args.open_loop_ref,
+            startup_pose=args.startup_pose, startup_move_duration=args.startup_move_duration,
+            action_smoothing=args.action_smoothing,
+        )
         deployment.startup_sequence()
         deployment.run()
-    except (StepLimitExceeded, TelemetryFaultError):
+    except SafetyAbort:
         logger.error("Exiting after safety abort. Motors have been released.")
         sys.exit(1)
     except Exception:
         logger.exception("Unhandled exception -- motors released via finally block.")
         raise
+    finally:
+        if not csv_file.closed:
+            csv_file.close()
 
 
 if __name__ == "__main__":
