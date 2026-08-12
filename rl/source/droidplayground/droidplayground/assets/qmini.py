@@ -17,9 +17,9 @@ from droidplayground.assets import ASSET_USD_DIRECTORY
 # "current best sim gains" -- both QMINI_CFG below and build_qmini_cfg()
 # read from it.
 DEFAULT_GAINS = {
-    "hip_pitch": dict(stiffness=75.0, damping=0.3, armature=0.002),
-    "knee": dict(stiffness=45.0, damping=0.5, armature=0.002),
-    "ankle": dict(stiffness=30.0, damping=0.25, armature=0.002),
+    "hip_pitch": dict(stiffness=75.0, damping=2.0, armature=0.02),
+    "knee": dict(stiffness=45.0, damping=2.0, armature=0.02),
+    "ankle": dict(stiffness=30.0, damping=2.0, armature=0.02),
 }
 
 
@@ -84,7 +84,12 @@ QMINI_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 2.0), joint_pos={".*": 0.0}
+        pos=(0.0, 0.0, 2.0), # joint_pos={".*": 0.0}
+        joint_pos={
+            "Revolute_left_pitch": -0.216651,
+            "Revolute_left_knee": 0.331148,
+            "Revolute_left_ankle": 0.254123
+        },
     ),
     actuators={
         # "xl330_velocity_actuator": DCMotorCfg(

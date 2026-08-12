@@ -28,6 +28,11 @@ WHAT THIS SCRIPT DOES
 
 WHAT YOU MUST ADAPT
 --------------------
+  - `default_pos_deg` on each joint in robot_config.json: the fixed pose the
+    policy's action is a small offset from (see QminiLegEnv._apply_action).
+    This must match training's default_joint_pos exactly, in degrees. This
+    is NOT the same thing as the keyframes/MotionReference below -- it's a
+    single fixed number per joint, not an animation.
   - `UNITREE_SDK_LIB_PATH`: point this at wherever you built
     unitree_actuator_sdk's `lib/` (contains the compiled python module).
   - `MotionReference`: this is a placeholder linear-interpolation
@@ -59,11 +64,18 @@ robot_config.json example:
   "max_step_deg": 5.0,
   "action_scale": 0.15,
   "joints": [
-    {"name": "hip",   "motor_id": 0, "invert": false, "kp": 140.0, "kd": 5.0},
-    {"name": "knee",  "motor_id": 1, "invert": true,  "kp": 180.0, "kd": 6.0},
-    {"name": "ankle", "motor_id": 2, "invert": false, "kp": 90.0,  "kd": 3.0}
+    {"name": "hip",   "motor_id": 0, "invert": false, "kp": 140.0, "kd": 5.0, "default_pos_deg": -12.4132},
+    {"name": "knee",  "motor_id": 1, "invert": true,  "kp": 180.0, "kd": 6.0, "default_pos_deg": 18.9734},
+    {"name": "ankle", "motor_id": 2, "invert": false, "kp": 90.0,  "kd": 3.0, "default_pos_deg": 14.5602}
   ]
 }
+
+NOTE ON default_pos_deg: this must exactly match the corresponding joint's
+default_joint_pos in training (qmini.py's ArticulationCfg.InitialStateCfg.joint_pos,
+converted rad -> deg). The policy's action is decoded as
+default_pos_deg + action_scale * action -- if this drifts from what training
+used, every commanded target on the real robot will be offset from what the
+policy actually learned, even though the policy itself is unchanged.
 """
 
 from __future__ import annotations
@@ -112,6 +124,23 @@ DEFAULT_GEAR_RATIO_GO_M8010_6 = 6.33  # verify against queryGearRatio()/datashee
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
+# A single reading-to-reading position jump bigger than this is treated as
+# corrupted telemetry (dropped/garbled/timed-out serial reply leaving
+# data.q/data.dq holding stale or uninitialized memory), not real motion.
+#
+# Deliberately NOT a velocity/time-normalized bound (e.g. "rad/s above
+# velocity_limit"): real elapsed time between readings balloons exactly
+# during the comms failures this check exists to catch (each timed-out
+# motor adds ~15-20ms of wait), which would make a time-normalized bound
+# *more* permissive right when it needs to be strictest. This bound is
+# fixed regardless of how much wall-clock time actually elapsed.
+#
+# Calibrated well above legitimate motion: our own control loop never
+# commands more than max_step_deg (see RobotConfig) away from the last
+# target in a single step, so a healthy joint should never be found this
+# far from its last reading, however long a stall lasted.
+MAX_PLAUSIBLE_JOINT_JUMP_RAD = math.radians(60.0)
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -125,6 +154,15 @@ class JointConfig:
     kp: float = 20.0          # output-side stiffness
     kd: float = 0.5           # output-side damping
     offset_deg: float = 0.0   # extra manual offset added on top of the startup calibration reading
+    default_pos_deg: float = 0.0
+    # Fixed anchor pose this joint's action is a *small offset from* --
+    # i.e. robot_cfg.action_scale * action + this. MUST match training's
+    # default_joint_pos for this joint exactly (qmini.py's
+    # ArticulationCfg.InitialStateCfg.joint_pos, converted to degrees,
+    # currently the keyframe-0 pose -- NOT necessarily 0). This is a single
+    # fixed number, unlike keyframes.json/DEFAULT_KEYFRAMES_DEG below (the
+    # full animation, only needed for --open-loop-ref / the obs motion_time
+    # phase signal, not for reconstructing policy targets).
 
 
 @dataclass
@@ -199,6 +237,27 @@ def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotC
             "action_scale (%.4f) -- using robot config value. Confirm this is intentional.",
             meta.get("action_scale"), robot_cfg.action_scale,
         )
+
+    # default_pos_deg is the anchor pose actions are decoded relative to
+    # (see JointConfig / Deployment.run()). A mismatch here doesn't crash
+    # anything -- it silently offsets every commanded target from what the
+    # policy actually learned, so check it like action_scale above whenever
+    # the sidecar declares it. Meta files without this field (older
+    # bundles) just skip the check.
+    meta_default_pose = meta.get("default_pos_deg")
+    if meta_default_pose is not None:
+        for joint in robot_cfg.joints:
+            expected = meta_default_pose.get(joint.name)
+            if expected is None:
+                continue
+            if abs(expected - joint.default_pos_deg) > 0.5:
+                raise PolicyMismatchError(
+                    f"robot_config.json default_pos_deg for '{joint.name}' "
+                    f"({joint.default_pos_deg:.3f} deg) differs from the policy "
+                    f"metadata's expected value ({expected:.3f} deg) by more than "
+                    f"0.5 deg. This anchor pose must match training's "
+                    f"default_joint_pos or every commanded target will be offset."
+                )
 
     policy = torch.jit.load(str(policy_path), map_location="cpu")
     policy.eval()
@@ -290,6 +349,24 @@ class MotorReading:
     error_flag: Optional[int] = None
 
 
+class TelemetryFaultError(Exception):
+    """Raised when a motor reading implies physically impossible motion --
+    almost always a dropped/garbled/timed-out serial reply being silently
+    treated as valid telemetry, not a real jump. Handled the same way as
+    StepLimitExceeded: caller releases all motors and aborts, since once one
+    reading is untrustworthy there's no safe basis for the next command."""
+    def __init__(self, joint_name: str, last_pos_rad: float, new_pos_rad: float):
+        self.joint_name = joint_name
+        jump_deg = math.degrees(abs(new_pos_rad - last_pos_rad))
+        super().__init__(
+            f"Motor '{joint_name}' reading jumped {jump_deg:.2f} deg "
+            f"(from {math.degrees(last_pos_rad):.2f} to {math.degrees(new_pos_rad):.2f} deg) "
+            f"in a single reading -- physically implausible, treating as a "
+            f"dropped/corrupted serial reply rather than real motion. Check "
+            f"motor power, cabling, and bus timing/framing."
+        )
+
+
 class MotorBus:
     def __init__(self, port: str, joints: list, logger: logging.Logger):
         if not _SDK_AVAILABLE:
@@ -318,6 +395,23 @@ class MotorBus:
         self.zero_offset_rotor_rad = {j.name: 0.0 for j in self.joints}
         self.last_commanded_output_rad = {j.name: None for j in self.joints}
 
+        # last known-GOOD reading per joint (distinct from
+        # last_commanded_output_rad, which tracks what we asked for, not
+        # what we last confirmed) -- used by _validate_reading() to catch
+        # corrupted telemetry from failed serial transactions.
+        self._last_valid_output_rad = {j.name: None for j in self.joints}
+
+    def _validate_reading(self, joint: JointConfig, output_pos_rad: float) -> None:
+        """Raises TelemetryFaultError if output_pos_rad jumped further from
+        this joint's last known-good reading than MAX_PLAUSIBLE_JOINT_JUMP_RAD
+        allows. Silently accepts (and records as the new known-good reading)
+        if there's no prior reading yet or the jump is plausible."""
+        last_pos = self._last_valid_output_rad[joint.name]
+        if last_pos is not None:
+            if abs(output_pos_rad - last_pos) > MAX_PLAUSIBLE_JOINT_JUMP_RAD:
+                raise TelemetryFaultError(joint.name, last_pos, output_pos_rad)
+        self._last_valid_output_rad[joint.name] = output_pos_rad
+
     def _direction(self, joint: JointConfig) -> float:
         return -1.0 if joint.invert else 1.0
 
@@ -343,6 +437,8 @@ class MotorBus:
         output_pos = (raw_rotor_pos / self.gear_ratio) * self._direction(joint)
         output_vel = (raw_rotor_vel / self.gear_ratio) * self._direction(joint)
         output_pos_calibrated = output_pos - self.zero_offset_rotor_rad[joint.name]
+
+        self._validate_reading(joint, output_pos_calibrated)
 
         return MotorReading(
             joint_name=joint.name,
@@ -387,8 +483,20 @@ class MotorBus:
         print(f"{'joint':<8} {'id':>3} {'raw_deg':>10} {'calib_deg':>10} {'invert':>7}")
         for joint in self.joints:
             r = self.read_motor(joint)
-            raw_deg = r.output_pos_rad * RAD2DEG
-            calib_deg = raw_deg  # right after calibrate_from_startup_position(), calib should read ~0
+            # True raw pose: direction-corrected, gear-divided, but NOT
+            # zero-offset-corrected. Previously this used r.output_pos_rad
+            # (already calibrated) for BOTH columns, so raw_deg and
+            # calib_deg were always identical and neither showed the
+            # robot's actual physical pose -- see r.raw_rotor_pos_rad,
+            # which read_motor() keeps around as the true rotor-side value.
+            raw_output_pos = (r.raw_rotor_pos_rad / self.gear_ratio) * self._direction(joint)
+            raw_deg = raw_output_pos * RAD2DEG
+            # Calibrated (zero-offset applied). Right after
+            # calibrate_from_startup_position() this reads ~ -offset_deg
+            # (not ~0, unless offset_deg is ~0) -- see that method's
+            # derivation: the calibrated reading at calibration time is
+            # defined to equal -offset_deg by construction.
+            calib_deg = r.output_pos_rad * RAD2DEG
             print(f"{joint.name:<8} {joint.motor_id:>3} {raw_deg:>10.2f} {calib_deg:>10.2f} {str(joint.invert):>7}")
         print("=======================================================================\n")
 
@@ -447,6 +555,9 @@ class MotorBus:
 
             output_pos = (data.q / self.gear_ratio) * direction - self.zero_offset_rotor_rad[joint.name]
             output_vel = (data.dq / self.gear_ratio) * direction
+
+            self._validate_reading(joint, output_pos)
+
             readings[joint.name] = MotorReading(
                 joint_name=joint.name,
                 output_pos_rad=output_pos,
@@ -550,6 +661,7 @@ class Deployment:
         open_loop_ref: bool = False,
         startup_pose: str = "auto",
         startup_move_duration: float = 2.0,
+        action_smoothing: float = 1.0,
     ):
         self.robot_cfg = robot_cfg
         self.policy = policy
@@ -564,6 +676,22 @@ class Deployment:
                 "sim/real matching (tune_pid_isaaclab.py), not normal operation."
             )
 
+        # EMA low-pass on the FINAL decoded target (after default_pose_rad +
+        # action_scale * action), applied every step regardless of
+        # open_loop_ref (a no-op there at the default). smoothed_t =
+        # action_smoothing * target_t + (1 - action_smoothing) * smoothed_{t-1}.
+        # 1.0 = off (raw target passed through unchanged, original
+        # behavior). Diagnostic tool for a specific symptom: if the policy
+        # is producing noisy/jittery frame-to-frame targets that demand
+        # sharp torque transients from the PD controller, this damps that
+        # out WITHOUT retraining, letting you test whether jitter (rather
+        # than wiring or an individual large target) is what's tripping the
+        # motor fault. If smoothing fixes it, the real fix is an
+        # action-rate penalty during training (see qmini_leg_env.py) --
+        # this flag is for isolating the cause, not a permanent substitute.
+        self.action_smoothing = action_smoothing
+        self._smoothed_targets: dict = {}
+
         self.bus = MotorBus(port, robot_cfg.joints, self.logger)
         if keyframes_path is not None:
             self.motion = MotionReference.from_json(keyframes_path)
@@ -576,15 +704,26 @@ class Deployment:
             )
         self.motion_time = 0.0
 
-        # "auto" resolves to "keyframe" if a keyframes file/reference was
-        # explicitly requested (--keyframes or --open-loop-ref), else
-        # "zero" -- matching how QminiLegEnv trains from a zero joint_pos
-        # init_state (see qmini.py's ArticulationCfg.InitialStateCfg) when
-        # there's no reference trajectory involved.
+        # Fixed anchor pose each joint's action is decoded relative to --
+        # target = default_pose_rad + action_scale * action. Deliberately
+        # NOT derived from self.motion (the keyframes/MotionReference
+        # above): that's the reference *animation*, this is the single
+        # fixed calibration pose from robot_config.json, matching
+        # training's default_joint_pos. See run() and JointConfig.
+        self.default_pose_rad = {
+            j.name: math.radians(j.default_pos_deg) for j in robot_cfg.joints
+        }
+
+        # "auto" resolves to "keyframe" only for --open-loop-ref (which
+        # needs to start on the reference trajectory it's about to command
+        # directly), else "default" -- matching how QminiLegEnv now resets
+        # each episode to default_joint_pos (see qmini.py's
+        # ArticulationCfg.InitialStateCfg and _apply_action's anchor pose)
+        # before the policy starts acting on it.
         if startup_pose == "auto":
-            startup_pose = "keyframe" if (keyframes_path is not None or open_loop_ref) else "zero"
-        if startup_pose not in ("zero", "keyframe", "none"):
-            raise ValueError(f"Unknown --startup-pose '{startup_pose}', expected zero|keyframe|none|auto")
+            startup_pose = "keyframe" if open_loop_ref else "default"
+        if startup_pose not in ("zero", "default", "keyframe", "none"):
+            raise ValueError(f"Unknown --startup-pose '{startup_pose}', expected zero|default|keyframe|none|auto")
         self.startup_pose_mode = startup_pose
         self.startup_move_duration = startup_move_duration
 
@@ -599,6 +738,8 @@ class Deployment:
     def _startup_pose_targets(self) -> dict:
         if self.startup_pose_mode == "zero":
             return {j.name: 0.0 for j in self.robot_cfg.joints}
+        elif self.startup_pose_mode == "default":
+            return dict(self.default_pose_rad)
         elif self.startup_pose_mode == "keyframe":
             ref = self.motion.sample(0.0)
             return {joint.name: ref[i] for i, joint in enumerate(self.robot_cfg.joints)}
@@ -643,7 +784,7 @@ class Deployment:
                 elapsed = time.perf_counter() - step_start
                 if elapsed < dt:
                     time.sleep(dt - elapsed)
-        except StepLimitExceeded as e:
+        except (StepLimitExceeded, TelemetryFaultError) as e:
             self.logger.error("SAFETY ABORT during startup move: %s", e)
             self.bus.release_all()
             raise
@@ -688,7 +829,7 @@ class Deployment:
 
                 readings = new_readings
 
-                print(f"HIP: {math.degrees(readings['hip'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['ankle'].output_pos_rad):10.5f}")
+                print(f"CURRENT HIP: {math.degrees(readings['hip'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['ankle'].output_pos_rad):10.5f}")
 
                 obs = self.build_obs(readings)
 
@@ -705,13 +846,32 @@ class Deployment:
                     with torch.no_grad():
                         action = self.policy(obs).squeeze(0).numpy()
                     action = action.clip(-1.0, 1.0)
-                    targets = {joint.name: float(action[i]) for i, joint in enumerate(self.robot_cfg.joints)}
+                    # Must mirror QminiLegEnv._apply_action exactly: action
+                    # is a small offset from the fixed default_pose_rad
+                    # anchor, scaled by action_scale -- NOT an absolute
+                    # target. See JointConfig.default_pos_deg.
+                    targets = {
+                        joint.name: self.default_pose_rad[joint.name]
+                        + self.robot_cfg.action_scale * float(action[i])
+                        for i, joint in enumerate(self.robot_cfg.joints)
+                    }
                 policy_ms = (time.perf_counter() - policy_start) * 1000.0
+
+                if self.action_smoothing < 1.0:
+                    for name, t in targets.items():
+                        prev = self._smoothed_targets.get(name)
+                        smoothed = t if prev is None else (
+                            self.action_smoothing * t + (1.0 - self.action_smoothing) * prev
+                        )
+                        self._smoothed_targets[name] = smoothed
+                        targets[name] = smoothed
+
+                print(f"TARGETS HIP: {math.degrees(targets['hip']):10.5f}  KNEE: {math.degrees(targets['knee']):10.5f}  ANKLE: {math.degrees(targets['ankle']):10.5f}")
 
                 bus_start = time.perf_counter()
                 try:
                     new_readings = self.bus.send_targets(targets, self.robot_cfg.max_step_deg, self.logger)
-                except StepLimitExceeded as e:
+                except (StepLimitExceeded, TelemetryFaultError) as e:
                     self.logger.error("SAFETY ABORT: %s", e)
                     self.bus.release_all()
                     raise
@@ -722,6 +882,7 @@ class Deployment:
 
                 self.motion_time = (self.motion_time + dt) % self.motion.length
                 step += 1
+                print(f"STEP: {step}  MOTION_TIME: {self.motion_time}")
 
                 elapsed = time.perf_counter() - loop_start
                 sleep_time = dt - elapsed
@@ -786,13 +947,28 @@ def main():
              "tune_pid_isaaclab.py -- NOT for normal operation.",
     )
     parser.add_argument(
-        "--startup-pose", type=str, default="auto", choices=["auto", "zero", "keyframe", "none"],
+        "--action-smoothing", type=float, default=1.0,
+        help="EMA low-pass factor applied to the final decoded joint "
+             "target every step. 1.0 (default) = off, unchanged behavior. "
+             "Lower = more smoothing (e.g. 0.3). Diagnostic tool: if the "
+             "policy's raw targets are jittery enough to trip a motor "
+             "fault that a smooth reference trajectory doesn't, lowering "
+             "this can confirm that without retraining. Not a permanent "
+             "fix -- if it helps, add an action-rate penalty to training "
+             "instead (see qmini_leg_env.py).",
+    )
+    parser.add_argument(
+        "--startup-pose", type=str, default="auto", choices=["auto", "zero", "default", "keyframe", "none"],
         help="Pose to smoothly move to after calibration, before the "
              "control loop starts. 'auto' (default) picks 'keyframe' "
-             "(keyframes[0]) if --keyframes/--open-loop-ref is set, else "
-             "'zero'. 'none' skips the move (old behavior -- the first "
-             "policy/reference action jumps straight from calibration "
-             "pose, subject to --max-step-deg).",
+             "(keyframes[0]) for --open-loop-ref, else 'default' (each "
+             "joint's default_pos_deg from robot_config.json -- the same "
+             "anchor pose the policy's actions are decoded relative to, "
+             "and what QminiLegEnv resets each training episode to). "
+             "'zero' moves to the raw calibration pose instead. 'none' "
+             "skips the move (old behavior -- the first policy/reference "
+             "action jumps straight from calibration pose, subject to "
+             "--max-step-deg).",
     )
     parser.add_argument(
         "--startup-move-duration", type=float, default=2.0,
@@ -820,11 +996,12 @@ def main():
         robot_cfg, policy, args.port, args.log_dir,
         keyframes_path=args.keyframes, open_loop_ref=args.open_loop_ref,
         startup_pose=args.startup_pose, startup_move_duration=args.startup_move_duration,
+        action_smoothing=args.action_smoothing,
     )
     try:
         deployment.startup_sequence()
         deployment.run()
-    except StepLimitExceeded:
+    except (StepLimitExceeded, TelemetryFaultError):
         logger.error("Exiting after safety abort. Motors have been released.")
         sys.exit(1)
     except Exception:

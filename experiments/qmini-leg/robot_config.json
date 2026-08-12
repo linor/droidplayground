@@ -1,10 +1,10 @@
 {
   "control_dt": 0.02,
-  "max_step_deg": 5.0,
-  "action_scale": 0.15,
+  "max_step_deg": 15.0,
+  "action_scale": 0.5,
   "joints": [
-    {"name": "hip",   "motor_id": 0, "invert": true,  "kp": 75.0, "kd": 0.3,  "offset_deg": -40.0},
-    {"name": "knee",  "motor_id": 1, "invert": false, "kp": 45.0, "kd": 0.5,  "offset_deg":  60.0},
-    {"name": "ankle", "motor_id": 2, "invert": false, "kp": 30.0, "kd": 0.25, "offset_deg":  20.0}
+    {"name": "hip",   "motor_id": 0, "invert": true,  "kp": 75.0, "kd": 2.0, "offset_deg": -40.0, "default_pos_deg": -12.4132},
+    {"name": "knee",  "motor_id": 1, "invert": false, "kp": 45.0, "kd": 2.0, "offset_deg":  60.0, "default_pos_deg":  18.9734},
+    {"name": "ankle", "motor_id": 2, "invert": false, "kp": 30.0, "kd": 2.0, "offset_deg":  20.0, "default_pos_deg":  14.5602}
   ]
 }
