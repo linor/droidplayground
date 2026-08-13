@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
 import torch
 from collections.abc import Sequence
+from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
@@ -16,14 +18,52 @@ from droidplayground.assets.qmini import QMINI_CFG
 # from .phase_modulator import PhaseModulator
 from .motion_player import MotionPlayer
 
+# Reference gait clip: time (s) -> 10 joint angles, in the clip's own
+# `joint_order` (see the file's "joint_order" key) -- NOT necessarily the
+# articulation's joint order. _load_reference_keyframes() below reorders
+# columns to match self.robot.joint_names at load time.
+KEYFRAMES_PATH = Path(__file__).parent / "keyframes_forward_slow_all_joints_4x.json"
+
+
+def _load_reference_keyframes(json_path: Path, joint_names: list[str]):
+    """Load a keyframe clip and reorder its columns to match `joint_names`.
+
+    The clip stores columns in its own `joint_order` (plain names like
+    "left_yaw", grouped left-then-right). The articulation's joint order can
+    differ (e.g. "Revolute_left_yaw", interleaved left/right/left/right) --
+    so each articulation joint is looked up by name rather than assuming the
+    two orderings already match.
+    """
+    with open(json_path) as f:
+        data = json.load(f)
+
+    clip_order = data["joint_order"]
+    column_for_name = {name: i for i, name in enumerate(clip_order)}
+
+    columns = []
+    for joint_name in joint_names:
+        key = joint_name.removeprefix("Revolute_")
+        if key not in column_for_name:
+            raise KeyError(
+                f"Robot joint '{joint_name}' (looked up as '{key}') has no "
+                f"matching column in {json_path}'s joint_order={clip_order}"
+            )
+        columns.append(column_for_name[key])
+
+    keyframes = [(t, [pose[c] for c in columns]) for t, pose in data["keyframes"]]
+    return keyframes, bool(data.get("degrees", True))
+
+
 @configclass
 class QminiLegEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 4
     episode_length_s = 10.0
     # - spaces definition
-    action_space = 3
-    observation_space = 7
+    # 10 actuated joints (yaw/roll/pitch/knee/ankle x left/right), see
+    # qmini_step_in_place isaac joint listing / keyframes_forward_slow_all_joints_4x.json.
+    action_space = 10
+    observation_space = 21  # 10 joint_pos + 10 joint_vel + 1 motion_time
     state_space = 0
     action_scale = 0.5
 
@@ -80,519 +120,18 @@ class QminiLegEnv(DirectRLEnv):
         #     num_envs=self.num_envs,
         #     device=self.device,
         # )
+        self.num_joints = self.cfg.action_space
+        assert len(self.robot.joint_names) == self.num_joints, (
+            f"Expected {self.num_joints} actuated joints (action_space), "
+            f"but the articulation has {len(self.robot.joint_names)}: "
+            f"{self.robot.joint_names}"
+        )
+
+        keyframes, degrees = _load_reference_keyframes(KEYFRAMES_PATH, self.robot.joint_names)
         self.motion = MotionPlayer(
-            keyframes=[
-                # time, [hip, knee, ankle]
-
-                # # leg lifted
-                # (0.0, [-20, 50, 30]),
-
-                # # leg passing through
-                # (0.4, [-5, 20, 10]),
-
-                # # leg extended
-                # (0.8, [15, -10, 5]),
-
-                # # return swing
-                # (1.2, [-5, 20, 10]),
-
-                # # back to lifted
-                # (1.6, [-20, 50, 30]),
-
-    # this is keyframes_forward_slow_4x.json
-    [
-      0.0,
-      [
-        -12.4132,
-        18.9734,
-        14.5602
-      ]
-    ],
-    [
-      0.066668,
-      [
-        -15.0793,
-        21.8532,
-        14.3195
-      ]
-    ],
-    [
-      0.133332,
-      [
-        -17.1174,
-        24.118,
-        13.3642
-      ]
-    ],
-    [
-      0.2,
-      [
-        -18.4167,
-        25.7784,
-        12.0877
-      ]
-    ],
-    [
-      0.266668,
-      [
-        -18.8723,
-        26.8404,
-        10.873
-      ]
-    ],
-    [
-      0.333332,
-      [
-        -18.4001,
-        27.3071,
-        10.079
-      ]
-    ],
-    [
-      0.4,
-      [
-        -16.9437,
-        27.1767,
-        10.0322
-      ]
-    ],
-    [
-      0.466668,
-      [
-        -14.9915,
-        27.1777,
-        11.2453
-      ]
-    ],
-    [
-      0.533332,
-      [
-        -12.7822,
-        27.5732,
-        13.7906
-      ]
-    ],
-    [
-      0.6,
-      [
-        -10.1697,
-        27.5804,
-        16.4103
-      ]
-    ],
-    [
-      0.666668,
-      [
-        -7.1451,
-        26.9819,
-        18.8363
-      ]
-    ],
-    [
-      0.733332,
-      [
-        -3.8431,
-        25.8096,
-        20.966
-      ]
-    ],
-    [
-      0.8,
-      [
-        -0.4126,
-        24.1223,
-        22.7092
-      ]
-    ],
-    [
-      0.866668,
-      [
-        2.909,
-        22.1092,
-        23.9847
-      ]
-    ],
-    [
-      0.933332,
-      [
-        5.7242,
-        20.1816,
-        24.5348
-      ]
-    ],
-    [
-      1.0,
-      [
-        7.9277,
-        18.5454,
-        24.481
-      ]
-    ],
-    [
-      1.066668,
-      [
-        9.522,
-        17.2824,
-        24.0088
-      ]
-    ],
-    [
-      1.133332,
-      [
-        10.9698,
-        15.6049,
-        22.8948
-      ]
-    ],
-    [
-      1.2,
-      [
-        12.3241,
-        13.4771,
-        21.2573
-      ]
-    ],
-    [
-      1.266668,
-      [
-        13.4122,
-        11.2969,
-        19.4229
-      ]
-    ],
-    [
-      1.333332,
-      [
-        14.0441,
-        9.4925,
-        17.7309
-      ]
-    ],
-    [
-      1.4,
-      [
-        13.9915,
-        8.5467,
-        16.537
-      ]
-    ],
-    [
-      1.466668,
-      [
-        13.3419,
-        9.1681,
-        17.2667
-      ]
-    ],
-    [
-      1.533332,
-      [
-        12.7128,
-        9.7435,
-        17.9708
-      ]
-    ],
-    [
-      1.6,
-      [
-        12.1156,
-        10.2522,
-        18.6401
-      ]
-    ],
-    [
-      1.666668,
-      [
-        11.5617,
-        10.6737,
-        19.2655
-      ]
-    ],
-    [
-      1.733332,
-      [
-        11.0629,
-        10.9878,
-        19.8385
-      ]
-    ],
-    [
-      1.8,
-      [
-        10.631,
-        11.174,
-        20.3505
-      ]
-    ],
-    [
-      1.866668,
-      [
-        9.9964,
-        11.4701,
-        20.4664
-      ]
-    ],
-    [
-      1.933332,
-      [
-        9.0326,
-        11.9793,
-        20.0119
-      ]
-    ],
-    [
-      2.0,
-      [
-        8.1764,
-        12.2927,
-        19.4691
-      ]
-    ],
-    [
-      2.066668,
-      [
-        7.458,
-        12.3628,
-        18.8208
-      ]
-    ],
-    [
-      2.133332,
-      [
-        6.893,
-        12.1686,
-        18.0616
-      ]
-    ],
-    [
-      2.2,
-      [
-        6.4545,
-        11.762,
-        17.2164
-      ]
-    ],
-    [
-      2.266668,
-      [
-        6.1147,
-        11.1945,
-        16.3092
-      ]
-    ],
-    [
-      2.333332,
-      [
-        5.8444,
-        10.5186,
-        15.3629
-      ]
-    ],
-    [
-      2.4,
-      [
-        5.6124,
-        9.7884,
-        14.4006
-      ]
-    ],
-    [
-      2.466668,
-      [
-        5.3854,
-        9.0598,
-        13.4449
-      ]
-    ],
-    [
-      2.533332,
-      [
-        5.1281,
-        8.3911,
-        12.5188
-      ]
-    ],
-    [
-      2.6,
-      [
-        4.8032,
-        7.8424,
-        11.6452
-      ]
-    ],
-    [
-      2.666668,
-      [
-        4.372,
-        7.4752,
-        10.8467
-      ]
-    ],
-    [
-      2.733332,
-      [
-        3.8052,
-        7.3335,
-        10.1382
-      ]
-    ],
-    [
-      2.8,
-      [
-        3.1452,
-        7.3447,
-        9.4894
-      ]
-    ],
-    [
-      2.866668,
-      [
-        2.4102,
-        7.4762,
-        8.8859
-      ]
-    ],
-    [
-      2.933332,
-      [
-        1.6106,
-        7.7089,
-        8.3191
-      ]
-    ],
-    [
-      3.0,
-      [
-        0.7573,
-        8.0232,
-        7.7801
-      ]
-    ],
-    [
-      3.066668,
-      [
-        -0.1387,
-        8.3997,
-        7.2606
-      ]
-    ],
-    [
-      3.133332,
-      [
-        -1.0659,
-        8.819,
-        6.7527
-      ]
-    ],
-    [
-      3.2,
-      [
-        -2.0129,
-        9.2618,
-        6.2486
-      ]
-    ],
-    [
-      3.266668,
-      [
-        -2.9681,
-        9.7096,
-        5.7412
-      ]
-    ],
-    [
-      3.333332,
-      [
-        -3.9195,
-        10.1438,
-        5.2241
-      ]
-    ],
-    [
-      3.4,
-      [
-        -4.8555,
-        10.5467,
-        4.6911
-      ]
-    ],
-    [
-      3.466668,
-      [
-        -5.7639,
-        10.9008,
-        4.1367
-      ]
-    ],
-    [
-      3.533332,
-      [
-        -6.6986,
-        11.455,
-        4.0063
-      ]
-    ],
-    [
-      3.6,
-      [
-        -7.8293,
-        12.9718,
-        5.6426
-      ]
-    ],
-    [
-      3.666668,
-      [
-        -8.8712,
-        14.3603,
-        7.2392
-      ]
-    ],
-    [
-      3.733332,
-      [
-        -9.8149,
-        15.6091,
-        8.7943
-      ]
-    ],
-    [
-      3.8,
-      [
-        -10.6509,
-        16.7067,
-        10.306
-      ]
-    ],
-    [
-      3.866668,
-      [
-        -11.3693,
-        17.6415,
-        11.7723
-      ]
-    ],
-    [
-      3.933332,
-      [
-        -11.9601,
-        18.4013,
-        13.1912
-      ]
-    ],
-    [
-      4.0,
-      [
-        -12.4132,
-        18.9734,
-        14.5602
-      ]
-    ]
-
-
-            ],
+            keyframes=keyframes,
             device=self.device,
-            degrees=True,
+            degrees=degrees,
         )
 
         self.motion_time = torch.zeros(
@@ -721,8 +260,8 @@ class QminiLegEnv(DirectRLEnv):
         # )
         observations = torch.cat(
             (
-                self.robot.data.joint_pos[:, :3],
-                self.robot.data.joint_vel[:, :3],
+                self.robot.data.joint_pos[:, :self.num_joints],
+                self.robot.data.joint_vel[:, :self.num_joints],
                 # reference,
                 self.motion_time.unsqueeze(1)
             ),
@@ -788,7 +327,7 @@ class QminiLegEnv(DirectRLEnv):
 
         reference = self.motion.sample(self.motion_time)
 
-        error = self.robot.data.joint_pos[:, :3] - reference
+        error = self.robot.data.joint_pos[:, :self.num_joints] - reference
 
         tracking_reward = torch.exp(
             -5.0 * torch.sum(error**2, dim=1)
@@ -804,7 +343,7 @@ class QminiLegEnv(DirectRLEnv):
         )/self.step_dt
 
         velocity_error = (
-            self.robot.data.joint_vel[:, :3]
+            self.robot.data.joint_vel[:, :self.num_joints]
             - reference_velocity
         )
 
@@ -833,27 +372,23 @@ class QminiLegEnv(DirectRLEnv):
         # ---------------------------------
         # Trajectory logging (env 0 only)
         # ---------------------------------
-        self.extras["log"] = {
-            "tracking/hip_error": torch.rad2deg(torch.mean(torch.abs(error[:, 0]))),
-            "tracking/knee_error": torch.rad2deg(torch.mean(torch.abs(error[:, 1]))),
-            "tracking/ankle_error": torch.rad2deg(torch.mean(torch.abs(error[:, 2]))),
+        joint_labels = [n.removeprefix("Revolute_") for n in self.robot.joint_names[:self.num_joints]]
+
+        log = {
             "tracking/reward": reward.mean(),
             "tracking/action_rate_penalty": action_rate_penalty.mean(),
-
-            # Reference vs actual joint positions
-            "motion/ref_hip": torch.rad2deg(reference[0, 0]),
-            "motion/ref_knee": torch.rad2deg(reference[0, 1]),
-            "motion/ref_ankle": torch.rad2deg(reference[0, 2]),
-
-            "motion/actual_hip": torch.rad2deg(self.robot.data.joint_pos[0, 0]),
-            "motion/actual_knee": torch.rad2deg(self.robot.data.joint_pos[0, 1]),
-            "motion/actual_ankle": torch.rad2deg(self.robot.data.joint_pos[0, 2]),
         }
+        for i, label in enumerate(joint_labels):
+            log[f"tracking/{label}_error"] = torch.rad2deg(torch.mean(torch.abs(error[:, i])))
+            # Reference vs actual joint positions
+            log[f"motion/ref_{label}"] = torch.rad2deg(reference[0, i])
+            log[f"motion/actual_{label}"] = torch.rad2deg(self.robot.data.joint_pos[0, i])
+        self.extras["log"] = log
 
         # Print every 500 simulation steps
         if self.common_step_counter % 100 == 0:
             ref = torch.rad2deg(reference[0]).cpu()
-            act = torch.rad2deg(self.robot.data.joint_pos[0, :3]).cpu()
+            act = torch.rad2deg(self.robot.data.joint_pos[0, :self.num_joints]).cpu()
 
             print("\n----------------------------")
             print(f"Step {self.common_step_counter}")

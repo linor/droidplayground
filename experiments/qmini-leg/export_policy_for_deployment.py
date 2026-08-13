@@ -12,14 +12,26 @@ robot_deploy.py refuses to run unless policy.meta.json matches both itself
 (obs/action layout it was written for) and the robot config you point it at.
 This is the "wrong policy loaded" safety check you asked for.
 
+IMPORTANT: --joint-order must be the order the POLICY actually produces
+actions in -- i.e. Isaac Lab's articulation joint order (print
+self.robot.joint_names in qmini_leg_env.py's __init__ to get it), NOT
+whatever order robot_config.json happens to list joints in for
+readability/wiring. robot_deploy.py only checks that the two reference the
+same SET of joints, not the same order -- it looks each one up by name, so a
+mismatched order here won't be caught by that check; it'll just silently
+send actions to the wrong motors. For this robot, Isaac's order interleaves
+left/right per joint type (see below), NOT grouped by leg.
+
 USAGE
 -----
     python export_policy_for_deployment.py \
         --checkpoint /path/to/model_1500.pt \
         --output-dir ./deploy_bundle \
-        --joint-order hip knee ankle \
-        --action-scale 0.15 \
-        --obs-terms joint_pos joint_vel motion_ref
+        --joint-order left_hip_yaw right_hip_yaw left_hip_roll right_hip_roll \
+                       left_hip_pitch right_hip_pitch left_knee right_knee \
+                       left_ankle right_ankle \
+        --action-scale 0.5 \
+        --obs-terms joint_pos joint_vel motion_time
 
 You will very likely need to adapt `load_policy_from_checkpoint()` below to
 however your rsl_rl OnPolicyRunner / ActorCritic is actually constructed --
@@ -128,8 +140,11 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--joint-order", nargs="+", required=True,
-                         help="Joint names in the exact order the policy expects, e.g. hip knee ankle")
-    parser.add_argument("--obs-terms", nargs="+", default=["joint_pos", "joint_vel", "motion_ref"],
+                         help="Joint names in the exact order the policy's action vector "
+                              "expects (Isaac Lab's articulation joint order -- NOT necessarily "
+                              "robot_config.json's order, see the module docstring), "
+                              "e.g. left_hip_yaw right_hip_yaw left_hip_roll ...")
+    parser.add_argument("--obs-terms", nargs="+", default=["joint_pos", "joint_vel", "motion_time"],
                          help="Named obs blocks in order, purely documentary/for the runtime check")
     parser.add_argument("--action-scale", type=float, default=0.15)
     parser.add_argument("--actor-hidden-dims", nargs="+", type=int, default=[128, 128, 128])
@@ -137,7 +152,11 @@ def main():
     args = parser.parse_args()
 
     n_joints = len(args.joint_order)
-    obs_dim = n_joints * 2 + n_joints  # joint_pos + joint_vel + motion_ref, matches QminiLegEnv (9 for 3 joints)
+    # joint_pos (n_joints) + joint_vel (n_joints) + a single motion_time
+    # scalar -- matches QminiLegEnv._get_observations exactly (21 for the
+    # current 10-joint env; NOT n_joints*3, which would assume a per-joint
+    # motion_ref term that QminiLegEnv computes but never appends to obs).
+    obs_dim = n_joints * 2 + 1
     action_dim = n_joints
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -159,11 +178,11 @@ def main():
             raise RuntimeError(
                 f"Loaded policy rejected an obs vector of size {obs_dim} "
                 f"(derived from --joint-order having {len(args.joint_order)} "
-                f"joints x 3 obs terms). This almost always means "
-                f"--joint-order and/or --obs-terms don't match how this "
-                f"policy was actually trained (wrong joint count, or a "
-                f"different obs composition than joint_pos+joint_vel+motion_ref). "
-                f"Underlying error: {e}"
+                f"joints x 2 [pos+vel] + 1 motion_time scalar). This almost "
+                f"always means --joint-order and/or --obs-terms don't match "
+                f"how this policy was actually trained (wrong joint count, "
+                f"or a different obs composition than "
+                f"joint_pos+joint_vel+motion_time). Underlying error: {e}"
             ) from e
         if out.shape[-1] != action_dim:
             raise RuntimeError(

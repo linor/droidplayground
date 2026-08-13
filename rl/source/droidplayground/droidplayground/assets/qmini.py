@@ -17,6 +17,8 @@ from droidplayground.assets import ASSET_USD_DIRECTORY
 # "current best sim gains" -- both QMINI_CFG below and build_qmini_cfg()
 # read from it.
 DEFAULT_GAINS = {
+    "hip_yaw": dict(stiffness=55.0, damping=2.0, armature=0.02),
+    "hip_roll": dict(stiffness=105.0, damping=18.0, armature=0.02),
     "hip_pitch": dict(stiffness=75.0, damping=2.0, armature=0.02),
     "knee": dict(stiffness=45.0, damping=2.0, armature=0.02),
     "ankle": dict(stiffness=30.0, damping=2.0, armature=0.02),
@@ -33,7 +35,7 @@ def build_qmini_cfg(gains: dict | None = None) -> ArticulationCfg:
 
     Args:
         gains: optional dict keyed by actuator group name
-            ("hip_pitch" | "knee" | "ankle"), each value a dict with any of
+            ("hip_yaw" | "hip_roll" | "hip_pitch" | "knee" | "ankle"), each value a dict with any of
             "stiffness" / "damping" / "armature". Fields not given for a
             group fall back to DEFAULT_GAINS for that group. Example:
 
@@ -67,7 +69,7 @@ def build_qmini_cfg(gains: dict | None = None) -> ArticulationCfg:
 
 QMINI_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"{ASSET_USD_DIRECTORY}/qmini_urdf.usda",
+        usd_path=f"{ASSET_USD_DIRECTORY}/qmini_urdf-2legs.usda",
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             rigid_body_enabled=True,
             max_linear_velocity=1000.0,
@@ -85,10 +87,20 @@ QMINI_CFG = ArticulationCfg(
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 2.0), # joint_pos={".*": 0.0}
+        # Matches keyframe-0 of keyframes_forward_slow_all_joints_4x.json
+        # (yaw/roll are 0.0 there for both legs, so left implicit). See
+        # qmini_leg_env.py's comment on why default_joint_pos must equal
+        # keyframe-0 exactly -- previously only the left leg's pitch/knee/
+        # ankle were set here, so the right leg reset to 0.0 instead of
+        # keyframe-0, which would jump on the first action of every episode
+        # once the right leg's actuators (added above) started tracking it.
         joint_pos={
             "Revolute_left_pitch": -0.216651,
             "Revolute_left_knee": 0.331148,
-            "Revolute_left_ankle": 0.254123
+            "Revolute_left_ankle": 0.254123,
+            "Revolute_right_pitch": -0.142705,
+            "Revolute_right_knee": -0.214548,
+            "Revolute_right_ankle": -0.339800,
         },
     ),
     actuators={
@@ -115,6 +127,22 @@ QMINI_CFG = ArticulationCfg(
         # Gains come from DEFAULT_GAINS above -- edit that dict, not these
         # literals, so build_qmini_cfg()'s "fall back to defaults" behavior
         # stays consistent with what QMINI_CFG itself spawns with.
+        "hip_yaw": DCMotorCfg(
+            joint_names_expr=[".*yaw"],
+            effort_limit=18.0,
+            saturation_effort=23.7,
+            velocity_limit=30.0,
+            **DEFAULT_GAINS["hip_yaw"],
+        ),
+
+        "hip_roll": DCMotorCfg(
+            joint_names_expr=[".*roll"],
+            effort_limit=18.0,
+            saturation_effort=23.7,
+            velocity_limit=30.0,
+            **DEFAULT_GAINS["hip_roll"],
+        ),
+
         "hip_pitch": DCMotorCfg(
             joint_names_expr=[".*pitch"],
             effort_limit=18.0,

@@ -2,9 +2,12 @@
 """
 robot_deploy.py
 
-Sim-to-real deployment of an Isaac Lab / rsl_rl policy (QminiLegEnv, 3 joints:
-hip, knee, ankle) onto real GO-M8010-6 motors via Unitree's unitree_actuator_sdk,
-over one or more RS485 busses (see "MULTIPLE SERIAL BUSSES" below).
+Sim-to-real deployment of an Isaac Lab / rsl_rl policy (QminiLegEnv, 10 joints:
+hip yaw/roll/pitch, knee, ankle x left/right) onto real GO-M8010-6 motors via
+Unitree's unitree_actuator_sdk, over one or more RS485 busses (see "MULTIPLE
+SERIAL BUSSES" below). Joint count/order is NOT hardcoded here -- it's
+whatever robot_config.json's "joints" list declares, cross-checked against
+the policy's own joint_order at startup (see load_and_verify_policy()).
 
 WHAT THIS SCRIPT DOES
 ----------------------
@@ -75,7 +78,8 @@ WHAT YOU MUST ADAPT
 USAGE
 -----
     python3 robot_deploy.py \
-        --config robot_config.json \
+        --config robot_config_qmini.json \
+        --keyframes keyframes_forward_slow_all_joints_4x.json \
         --policy ./deploy_bundle/policy.pt \
         --policy-meta ./deploy_bundle/policy.meta.json
 
@@ -84,23 +88,26 @@ in robot_config.json (see "MULTIPLE SERIAL BUSSES" above), since a config
 that's wrong for the robot you're pointing it at is exactly the kind of
 mistake that should live in a reviewable file, not a shell history entry.
 
-robot_config.json example:
+robot_config.json example (see robot_config_qmini.json for the full,
+currently-in-use 10-joint config this robot actually runs with):
 {
   "control_dt": 0.02,
-  "max_step_deg": 5.0,
-  "action_scale": 0.15,
+  "max_step_deg": 15.0,
+  "action_scale": 0.5,
   "motor_temp_limit_c": 55.0,
   "joints": [
-    {"name": "hip",   "motor_id": 0, "port": "/dev/ttyUSB0", "invert": false, "kp": 140.0, "kd": 5.0, "default_pos_deg": -12.4132, "min_deg": -45.0, "max_deg": 45.0},
-    {"name": "knee",  "motor_id": 1, "port": "/dev/ttyUSB0", "invert": true,  "kp": 180.0, "kd": 6.0, "default_pos_deg": 18.9734,  "min_deg": -90.0, "max_deg": 30.0},
-    {"name": "ankle", "motor_id": 2, "port": "/dev/ttyUSB0", "invert": false, "kp": 90.0,  "kd": 3.0, "default_pos_deg": 14.5602,  "min_deg": -45.0, "max_deg": 45.0, "extra_gear_ratio": 1.0}
+    {"name": "left_hip_yaw",   "motor_id": 1, "port": "/dev/ttyUSB3", "invert": false, "kp": 55.0,  "kd": 2.0,  "default_pos_deg": 8.1526,  "min_deg": -45.0, "max_deg": 30.0},
+    {"name": "left_hip_roll",  "motor_id": 1, "port": "/dev/ttyUSB2", "invert": false, "kp": 105.0, "kd": 18.0, "default_pos_deg": -0.1799, "min_deg": -15.0, "max_deg": 15.0, "extra_gear_ratio": 3.0},
+    {"name": "left_hip_pitch", "motor_id": 0, "port": "/dev/ttyUSB1", "invert": true,  "kp": 75.0,  "kd": 2.0,  "default_pos_deg": 4.5092,  "min_deg": -50.0, "max_deg": 50.0},
+    {"name": "left_knee",      "motor_id": 1, "port": "/dev/ttyUSB1", "invert": false, "kp": 45.0,  "kd": 2.0,  "default_pos_deg": 16.6821, "min_deg": -60.0, "max_deg": 50.0},
+    {"name": "left_ankle",     "motor_id": 2, "port": "/dev/ttyUSB1", "invert": false, "kp": 30.0,  "kd": 2.0,  "default_pos_deg": 25.6964, "min_deg": -60.0, "max_deg": 40.0}
+    ... and the mirrored right_* joints -- see robot_config_qmini.json for the full list
   ]
 }
 min_deg/max_deg are output-side degrees, optional per side (omit or set
 null for "no limit" on that side) -- but leaving them unset means that
 joint has NO joint-limit safety abort, so set them to your robot's actual
-safe mechanical range before running for real (the numbers above are just
-illustrative, not measured for your hardware).
+safe mechanical range before running for real.
 
 NOTE ON default_pos_deg: this must exactly match the corresponding joint's
 default_joint_pos in training (qmini.py's ArticulationCfg.InitialStateCfg.joint_pos,
@@ -193,9 +200,9 @@ class JointConfig:
     # default_joint_pos for this joint exactly (qmini.py's
     # ArticulationCfg.InitialStateCfg.joint_pos, converted to degrees,
     # currently the keyframe-0 pose -- NOT necessarily 0). This is a single
-    # fixed number, unlike keyframes.json/DEFAULT_KEYFRAMES_DEG below (the
-    # full animation, only needed for --open-loop-ref / the obs motion_time
-    # phase signal, not for reconstructing policy targets).
+    # fixed number, unlike the --keyframes clip (the full animation, only
+    # needed for --open-loop-ref / the obs motion_time phase signal, not
+    # for reconstructing policy targets).
     min_deg: Optional[float] = None  # output-side lower limit; None = no limit enforced (unsafe -- set this!)
     max_deg: Optional[float] = None  # output-side upper limit; None = no limit enforced (unsafe -- set this!)
     extra_gear_ratio: float = 1.0
@@ -263,8 +270,11 @@ def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotC
 
     n_joints = len(robot_cfg.joints)
     expected_action_dim = n_joints
-    # expected_obs_dim = n_joints * 3  # joint_pos + joint_vel + motion_ref, per QminiLegEnv
-    expected_obs_dim = 7
+    # joint_pos (n_joints) + joint_vel (n_joints) + a single motion_time
+    # scalar -- matches QminiLegEnv._get_observations exactly (NOT a
+    # per-joint motion_ref: that term is computed but never appended there,
+    # see the commented-out `# reference,` line).
+    expected_obs_dim = n_joints * 2 + 1
 
     if meta.get("action_dim") != expected_action_dim:
         raise PolicyMismatchError(
@@ -274,14 +284,30 @@ def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotC
     if meta.get("obs_dim") != expected_obs_dim:
         raise PolicyMismatchError(
             f"Policy obs_dim={meta.get('obs_dim')} does not match expected "
-            f"{expected_obs_dim} (3 * {n_joints} joints: pos+vel+ref)."
+            f"{expected_obs_dim} (2 * {n_joints} joints [pos+vel] + 1 motion_time scalar)."
         )
-    if list(meta.get("joint_order", [])) != robot_cfg.joint_names:
+    # NOTE: this is a SET comparison, not an order comparison. robot_cfg's
+    # joint order is whatever's convenient to read/wire physically (e.g.
+    # grouped by leg); meta["joint_order"] is the order the policy actually
+    # produces actions in (e.g. Isaac Lab's articulation order, which
+    # interleaves left/right and will generally NOT match robot_cfg's
+    # order). Deployment builds every obs/action array by walking
+    # meta["joint_order"] and looking joints up by NAME -- never by
+    # position against robot_cfg.joints -- specifically so this mismatch
+    # (a real bug caught during the 3->10 joint migration: a naive
+    # positional zip between the two orders would have silently swapped
+    # which motor got which command) can't reoccur regardless of how
+    # robot_cfg.json happens to list its joints.
+    policy_joint_order = list(meta.get("joint_order", []))
+    if len(policy_joint_order) != len(set(policy_joint_order)):
         raise PolicyMismatchError(
-            f"Policy joint_order={meta.get('joint_order')} does not match "
-            f"robot config joint order {robot_cfg.joint_names}. Joint order "
-            f"mismatches are especially dangerous -- they silently swap which "
-            f"motor gets which command."
+            f"Policy joint_order={policy_joint_order} contains duplicate names."
+        )
+    if set(policy_joint_order) != set(robot_cfg.joint_names):
+        raise PolicyMismatchError(
+            f"Policy joint_order={policy_joint_order} does not reference the "
+            f"same set of joints as robot config {robot_cfg.joint_names} "
+            f"(order may differ, but every joint name must appear in both)."
         )
     if abs(meta.get("action_scale", robot_cfg.action_scale) - robot_cfg.action_scale) > 1e-9:
         logger.warning(
@@ -350,14 +376,26 @@ class MotionReference:
         self.length = self.times[-1]  # assumes first/last keyframe match, i.e. a closed loop
 
     @classmethod
-    def from_json(cls, path: Path) -> "MotionReference":
-        """Load keyframes from the shared keyframes.json (see that file's
-        _warning field) instead of a hardcoded DEFAULT_KEYFRAMES_DEG copy.
-        Kept as a separate constructor rather than changing __init__'s
-        signature so DEFAULT_KEYFRAMES_DEG below still works unmodified for
-        anyone not yet using the shared file."""
+    def from_json(cls, path: Path, n_joints: Optional[int] = None) -> "MotionReference":
+        """Load keyframes from a shared keyframes.json (e.g.
+        keyframes_forward_slow_all_joints_4x.json). If `n_joints` is given,
+        checks every frame has exactly that many values -- a clip built for
+        the wrong joint count would otherwise only surface as a much more
+        confusing IndexError deep in the control loop (--open-loop-ref) or
+        _startup_pose_targets()."""
         raw = json.loads(Path(path).read_text())
-        return cls(raw["keyframes"], degrees=raw.get("degrees", True))
+        keyframes = raw["keyframes"]
+        if n_joints is not None:
+            for t, pose in keyframes:
+                if len(pose) != n_joints:
+                    raise ValueError(
+                        f"{path} has a keyframe at t={t} with {len(pose)} "
+                        f"joint values, but robot_config.json declares "
+                        f"{n_joints} joints. This clip was very likely built "
+                        f"for a different robot/joint-count -- check "
+                        f"joint_order in the file before using it."
+                    )
+        return cls(keyframes, degrees=raw.get("degrees", True))
 
     def sample(self, t: float):
         t = t % self.length
@@ -369,21 +407,6 @@ class MotionReference:
                 return [a + alpha * (b - a) for a, b in zip(v0, v1)]
         return self.values_rad[-1]
 
-
-DEFAULT_KEYFRAMES_DEG = [
-    (0.0, [20, -50, 30]),
-    (0.4, [5, -20, 10]),
-    (0.8, [-15, 10, 5]),
-    (1.2, [5, -20, 10]),
-    (1.6, [20, -50, 30]),
-]
-# DEFAULT_KEYFRAMES_DEG = [
-#     (0.0, [20, -50, 30]),
-#     (1.0, [5, -20, 10]),
-#     (2.0, [-15, 10, 5]),
-#     (3.0, [5, -20, 10]),
-#     (4.0, [20, -50, 30]),
-# ]
 
 
 # ---------------------------------------------------------------------------
@@ -749,22 +772,29 @@ def setup_logging(log_dir: Path):
     return logger, csv_writer, csv_file, csv_path
 
 
-def write_csv_header(csv_writer, joint_names):
+def write_csv_header(csv_writer, policy_joint_order, physical_joint_names):
     # NOTE: this must match build_obs()'s actual layout exactly (pos x N,
     # then vel x N, then a single motion_time scalar -- NOT an obs_ref per
     # joint, which build_obs() computes but never appends). The previous
     # version of this header didn't match, which silently shifted every
     # column after it by 2. If you've since added `ref` back into build_obs
     # (the commented-out `obs.extend(ref)` line), update this to match.
+    #
+    # obs/action columns follow `policy_joint_order` (meta.json's order --
+    # what the policy's own vectors are actually indexed by); the
+    # target/actual/temp/err columns follow `physical_joint_names`
+    # (robot_cfg's order -- purely bookkeeping, doesn't need to match the
+    # policy). These two orders are allowed to differ -- see
+    # load_and_verify_policy()'s joint_order check and Deployment.build_obs.
     header = ["t_wall", "motion_time"]  # t_wall = measured perf_counter() time since run() started
-    for name in joint_names:
+    for name in policy_joint_order:
         header += [f"obs_pos_{name}"]
-    for name in joint_names:
+    for name in policy_joint_order:
         header += [f"obs_vel_{name}"]
     header += ["obs_motion_time"]
-    for name in joint_names:
+    for name in policy_joint_order:
         header += [f"action_{name}"]
-    for name in joint_names:
+    for name in physical_joint_names:
         header += [f"target_deg_{name}", f"actual_deg_{name}", f"temp_{name}", f"err_{name}"]
     header += ["policy_ms", "bus_ms"]  # per-step timing breakdown, see analyze_delay.py
     csv_writer.writerow(header)
@@ -782,6 +812,7 @@ class Deployment:
         logger: logging.Logger,
         csv_writer,
         csv_file,
+        policy_joint_order: Optional[list] = None,
         keyframes_path: Optional[Path] = None,
         open_loop_ref: bool = False,
         startup_pose: str = "auto",
@@ -794,7 +825,26 @@ class Deployment:
         self.logger = logger
         self.csv_writer = csv_writer
         self.csv_file = csv_file
-        write_csv_header(self.csv_writer, robot_cfg.joint_names)
+
+        # The order the policy's obs/action vectors are actually indexed by
+        # -- from policy.meta.json's joint_order, verified by
+        # load_and_verify_policy() to reference the same joints as
+        # robot_cfg (as a SET, not by position). build_obs()/run() walk
+        # THIS list and look joints up by name, never by position against
+        # robot_cfg.joints, so robot_cfg.json's own order (e.g. grouped by
+        # leg, for readability/wiring) doesn't need to match it. Falls back
+        # to robot_cfg.joint_names for --open-loop-ref, where there's no
+        # policy/meta to source an order from and this list is only used
+        # for (unused-for-control) obs logging.
+        self.policy_joint_order = (
+            list(policy_joint_order) if policy_joint_order is not None else robot_cfg.joint_names
+        )
+        assert set(self.policy_joint_order) == set(robot_cfg.joint_names), (
+            "policy_joint_order must reference exactly robot_cfg's joints -- "
+            "this should have been caught by load_and_verify_policy()."
+        )
+
+        write_csv_header(self.csv_writer, self.policy_joint_order, robot_cfg.joint_names)
 
         for joint in robot_cfg.joints:
             if joint.min_deg is None or joint.max_deg is None:
@@ -845,15 +895,16 @@ class Deployment:
             "; ".join(f"{bus.port} -> {[j.name for j in bus.joints]}" for bus in self.buses),
         )
 
-        if keyframes_path is not None:
-            self.motion = MotionReference.from_json(keyframes_path)
-            self.logger.info("Loaded keyframes from %s", keyframes_path)
-        else:
-            self.motion = MotionReference(DEFAULT_KEYFRAMES_DEG, degrees=True)
-            self.logger.warning(
-                "Using hardcoded DEFAULT_KEYFRAMES_DEG, not the shared "
-                "keyframes.json -- pass --keyframes to avoid sim/real drift."
+        if keyframes_path is None:
+            raise ValueError(
+                "keyframes_path is required -- pass --keyframes pointing at "
+                "the clip this robot_config.json's joints were tuned "
+                "against (e.g. keyframes_forward_slow_all_joints_4x.json). "
+                "There is no built-in default clip: a stale/wrong joint "
+                "count here would silently drift from what training used."
             )
+        self.motion = MotionReference.from_json(keyframes_path, n_joints=len(robot_cfg.joints))
+        self.logger.info("Loaded keyframes from %s", keyframes_path)
         self.motion_time = 0.0
 
         # Fixed anchor pose each joint's action is decoded relative to --
@@ -918,6 +969,12 @@ class Deployment:
         elif self.startup_pose_mode == "default":
             return dict(self.default_pose_rad)
         elif self.startup_pose_mode == "keyframe":
+            # Zipped positionally against robot_cfg.joints (NOT
+            # policy_joint_order) -- this is a property of the shared
+            # keyframes clip, which is authored in the same order
+            # robot_cfg.json lists its joints in (grouped by leg), not the
+            # policy's training order. Unlike build_obs/run() above, there
+            # is no meta.json here to source a name-verified order from.
             ref = self.motion.sample(0.0)
             return {joint.name: ref[i] for i, joint in enumerate(self.robot_cfg.joints)}
         else:
@@ -989,13 +1046,24 @@ class Deployment:
         if self.startup_pose_mode != "none":
             self.move_to_pose(self._startup_pose_targets(), self.startup_move_duration)
 
+        answer = input(
+            "Start pose reached: Continue and start policy? [y/N] "
+        )
+        if answer.strip().lower() != "y":
+            self.logger.info("User declined startup confirmation. Exiting without enabling motors.")
+            self._release_all()
+            sys.exit(0)
+
     def build_obs(self, readings: dict) -> torch.Tensor:
         ref = self.motion.sample(self.motion_time)
         obs = []
-        for i, joint in enumerate(self.robot_cfg.joints):
-            obs.append(readings[joint.name].output_pos_rad)
-        for i, joint in enumerate(self.robot_cfg.joints):
-            obs.append(readings[joint.name].output_vel_rad_s)
+        # Walk policy_joint_order (NOT robot_cfg.joints) so the obs vector
+        # is indexed exactly the way the policy was trained, regardless of
+        # what order robot_cfg.json happens to list joints in.
+        for name in self.policy_joint_order:
+            obs.append(readings[name].output_pos_rad)
+        for name in self.policy_joint_order:
+            obs.append(readings[name].output_vel_rad_s)
         obs.append(self.motion_time)
         # obs.extend(ref)
         return torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
@@ -1012,8 +1080,8 @@ class Deployment:
 
                 readings = new_readings
 
-                print(f"CURRENT HIP: {math.degrees(readings['hip'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['ankle'].output_pos_rad):10.5f}")
-
+                print(f"CURRENT  LEFT HIP YAW: {math.degrees(readings['left_hip_yaw'].output_pos_rad):10.5f}  HIP ROLL: {math.degrees(readings['left_hip_roll'].output_pos_rad):10.5f}  HIP PITCH: {math.degrees(readings['left_hip_pitch'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['left_knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['left_ankle'].output_pos_rad):10.5f}")
+                print(f"CURRENT RIGHT HIP YAW: {math.degrees(readings['right_hip_yaw'].output_pos_rad):10.5f}  HIP ROLL: {math.degrees(readings['right_hip_roll'].output_pos_rad):10.5f}  HIP PITCH: {math.degrees(readings['right_hip_pitch'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['right_knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['right_ankle'].output_pos_rad):10.5f}")
                 obs = self.build_obs(readings)
 
                 ref = self.motion.sample(self.motion_time)
@@ -1022,7 +1090,9 @@ class Deployment:
                 if self.open_loop_ref:
                     # Bypass the policy entirely -- targets are the raw
                     # reference trajectory. Used to capture a real-robot
-                    # trace to compare against tune_pid_isaaclab.py.
+                    # trace to compare against tune_pid_isaaclab.py. Zipped
+                    # against robot_cfg.joints, same as _startup_pose_targets'
+                    # "keyframe" branch -- see the comment there.
                     action = [0.0] * len(self.robot_cfg.joints)
                     targets = {joint.name: ref[i] for i, joint in enumerate(self.robot_cfg.joints)}
                 else:
@@ -1032,11 +1102,15 @@ class Deployment:
                     # Must mirror QminiLegEnv._apply_action exactly: action
                     # is a small offset from the fixed default_pose_rad
                     # anchor, scaled by action_scale -- NOT an absolute
-                    # target. See JointConfig.default_pos_deg.
+                    # target. See JointConfig.default_pos_deg. Indexed by
+                    # policy_joint_order (matching build_obs above), NOT
+                    # robot_cfg.joints -- action[i] means whatever joint
+                    # policy_joint_order[i] names, which may not be
+                    # robot_cfg.joints[i].
                     targets = {
-                        joint.name: self.default_pose_rad[joint.name]
+                        name: self.default_pose_rad[name]
                         + self.robot_cfg.action_scale * float(action[i])
-                        for i, joint in enumerate(self.robot_cfg.joints)
+                        for i, name in enumerate(self.policy_joint_order)
                     }
                 policy_ms = (time.perf_counter() - policy_start) * 1000.0
 
@@ -1049,7 +1123,8 @@ class Deployment:
                         self._smoothed_targets[name] = smoothed
                         targets[name] = smoothed
 
-                print(f"TARGETS HIP: {math.degrees(targets['hip']):10.5f}  KNEE: {math.degrees(targets['knee']):10.5f}  ANKLE: {math.degrees(targets['ankle']):10.5f}")
+                print(f"TARGETS  LEFT HIP YAW: {math.degrees(targets['left_hip_yaw']):10.5f}  HIP ROLL: {math.degrees(targets['left_hip_roll']):10.5f}  HIP PITCH: {math.degrees(targets['left_hip_pitch']):10.5f}  KNEE: {math.degrees(targets['left_knee']):10.5f}  ANKLE: {math.degrees(targets['left_ankle']):10.5f}")
+                print(f"TARGETS RIGHT HIP YAW: {math.degrees(targets['right_hip_yaw']):10.5f}  HIP ROLL: {math.degrees(targets['right_hip_roll']):10.5f}  HIP PITCH: {math.degrees(targets['right_hip_pitch']):10.5f}  KNEE: {math.degrees(targets['right_knee']):10.5f}  ANKLE: {math.degrees(targets['right_ankle']):10.5f}")
 
                 bus_start = time.perf_counter()
                 try:
@@ -1120,9 +1195,11 @@ def main():
     )
     parser.add_argument("--log-dir", type=Path, default=Path("./logs"))
     parser.add_argument(
-        "--keyframes", type=Path, default=None,
-        help="Path to shared keyframes.json. If omitted, falls back to the "
-             "hardcoded DEFAULT_KEYFRAMES_DEG (logs a warning).",
+        "--keyframes", type=Path, required=True,
+        help="Path to the shared keyframes clip (e.g. "
+             "keyframes_forward_slow_all_joints_4x.json) matching --config's "
+             "joint count and order. Required -- there is no built-in "
+             "default clip.",
     )
     parser.add_argument(
         "--open-loop-ref", action="store_true",
@@ -1173,6 +1250,7 @@ def main():
     logger.info("Logging control loop to %s", csv_path)
 
     try:
+        policy_joint_order = None
         if args.open_loop_ref:
             if args.policy or args.policy_meta:
                 logger.info("--open-loop-ref set: ignoring --policy/--policy-meta, the policy will not be called.")
@@ -1181,9 +1259,11 @@ def main():
             if not args.policy or not args.policy_meta:
                 parser.error("--policy and --policy-meta are required unless --open-loop-ref is set.")
             policy, meta = load_and_verify_policy(args.policy, args.policy_meta, robot_cfg, logger)
+            policy_joint_order = meta["joint_order"]
 
         deployment = Deployment(
             robot_cfg, policy, logger, csv_writer, csv_file,
+            policy_joint_order=policy_joint_order,
             keyframes_path=args.keyframes, open_loop_ref=args.open_loop_ref,
             startup_pose=args.startup_pose, startup_move_duration=args.startup_move_duration,
             action_smoothing=args.action_smoothing,
