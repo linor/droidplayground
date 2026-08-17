@@ -31,7 +31,7 @@ USAGE
                        left_hip_pitch right_hip_pitch left_knee right_knee \
                        left_ankle right_ankle \
         --action-scale 0.5 \
-        --obs-terms joint_pos joint_vel motion_time
+        --obs-terms joint_pos joint_vel imu_gravity imu_ang_vel motion_time
 
 You will very likely need to adapt `load_policy_from_checkpoint()` below to
 however your rsl_rl OnPolicyRunner / ActorCritic is actually constructed --
@@ -144,19 +144,23 @@ def main():
                               "expects (Isaac Lab's articulation joint order -- NOT necessarily "
                               "robot_config.json's order, see the module docstring), "
                               "e.g. left_hip_yaw right_hip_yaw left_hip_roll ...")
-    parser.add_argument("--obs-terms", nargs="+", default=["joint_pos", "joint_vel", "motion_time"],
-                         help="Named obs blocks in order, purely documentary/for the runtime check")
+    parser.add_argument(
+        "--obs-terms", nargs="+",
+        default=["joint_pos", "joint_vel", "imu_gravity", "imu_ang_vel", "motion_time"],
+        help="Named obs blocks in order, purely documentary/for the runtime check",
+    )
     parser.add_argument("--action-scale", type=float, default=0.15)
     parser.add_argument("--actor-hidden-dims", nargs="+", type=int, default=[128, 128, 128])
     parser.add_argument("--activation", default="elu", choices=["elu", "relu", "tanh"])
     args = parser.parse_args()
 
     n_joints = len(args.joint_order)
-    # joint_pos (n_joints) + joint_vel (n_joints) + a single motion_time
-    # scalar -- matches QminiLegEnv._get_observations exactly (21 for the
-    # current 10-joint env; NOT n_joints*3, which would assume a per-joint
-    # motion_ref term that QminiLegEnv computes but never appends to obs).
-    obs_dim = n_joints * 2 + 1
+    # joint_pos (n_joints) + joint_vel (n_joints) + 3 IMU projected-gravity
+    # + 3 IMU angular velocity + a single motion_time scalar -- matches
+    # QminiLegEnv._get_observations exactly (27 for the current 10-joint
+    # env; NOT n_joints*3, which would assume a per-joint motion_ref term
+    # that QminiLegEnv computes but never appends to obs).
+    obs_dim = n_joints * 2 + 6 + 1
     action_dim = n_joints
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -178,11 +182,13 @@ def main():
             raise RuntimeError(
                 f"Loaded policy rejected an obs vector of size {obs_dim} "
                 f"(derived from --joint-order having {len(args.joint_order)} "
-                f"joints x 2 [pos+vel] + 1 motion_time scalar). This almost "
-                f"always means --joint-order and/or --obs-terms don't match "
-                f"how this policy was actually trained (wrong joint count, "
-                f"or a different obs composition than "
-                f"joint_pos+joint_vel+motion_time). Underlying error: {e}"
+                f"joints x 2 [pos+vel] + 6 IMU [gravity xyz + ang_vel xyz] + "
+                f"1 motion_time scalar). This almost always means "
+                f"--joint-order and/or --obs-terms don't match how this "
+                f"policy was actually trained (wrong joint count, or a "
+                f"different obs composition than "
+                f"joint_pos+joint_vel+imu_gravity+imu_ang_vel+motion_time). "
+                f"Underlying error: {e}"
             ) from e
         if out.shape[-1] != action_dim:
             raise RuntimeError(

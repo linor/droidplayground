@@ -1,0 +1,23 @@
+{
+  "control_dt": 0.02,
+  "max_step_deg": 15.0,
+  "action_scale": 0.5,
+  "motor_temp_limit_c": 55.0,
+  "_pose_comment": "default_pos_deg below is the static standing-balance pose (NOT the old forward_slow walking gait's keyframe-0) -- found empirically with tune_stance_lean_isaaclab.py against qmini_urdf-2legs.usda's real mass distribution (battery + Pi mount etc.), and what qmini.py's ArticulationCfg.InitialStateCfg.joint_pos / keyframes_standing_still.json's keyframe-0 both currently use for training. Use this config (not robot_config_qmini.json or the _forward_slow/_left_strafe/_left_turn variants) together with --keyframes keyframes_standing_still.json to deploy the standing-balance policy.",
+  "_imu_comment": "axis_remap is [[chip_axis_index, sign], ...] for base_link's own [X, Y, Z]. Confirmed in Isaac Sim: base_link +X points toward the LEFT leg, +Y toward the REAR, +Z is up. Chip mount: chip X+ = robot rear, chip Y+ = robot right leg, chip Z+ = up. So base_X=-chip_Y, base_Y=chip_X, base_Z=chip_Z. NOT yet verified against the real sensor -- run imu_calibration_check.py before trusting this on real hardware.",
+  "imu_i2c_address": null,
+  "imu_axis_remap": [[1, -1.0], [0, 1.0], [2, 1.0]],
+  "joints": [
+    {"name": "left_hip_yaw",    "motor_id": 1, "port": "/dev/ttyUSB3", "invert": false, "kp": 55.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":   0.0, "min_deg": -45, "max_deg": 30},
+    {"name": "left_hip_roll",   "motor_id": 1, "port": "/dev/ttyUSB2", "invert": false, "kp": 105.0, "kd": 18.0, "offset_deg": 0.0, "default_pos_deg":   0.0, "min_deg": -15, "max_deg": 15, "extra_gear_ratio": 3.0},
+    {"name": "left_hip_pitch",  "motor_id": 0, "port": "/dev/ttyUSB1", "invert": true,  "kp": 75.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg": -16.0, "min_deg": -50, "max_deg": 50},
+    {"name": "left_knee",       "motor_id": 1, "port": "/dev/ttyUSB1", "invert": false, "kp": 45.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":  10.0, "min_deg": -60, "max_deg": 50},
+    {"name": "left_ankle",      "motor_id": 2, "port": "/dev/ttyUSB1", "invert": false, "kp": 30.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":   1.0, "min_deg": -60, "max_deg": 40},
+
+    {"name": "right_hip_yaw",   "motor_id": 0, "port": "/dev/ttyUSB3", "invert": false, "kp": 55.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":   0.0, "min_deg": -30, "max_deg": 45},
+    {"name": "right_hip_roll",  "motor_id": 0, "port": "/dev/ttyUSB2", "invert": false, "kp": 105.0, "kd": 18.0, "offset_deg": 0.0, "default_pos_deg":   0.0, "min_deg": -15, "max_deg": 15, "extra_gear_ratio": 3.0},
+    {"name": "right_hip_pitch", "motor_id": 0, "port": "/dev/ttyUSB0", "invert": true,  "kp": 75.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":  16.0, "min_deg": -50, "max_deg": 50},
+    {"name": "right_knee",      "motor_id": 1, "port": "/dev/ttyUSB0", "invert": false, "kp": 45.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg": -10.0, "min_deg": -50, "max_deg": 60},
+    {"name": "right_ankle",     "motor_id": 2, "port": "/dev/ttyUSB0", "invert": false, "kp": 30.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":  -1.0, "min_deg": -40, "max_deg": 60}
+  ]
+}

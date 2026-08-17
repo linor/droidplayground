@@ -1,17 +1,26 @@
 {
-  "obs_dim": 7,
-  "action_dim": 3,
+  "obs_dim": 27,
+  "action_dim": 10,
   "joint_order": [
-    "hip",
-    "knee",
-    "ankle"
+    "left_hip_yaw",
+    "right_hip_yaw",
+    "left_hip_roll",
+    "right_hip_roll",
+    "left_hip_pitch",
+    "right_hip_pitch",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle"
   ],
   "obs_terms": [
     "joint_pos",
     "joint_vel",
-    "motion_ref"
+    "imu_gravity",
+    "imu_ang_vel",
+    "motion_time"
   ],
   "action_scale": 0.5,
-  "source_checkpoint": "../qmini-leg/policies/policy.pt",
-  "policy_sha256": "88aa6e15b04ad0ee6066b1e8e7fca7019014cd823db70a4c290ba77f27ce9a6c"
+  "source_checkpoint": "../../logs/rsl_rl/qmini-leg/2026-08-17_19-14-29/exported/policy.pt",
+  "policy_sha256": "fc36e295f500716345909bc92f157650c4d03686acff09b5c8ead07c8a669106"
 }

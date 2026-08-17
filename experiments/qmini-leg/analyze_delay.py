@@ -76,6 +76,12 @@ def report_loop_timing(data: dict, control_dt_hint: float | None):
         print(f"  target dt      : {control_dt_hint*1000:7.2f} ms  ({1.0/control_dt_hint:6.1f} Hz)")
         overrun_frac = np.mean(dt > 1.5 * control_dt_hint)
         print(f"  frac. overrun  : {overrun_frac*100:5.1f}% of steps exceed 1.5x target dt")
+    if "imu_ms" in data:
+        print(f"  mean imu_ms    : {data['imu_ms'].mean():7.2f} ms  "
+              f"(<- IMU read, happens before policy_ms starts timing; worth "
+              f"watching if you're on a USB-bridged I2C adapter, e.g. "
+              f"MCP2221/FT232H, which has higher per-transaction latency "
+              f"than the Pi's native GPIO I2C)")
     if "policy_ms" in data and "bus_ms" in data:
         print(f"  mean policy_ms : {data['policy_ms'].mean():7.2f} ms")
         print(f"  mean bus_ms    : {data['bus_ms'].mean():7.2f} ms  "

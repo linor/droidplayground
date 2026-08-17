@@ -78,10 +78,20 @@ WHAT YOU MUST ADAPT
 USAGE
 -----
     python3 robot_deploy.py \
-        --config robot_config_qmini.json \
-        --keyframes keyframes_forward_slow_all_joints_4x.json \
+        --config robot_config_qmini_standing.json \
+        --keyframes keyframes_standing_still.json \
         --policy ./deploy_bundle/policy.pt \
         --policy-meta ./deploy_bundle/policy.meta.json
+
+(robot_config_qmini_standing.json is the current one to use -- it has
+default_pos_deg set to the verified static standing-balance pose, matching
+qmini.py's ArticulationCfg.InitialStateCfg.joint_pos and
+keyframes_standing_still.json's keyframe-0. robot_config_qmini.json and the
+_forward_slow/_left_strafe/_left_turn variants still have the OLDER
+walking-gait default_pos_deg -- don't use those with a policy trained
+against the standing pose, see load_and_verify_policy()'s default_pos_deg
+check, which will refuse to run a mismatched pair if the policy's
+meta.json declares it.)
 
 Note: the serial port used to be a --port CLI flag. It's now set per joint
 in robot_config.json (see "MULTIPLE SERIAL BUSSES" above), since a config
@@ -134,6 +144,8 @@ from typing import Optional
 
 import torch
 
+import imu_sensor
+
 # ---------------------------------------------------------------------------
 # unitree_actuator_sdk import
 # ---------------------------------------------------------------------------
@@ -180,6 +192,23 @@ RAD2DEG = 180.0 / math.pi
 # far from its last reading, however long a stall lasted.
 MAX_PLAUSIBLE_JOINT_JUMP_RAD = math.radians(60.0)
 
+# *** TEMPORARY WORKAROUND -- remove once a retrained policy is deployed ***
+# Joints listed here have the POLICY's action ignored entirely and are held
+# at their fixed default_pose_rad anchor instead -- see Deployment.run().
+# Added because a policy trained before qmini_leg_env.py's
+# target_limit_penalty fix learned to command hip_roll targets beyond the
+# real joint's physical limits (2026-08-16 SAFETY ABORT: right_hip_roll
+# -18.18 deg, limits [-15,15] -- see that fix's commit/comment for why sim
+# never taught it not to). Both hip_roll joints are frozen, not just the
+# one that tripped: the policy learned a MIRRORED left/right roll strategy,
+# so holding only one side at default while the other still acts on it
+# risks a worse, inconsistent asymmetry rather than a safe fallback.
+# left_hip_roll=0/right_hip_roll=0 (the default pose) is exactly the
+# stance tune_stance_lean_isaaclab.py verified stable (worst_tilt=3.2deg)
+# before any roll offset was ever introduced, so freezing here falls back
+# to a known-good baseline, not an untested one.
+FROZEN_JOINTS = {}  # "left_hip_roll", "right_hip_roll"
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -218,6 +247,13 @@ class RobotConfig:
     action_scale: float = 0.15
     motor_temp_limit_c: float = 55.0
     joints: list = field(default_factory=list)  # list[JointConfig]
+    # IMU (see imu_sensor.py). None = that module's defaults
+    # (DEFAULT_LSM6DSOX_ADDRESS / AXIS_REMAP). Living in robot_config.json
+    # rather than hardcoded in imu_sensor.py keeps the same "wiring/
+    # calibration mistakes belong in a reviewable file" philosophy as the
+    # joints list above -- and lets --config alone fully describe a robot.
+    imu_i2c_address: Optional[int] = None
+    imu_axis_remap: Optional[list] = None  # [[chip_axis_index, sign], ...] for robot [X, Y, Z]
 
     @staticmethod
     def load(path: Path) -> "RobotConfig":
@@ -240,6 +276,8 @@ class RobotConfig:
             action_scale=raw.get("action_scale", 0.15),
             motor_temp_limit_c=raw.get("motor_temp_limit_c", 55.0),
             joints=joints,
+            imu_i2c_address=raw.get("imu_i2c_address"),
+            imu_axis_remap=raw.get("imu_axis_remap"),
         )
 
     @property
@@ -270,11 +308,12 @@ def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotC
 
     n_joints = len(robot_cfg.joints)
     expected_action_dim = n_joints
-    # joint_pos (n_joints) + joint_vel (n_joints) + a single motion_time
-    # scalar -- matches QminiLegEnv._get_observations exactly (NOT a
-    # per-joint motion_ref: that term is computed but never appended there,
-    # see the commented-out `# reference,` line).
-    expected_obs_dim = n_joints * 2 + 1
+    # joint_pos (n_joints) + joint_vel (n_joints) + 3 IMU projected-gravity
+    # + 3 IMU angular velocity + a single motion_time scalar -- matches
+    # QminiLegEnv._get_observations exactly (NOT a per-joint motion_ref:
+    # that term is computed but never appended there, see the
+    # commented-out `# reference,` line).
+    expected_obs_dim = n_joints * 2 + 6 + 1
 
     if meta.get("action_dim") != expected_action_dim:
         raise PolicyMismatchError(
@@ -284,7 +323,8 @@ def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotC
     if meta.get("obs_dim") != expected_obs_dim:
         raise PolicyMismatchError(
             f"Policy obs_dim={meta.get('obs_dim')} does not match expected "
-            f"{expected_obs_dim} (2 * {n_joints} joints [pos+vel] + 1 motion_time scalar)."
+            f"{expected_obs_dim} (2 * {n_joints} joints [pos+vel] + 6 IMU "
+            f"[gravity xyz + ang_vel xyz] + 1 motion_time scalar)."
         )
     # NOTE: this is a SET comparison, not an order comparison. robot_cfg's
     # joint order is whatever's convenient to read/wire physically (e.g.
@@ -774,11 +814,12 @@ def setup_logging(log_dir: Path):
 
 def write_csv_header(csv_writer, policy_joint_order, physical_joint_names):
     # NOTE: this must match build_obs()'s actual layout exactly (pos x N,
-    # then vel x N, then a single motion_time scalar -- NOT an obs_ref per
-    # joint, which build_obs() computes but never appends). The previous
-    # version of this header didn't match, which silently shifted every
-    # column after it by 2. If you've since added `ref` back into build_obs
-    # (the commented-out `obs.extend(ref)` line), update this to match.
+    # vel x N, 6 IMU terms, then a single motion_time scalar -- NOT an
+    # obs_ref per joint, which build_obs() computes but never appends). A
+    # previous version of this header didn't match, which silently shifted
+    # every column after it. If you've since added `ref` back into
+    # build_obs (the commented-out `obs.extend(ref)` line), update this to
+    # match.
     #
     # obs/action columns follow `policy_joint_order` (meta.json's order --
     # what the policy's own vectors are actually indexed by); the
@@ -791,12 +832,16 @@ def write_csv_header(csv_writer, policy_joint_order, physical_joint_names):
         header += [f"obs_pos_{name}"]
     for name in policy_joint_order:
         header += [f"obs_vel_{name}"]
+    header += [
+        "obs_imu_gravity_x", "obs_imu_gravity_y", "obs_imu_gravity_z",
+        "obs_imu_ang_vel_x", "obs_imu_ang_vel_y", "obs_imu_ang_vel_z",
+    ]
     header += ["obs_motion_time"]
     for name in policy_joint_order:
         header += [f"action_{name}"]
     for name in physical_joint_names:
         header += [f"target_deg_{name}", f"actual_deg_{name}", f"temp_{name}", f"err_{name}"]
-    header += ["policy_ms", "bus_ms"]  # per-step timing breakdown, see analyze_delay.py
+    header += ["imu_ms", "policy_ms", "bus_ms"]  # per-step timing breakdown, see analyze_delay.py
     csv_writer.writerow(header)
 
 
@@ -893,6 +938,20 @@ class Deployment:
             "Initialized %d motor bus(es): %s",
             len(self.buses),
             "; ".join(f"{bus.port} -> {[j.name for j in bus.joints]}" for bus in self.buses),
+        )
+
+        # See imu_sensor.py's module docstring -- the axis remap it uses by
+        # default (or robot_cfg.imu_axis_remap, if set) is an UNVERIFIED
+        # placeholder. Run imu_calibration_check.py before trusting this
+        # for a real balance policy.
+        self.imu = imu_sensor.ImuSensor(
+            address=robot_cfg.imu_i2c_address,
+            axis_remap=robot_cfg.imu_axis_remap or imu_sensor.AXIS_REMAP,
+        )
+        self.logger.info(
+            "IMU initialized (axis_remap=%s) -- UNVERIFIED, see imu_sensor.py "
+            "and run imu_calibration_check.py if you haven't already.",
+            self.imu.axis_remap,
         )
 
         if keyframes_path is None:
@@ -1064,6 +1123,18 @@ class Deployment:
             obs.append(readings[name].output_pos_rad)
         for name in self.policy_joint_order:
             obs.append(readings[name].output_vel_rad_s)
+
+        # Must exactly match QminiLegEnv._get_observations' (projected_gravity_b,
+        # root_ang_vel_b) -- gravity_dir here is already sign-flipped to a
+        # gravity-DIRECTION unit vector (down when level), not the raw
+        # accelerometer reading. See imu_sensor.py.
+        imu_start = time.perf_counter()
+        gravity_dir, ang_vel_rad_s = self.imu.read_robot_frame()
+        self._last_imu_ms = (time.perf_counter() - imu_start) * 1000.0
+        self._last_imu_reading = (gravity_dir, ang_vel_rad_s)  # for run()'s console print
+        obs.extend(gravity_dir)
+        obs.extend(ang_vel_rad_s)
+
         obs.append(self.motion_time)
         # obs.extend(ref)
         return torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
@@ -1083,6 +1154,15 @@ class Deployment:
                 print(f"CURRENT  LEFT HIP YAW: {math.degrees(readings['left_hip_yaw'].output_pos_rad):10.5f}  HIP ROLL: {math.degrees(readings['left_hip_roll'].output_pos_rad):10.5f}  HIP PITCH: {math.degrees(readings['left_hip_pitch'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['left_knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['left_ankle'].output_pos_rad):10.5f}")
                 print(f"CURRENT RIGHT HIP YAW: {math.degrees(readings['right_hip_yaw'].output_pos_rad):10.5f}  HIP ROLL: {math.degrees(readings['right_hip_roll'].output_pos_rad):10.5f}  HIP PITCH: {math.degrees(readings['right_hip_pitch'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['right_knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['right_ankle'].output_pos_rad):10.5f}")
                 obs = self.build_obs(readings)
+                imu_ms = self._last_imu_ms
+                gravity_dir, ang_vel_rad_s = self._last_imu_reading
+                print(
+                    f"IMU  gravity(x,y,z)=({gravity_dir[0]:+.3f}, {gravity_dir[1]:+.3f}, {gravity_dir[2]:+.3f})"
+                    f"  [expect ~(0,0,-1) when level]"
+                    f"  ang_vel_deg_s=({math.degrees(ang_vel_rad_s[0]):+7.2f}, "
+                    f"{math.degrees(ang_vel_rad_s[1]):+7.2f}, {math.degrees(ang_vel_rad_s[2]):+7.2f})"
+                    f"  imu_ms={imu_ms:.1f}"
+                )
 
                 ref = self.motion.sample(self.motion_time)
 
@@ -1114,6 +1194,12 @@ class Deployment:
                     }
                 policy_ms = (time.perf_counter() - policy_start) * 1000.0
 
+                # See FROZEN_JOINTS' module-level comment -- temporary,
+                # remove once a retrained policy is deployed.
+                for name in FROZEN_JOINTS:
+                    if name in targets:
+                        targets[name] = self.default_pose_rad[name]
+
                 if self.action_smoothing < 1.0:
                     for name, t in targets.items():
                         prev = self._smoothed_targets.get(name)
@@ -1133,12 +1219,26 @@ class Deployment:
                     check_motor_safety(new_readings, self.robot_cfg.motor_temp_limit_c)
                 except SafetyAbort as e:
                     self.logger.error("SAFETY ABORT: %s", e)
+                    # Log the ATTEMPTED step before releasing/re-raising --
+                    # otherwise a SafetyAbort on literally the first step
+                    # (as happened when a policy commanded a target outside
+                    # joint limits right out of the startup pose) leaves
+                    # the CSV completely empty, with no record of the
+                    # obs/action/targets that caused it -- exactly the
+                    # moment that trail matters most. `readings` stands in
+                    # for new_readings (validation failed before anything
+                    # was actually sent, so there's no post-send reading);
+                    # this row's actual_deg columns reflect state BEFORE
+                    # the rejected command, not after.
+                    bus_ms = (time.perf_counter() - bus_start) * 1000.0
+                    t_wall = loop_start - run_start
+                    self._log_step(step, t_wall, readings, obs, action, targets, readings, imu_ms, policy_ms, bus_ms)
                     self._release_all()
                     raise
                 bus_ms = (time.perf_counter() - bus_start) * 1000.0
 
                 t_wall = loop_start - run_start
-                self._log_step(step, t_wall, readings, obs, action, targets, new_readings, policy_ms, bus_ms)
+                self._log_step(step, t_wall, readings, obs, action, targets, new_readings, imu_ms, policy_ms, bus_ms)
 
                 self.motion_time = (self.motion_time + dt) % self.motion.length
                 step += 1
@@ -1150,15 +1250,15 @@ class Deployment:
                     time.sleep(sleep_time)
                 elif elapsed > dt * 1.5:
                     self.logger.warning(
-                        "Control loop overrun: %.1f ms (target %.1f ms) -- policy %.1f ms, bus %.1f ms",
-                        elapsed * 1000, dt * 1000, policy_ms, bus_ms,
+                        "Control loop overrun: %.1f ms (target %.1f ms) -- imu %.1f ms, policy %.1f ms, bus %.1f ms",
+                        elapsed * 1000, dt * 1000, imu_ms, policy_ms, bus_ms,
                     )
         finally:
             self._release_all()
             self.csv_file.close()
             self.logger.info("Deployment stopped, motors released, log file closed.")
 
-    def _log_step(self, step, t_wall, readings, obs, action, targets, new_readings, policy_ms, bus_ms):
+    def _log_step(self, step, t_wall, readings, obs, action, targets, new_readings, imu_ms, policy_ms, bus_ms):
         # NOTE: 't' is now the measured wall-clock time since run() started,
         # NOT step * control_dt. If your loop is overrunning control_dt
         # (watch the "Control loop overrun" warnings), those two diverge --
@@ -1176,7 +1276,7 @@ class Deployment:
                 r.temperature if r.temperature is not None else "",
                 r.error_flag if r.error_flag is not None else "",
             ]
-        row += [policy_ms, bus_ms]
+        row += [imu_ms, policy_ms, bus_ms]
         self.csv_writer.writerow(row)
         if step % 50 == 0:
             self.csv_file.flush()
@@ -1272,6 +1372,16 @@ def main():
         deployment.run()
     except SafetyAbort:
         logger.error("Exiting after safety abort. Motors have been released.")
+        sys.exit(1)
+    except imu_sensor.ImuTelemetryFault as e:
+        # Not a SafetyAbort subclass (imu_sensor.py is standalone, doesn't
+        # depend on this file's class hierarchy) but the same kind of
+        # event -- corrupted sensor telemetry, not a code bug. Motors are
+        # already released via Deployment.run()'s finally block regardless
+        # of which except clause catches this; this just logs it clearly
+        # instead of falling through to the generic "unhandled exception"
+        # path below.
+        logger.error("Exiting after IMU telemetry fault: %s. Motors have been released.", e)
         sys.exit(1)
     except Exception:
         logger.exception("Unhandled exception -- motors released via finally block.")

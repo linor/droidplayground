@@ -1,0 +1,26 @@
+{
+  "_comment": "Static balanced standing pose, NOT a gait -- both keyframes hold the identical pose, so MotionPlayer/MotionReference just returns a constant reference regardless of motion_time. Values found empirically with tune_stance_lean_isaaclab.py (held for 2s of PD-controlled settling, worst_tilt=3.2deg, final projected_gravity_b=(+0.011,+0.010,-1.000)) against qmini_urdf-2legs.usda's current mass distribution, which includes the real ~1.2kg rear-mounted battery ('Go1_________1') plus Pi mount/decoration/handle (~2.36kg total added, ~13cm rearward CoM shift from base_link's own origin) -- see the qmini-leg training thread this came out of. left/right are mirrored (right = -left) for pitch, knee, AND ankle -- confirmed by hand in Isaac Sim, NOT the same-sign convention keyframes_forward_slow_all_joints_4x.json's own _comment describes for its extraction pipeline. yaw/roll are 0 for both legs (untouched by the lean search).",
+  "degrees": true,
+  "joint_order": [
+    "left_yaw",
+    "left_roll",
+    "left_pitch",
+    "left_knee",
+    "left_ankle",
+    "right_yaw",
+    "right_roll",
+    "right_pitch",
+    "right_knee",
+    "right_ankle"
+  ],
+  "keyframes": [
+    [
+      0.0,
+      [0.0, 0.0, -16.0, 10.0, 1.0, 0.0, 0.0, 16.0, -10.0, -1.0]
+    ],
+    [
+      1.0,
+      [0.0, 0.0, -16.0, 10.0, 1.0, 0.0, 0.0, 16.0, -10.0, -1.0]
+    ]
+  ]
+}

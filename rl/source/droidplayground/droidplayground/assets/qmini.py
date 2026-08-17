@@ -86,21 +86,34 @@ QMINI_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 2.0), # joint_pos={".*": 0.0}
-        # Matches keyframe-0 of keyframes_forward_slow_all_joints_4x.json
-        # (yaw/roll are 0.0 there for both legs, so left implicit). See
-        # qmini_leg_env.py's comment on why default_joint_pos must equal
-        # keyframe-0 exactly -- previously only the left leg's pitch/knee/
-        # ankle were set here, so the right leg reset to 0.0 instead of
-        # keyframe-0, which would jump on the first action of every episode
-        # once the right leg's actuators (added above) started tracking it.
+        # Was (0,0,2.0) while the base was welded to the world via the
+        # USD's root_joint (see qmini_urdf-2legs.usda; that fixed joint
+        # has since been removed so the base is free-floating). 0.42m
+        # matches what tune_stance_lean_isaaclab.py used when it verified
+        # the joint_pos stance below (worst_tilt=3.2deg over a 2s held
+        # settle) -- if you change this, re-verify the stance still holds.
+        pos=(0.0, 0.0, 0.42), # joint_pos={".*": 0.0}
+        # Static balanced standing pose (NOT a walking gait pose), found
+        # empirically with tune_stance_lean_isaaclab.py against this USD's
+        # real mass distribution -- base_link alone would balance fine,
+        # but the real ~1.2kg rear-mounted battery ("Go1_________1") plus
+        # Pi mount/decoration/handle (~2.36kg total, ~13cm rearward CoM
+        # shift) made the old walking-gait-keyframe-0 pose fall over
+        # immediately, before any policy could act. Must equal
+        # keyframes_standing_still.json's keyframe-0 exactly -- see
+        # qmini_leg_env.py's comment on why. Right leg values are the
+        # LEFT leg's negated (confirmed by hand in Isaac Sim: this robot's
+        # left/right pitch/knee/ankle joints use opposite sign for the
+        # same physical motion, NOT the same sign the reference gait
+        # clip's own extraction pipeline assumed -- see
+        # tune_stance_lean_isaaclab.py's docstring).
         joint_pos={
-            "Revolute_left_pitch": -0.216651,
-            "Revolute_left_knee": 0.331148,
-            "Revolute_left_ankle": 0.254123,
-            "Revolute_right_pitch": -0.142705,
-            "Revolute_right_knee": -0.214548,
-            "Revolute_right_ankle": -0.339800,
+            "Revolute_left_pitch": -0.279253,   # -16.0 deg
+            "Revolute_left_knee": 0.174533,     # +10.0 deg
+            "Revolute_left_ankle": 0.017453,    # +1.0 deg
+            "Revolute_right_pitch": 0.279253,   # +16.0 deg (mirrored)
+            "Revolute_right_knee": -0.174533,   # -10.0 deg (mirrored)
+            "Revolute_right_ankle": -0.017453,  # -1.0 deg (mirrored)
         },
     ),
     actuators={
