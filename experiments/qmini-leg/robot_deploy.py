@@ -293,7 +293,10 @@ class PolicyMismatchError(RuntimeError):
     pass
 
 
-def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotConfig, logger: logging.Logger):
+def load_and_verify_policy(
+    policy_path: Path, meta_path: Path, robot_cfg: RobotConfig, logger: logging.Logger,
+    action_smoothing: float | None = None,
+):
     """
     Loads the TorchScript policy and cross-checks its metadata sidecar
     against both the file's actual hash and this robot's config, so a
@@ -355,6 +358,29 @@ def load_and_verify_policy(policy_path: Path, meta_path: Path, robot_cfg: RobotC
             "action_scale (%.4f) -- using robot config value. Confirm this is intentional.",
             meta.get("action_scale"), robot_cfg.action_scale,
         )
+
+    # action_smoothing (the EMA low-pass on decoded targets -- see
+    # qmini_leg_env.py's cfg.action_smoothing) now trains as a permanent
+    # part of the sim dynamics, not just an optional deploy-side
+    # diagnostic. Unlike action_scale/default_pos_deg (which only offset
+    # targets if wrong), a --action-smoothing value that doesn't match
+    # training changes the actual DYNAMICS the policy has to control --
+    # more smoothing than it trained with makes it sluggish/laggy, less
+    # (or none) leaves it fighting whatever oscillation this was meant to
+    # damp in the first place. meta may not have this field (older
+    # exported policies, from before this existed) -- skip the check then
+    # rather than compare against a value that was never trained either way.
+    meta_smoothing = meta.get("action_smoothing")
+    if meta_smoothing is not None and action_smoothing is not None:
+        if abs(meta_smoothing - action_smoothing) > 1e-9:
+            logger.warning(
+                "Policy metadata action_smoothing (%.4f) differs from "
+                "--action-smoothing (%.4f) -- this changes the actual control "
+                "dynamics the policy trained against, not just a target offset. "
+                "Set --action-smoothing to match unless you have a specific "
+                "reason not to.",
+                meta_smoothing, action_smoothing,
+            )
 
     # default_pos_deg is the anchor pose actions are decoded relative to
     # (see JointConfig / Deployment.run()). A mismatch here doesn't crash
@@ -862,7 +888,7 @@ class Deployment:
         open_loop_ref: bool = False,
         startup_pose: str = "auto",
         startup_move_duration: float = 2.0,
-        action_smoothing: float = 1.0,
+        action_smoothing: float = 1.0,  # keep in sync with --action-smoothing's default
     ):
         self.robot_cfg = robot_cfg
         self.policy = policy
@@ -914,15 +940,23 @@ class Deployment:
         # action_scale * action), applied every step regardless of
         # open_loop_ref (a no-op there at the default). smoothed_t =
         # action_smoothing * target_t + (1 - action_smoothing) * smoothed_{t-1}.
-        # 1.0 = off (raw target passed through unchanged, original
-        # behavior). Diagnostic tool for a specific symptom: if the policy
-        # is producing noisy/jittery frame-to-frame targets that demand
-        # sharp torque transients from the PD controller, this damps that
-        # out WITHOUT retraining, letting you test whether jitter (rather
-        # than wiring or an individual large target) is what's tripping the
-        # motor fault. If smoothing fixes it, the real fix is an
-        # action-rate penalty during training (see qmini_leg_env.py) --
-        # this flag is for isolating the cause, not a permanent substitute.
+        # 1.0 = off (raw target passed through unchanged).
+        #
+        # Originally added as a deploy-only diagnostic (isolate whether
+        # frame-to-frame jitter, not wiring or a single large target, was
+        # tripping a motor fault) with the assumption that if it helped,
+        # the real fix belonged in training as an action-rate penalty
+        # instead. Tried making it a permanent part of training instead
+        # (qmini_leg_env.py's cfg.action_smoothing, same formula/point in
+        # the pipeline, hoping a low-pass filter's frequency selectivity
+        # could do what a scalar penalty couldn't) -- also failed, same way
+        # as the action-rate-penalty attempts: suppressed genuine swing
+        # motion without actually stopping the oscillation. See that cfg's
+        # comment for the full result and why. Back to deploy-only-
+        # diagnostic status, default off. If cfg.action_smoothing is ever
+        # turned back on for training, this MUST match it at deploy time --
+        # see load_and_verify_policy()'s mismatch check against the
+        # policy's metadata sidecar.
         self.action_smoothing = action_smoothing
         self._smoothed_targets: dict = {}
 
@@ -1146,6 +1180,30 @@ class Deployment:
         try:
             new_readings = self._read_all_motors()
             check_motor_safety(new_readings, self.robot_cfg.motor_temp_limit_c)
+
+            # Re-warm the policy right before the timed loop starts, not
+            # just once at load time. load_and_verify_policy() already
+            # does a dummy forward pass, but that happens BEFORE the
+            # "Enable motors and start policy?" / "Continue and start
+            # policy?" prompts and the 2s move-to-pose sequence -- an
+            # operator-paced gap that can easily be tens of seconds. A
+            # compiled TorchScript graph staying idle that long can still
+            # see a slow first real call afterward (CPU frequency scaling
+            # down, cache eviction) even though the graph itself never
+            # got un-warmed. Added after a real deploy attempt showed
+            # policy_ms=22.4ms on the very first control step (vs. the
+            # usual ~1-2ms), overrunning the 20ms loop budget (42.4ms
+            # total) and immediately preceding a multi-motor communication
+            # timeout and SAFETY ABORT -- the slow step is the likely
+            # trigger, not a coincidence. Uses a real obs (from the
+            # reading just taken above), not zeros, so it exercises the
+            # same shapes/dtypes the real loop will use.
+            if not self.open_loop_ref:
+                warm_obs = self.build_obs(new_readings)
+                with torch.no_grad():
+                    for _ in range(5):
+                        self.policy(warm_obs)
+
             while not self._stop:
                 loop_start = time.perf_counter()
 
@@ -1310,13 +1368,18 @@ def main():
     parser.add_argument(
         "--action-smoothing", type=float, default=1.0,
         help="EMA low-pass factor applied to the final decoded joint "
-             "target every step. 1.0 (default) = off, unchanged behavior. "
-             "Lower = more smoothing (e.g. 0.3). Diagnostic tool: if the "
-             "policy's raw targets are jittery enough to trip a motor "
-             "fault that a smooth reference trajectory doesn't, lowering "
-             "this can confirm that without retraining. Not a permanent "
-             "fix -- if it helps, add an action-rate penalty to training "
-             "instead (see qmini_leg_env.py).",
+             "target every step, same formula as qmini_leg_env.py's "
+             "cfg.action_smoothing. 1.0 (default) = off. Back to off as of "
+             "2026-08-26 -- training this as a permanent part of the sim "
+             "dynamics was tried at alpha=0.5 and reverted (see that cfg's "
+             "comment): it suppressed genuine swing motion the same way "
+             "three earlier, unrelated fix attempts did, without actually "
+             "stopping the oscillation it was meant to damp. MUST match "
+             "whatever cfg.action_smoothing value the loaded policy was "
+             "actually trained with if this is ever turned back on --  "
+             "load_and_verify_policy() warns on a mismatch against the "
+             "policy's own metadata sidecar when that sidecar has the "
+             "field (see export_policy_for_deployment.py).",
     )
     parser.add_argument(
         "--startup-pose", type=str, default="auto", choices=["auto", "zero", "default", "keyframe", "none"],
@@ -1358,7 +1421,10 @@ def main():
         else:
             if not args.policy or not args.policy_meta:
                 parser.error("--policy and --policy-meta are required unless --open-loop-ref is set.")
-            policy, meta = load_and_verify_policy(args.policy, args.policy_meta, robot_cfg, logger)
+            policy, meta = load_and_verify_policy(
+                args.policy, args.policy_meta, robot_cfg, logger,
+                action_smoothing=args.action_smoothing,
+            )
             policy_joint_order = meta["joint_order"]
 
         deployment = Deployment(

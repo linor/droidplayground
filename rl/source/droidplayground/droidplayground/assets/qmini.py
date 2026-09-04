@@ -18,9 +18,63 @@ from droidplayground.assets import ASSET_USD_DIRECTORY
 # read from it.
 DEFAULT_GAINS = {
     "hip_yaw": dict(stiffness=55.0, damping=2.0, armature=0.02),
-    "hip_roll": dict(stiffness=105.0, damping=18.0, armature=0.02),
+    # stiffness raised 105.0 -> 360.0 on 2026-08-29: hip_roll has an
+    # extra_gear_ratio of 3.0 (see robot_config_qmini_stepinplace.json)
+    # on top of the base 6.33 reduction, and kp_rotor = kp_output /
+    # gear_ratio^2 -- squaring that extra 3x into the denominator left
+    # hip_roll's real rotor-side stiffness (~0.29) far below every other
+    # joint's (~0.75-1.87) even though damping came out matched (~0.05
+    # rotor-side) everywhere. Confirmed on real hardware via
+    # analyze_delay.py against an --open-loop-ref log: this alone dropped
+    # measured actuation delay from 200ms/10 steps (a 2.5-5x outlier vs
+    # every other joint) to 80ms/4 steps (in line with knee). 360 puts
+    # kp_rotor at ~1.0, still below hip_pitch's ~1.87 -- there may be room
+    # to push further, but this already roughly doubles the deployment's
+    # historical kp~=0.5 baseline, so leaving it here for now rather than
+    # continuing to chase it blind. See qmini_leg_env.py's
+    # action_delay_range_steps comment for the full measurement history.
+    #
+    # Briefly reverted to 105.0 (2026-08-29) as an isolation test against
+    # the per-joint action_delay_range_steps change -- RESULT: confirmed
+    # the delay-range widening alone (not stiffness) is a real driver of
+    # instability (initial shock was if anything WORSE in isolation --
+    # noise_std peaked at 0.65 vs 0.58 combined, value_function_loss hit
+    # 515 vs 416, mean_reward briefly went negative), but revealed
+    # something worse than the combined test: general stability metrics
+    # recovered fast (noise_std/value_function_loss/episode_length/
+    # fall_rate all back near-healthy within ~30min), while
+    # foot_swing_reward collapsed to ~0 and STAYED there with noise_std
+    # already low and falling -- the "safe local optimum, can't explore
+    # back out" pattern, and video confirmed neither leg lifting anymore.
+    # The combined test (stiffness+delay both changed) was rockier for
+    # longer but had foot_swing_reward on a real, if slow, recovery trend
+    # (0.25->0.40 over 4hr) instead of collapsing. Reverted back to 360 --
+    # removing it didn't help the thing that actually matters and may have
+    # made it worse. See action_delay_range_steps' comment in
+    # qmini_leg_env.py for the paired narrowing of the delay ranges tried
+    # alongside restoring this.
+    "hip_roll": dict(stiffness=360.0, damping=18.0, armature=0.02),
     "hip_pitch": dict(stiffness=75.0, damping=2.0, armature=0.02),
     "knee": dict(stiffness=45.0, damping=2.0, armature=0.02),
+    # Tried damping 2.0 -> 4.0 on 2026-08-26 as a fix for a persistent
+    # right-ankle-specific shake/twitch after lifting (see
+    # gain_randomization_range's comment in qmini_leg_env.py for the ruled-
+    # out per-episode-noise hypothesis that came before this one). RESULT:
+    # negative and actively worse -- an hour/~4000 iterations of retraining
+    # at damping=4.0 didn't stop the shake, AND tracking/foot_swing_reward
+    # collapsed (from a ~0.65-0.70 baseline down to swinging 0.3-0.65,
+    # averaging much lower) with video showing the whole gait degrade into
+    # more of a static crouch, left leg specifically no longer lifting
+    # despite the reference calling for it. Reverted back to 2.0. Exactly
+    # the "goes sluggish" failure mode this comment originally warned
+    # about, just more severe than expected from a 2x bump -- don't re-try
+    # a smaller increase without a better reason than the two hypotheses
+    # tried so far, both of which pointed at underdamping and both of
+    # which tested negative. Next lead if this comes up again: foot_swing_
+    # reward in qmini_leg_env.py is scored per-frame with no smoothness or
+    # sustain requirement, which may just make a fast flick cheaper than a
+    # controlled swing under the current orientation/position reward
+    # balance -- a reward-shape question, not a gain-tuning one.
     "ankle": dict(stiffness=30.0, damping=2.0, armature=0.02),
 }
 
@@ -108,12 +162,12 @@ QMINI_CFG = ArticulationCfg(
         # clip's own extraction pipeline assumed -- see
         # tune_stance_lean_isaaclab.py's docstring).
         joint_pos={
-            "Revolute_left_pitch": -0.279253,   # -16.0 deg
-            "Revolute_left_knee": 0.174533,     # +10.0 deg
-            "Revolute_left_ankle": 0.017453,    # +1.0 deg
-            "Revolute_right_pitch": 0.279253,   # +16.0 deg (mirrored)
-            "Revolute_right_knee": -0.174533,   # -10.0 deg (mirrored)
-            "Revolute_right_ankle": -0.017453,  # -1.0 deg (mirrored)
+            "Revolute_left_pitch":  -0.289124,  # -16.5656 deg
+            "Revolute_left_knee":    0.393692,  # +22.5569 deg
+            "Revolute_left_ankle":   0.226741,  # +12.9913 deg
+            "Revolute_right_pitch":  0.289124,  # +16.5656 deg (mirrored)
+            "Revolute_right_knee":  -0.393692,  # -22.5569 deg (mirrored)
+            "Revolute_right_ankle": -0.226741,  # -12.9913 deg (mirrored)
         },
     ),
     actuators={

@@ -150,6 +150,14 @@ def main():
         help="Named obs blocks in order, purely documentary/for the runtime check",
     )
     parser.add_argument("--action-scale", type=float, default=0.15)
+    parser.add_argument(
+        "--action-smoothing", type=float, default=1.0,
+        help="Must match qmini_leg_env.py's cfg.action_smoothing used to train this "
+        "checkpoint -- see that cfg's comment (default reverted to 1.0/off on "
+        "2026-08-26, training with smoothing on was tried and reverted). Recorded "
+        "here so robot_deploy.py can warn on a mismatch the same way it already "
+        "does for --action-scale.",
+    )
     parser.add_argument("--actor-hidden-dims", nargs="+", type=int, default=[128, 128, 128])
     parser.add_argument("--activation", default="elu", choices=["elu", "relu", "tanh"])
     args = parser.parse_args()
@@ -210,6 +218,7 @@ def main():
         "joint_order": args.joint_order,
         "obs_terms": args.obs_terms,
         "action_scale": args.action_scale,
+        "action_smoothing": args.action_smoothing,
         "source_checkpoint": str(args.checkpoint),
         "policy_sha256": sha256,
     }
