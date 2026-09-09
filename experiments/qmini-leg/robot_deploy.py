@@ -312,11 +312,20 @@ def load_and_verify_policy(
     n_joints = len(robot_cfg.joints)
     expected_action_dim = n_joints
     # joint_pos (n_joints) + joint_vel (n_joints) + 3 IMU projected-gravity
-    # + 3 IMU angular velocity + a single motion_time scalar -- matches
+    # + 3 IMU angular velocity + sin(phase)/cos(phase) (+2) -- matches
     # QminiLegEnv._get_observations exactly (NOT a per-joint motion_ref:
     # that term is computed but never appended there, see the
-    # commented-out `# reference,` line).
-    expected_obs_dim = n_joints * 2 + 6 + 1
+    # commented-out `# reference,` line). RE-ADOPTED 2026-09-08, back OUT
+    # of the raw motion_time scalar (+1) used since the 2026-09-07 revert
+    # -- see observation_space's comment in qmini_leg_env.py for the full
+    # story. Short version: sin/cos fixes a real hardware phase-
+    # discontinuity landmine, and the reason no training run under it had
+    # found genuine stepping turned out to be an unrelated reward-shape
+    # regression (tracking_linear_penalty_weight), not the encoding itself
+    # -- confirmed by finding genuine stepping again under the RAW scalar
+    # once that was fixed. Now re-adopting sin/cos on top of the corrected
+    # reward config.
+    expected_obs_dim = n_joints * 2 + 6 + 2
 
     if meta.get("action_dim") != expected_action_dim:
         raise PolicyMismatchError(
@@ -327,7 +336,7 @@ def load_and_verify_policy(
         raise PolicyMismatchError(
             f"Policy obs_dim={meta.get('obs_dim')} does not match expected "
             f"{expected_obs_dim} (2 * {n_joints} joints [pos+vel] + 6 IMU "
-            f"[gravity xyz + ang_vel xyz] + 1 motion_time scalar)."
+            f"[gravity xyz + ang_vel xyz] + 2 sin/cos phase terms)."
         )
     # NOTE: this is a SET comparison, not an order comparison. robot_cfg's
     # joint order is whatever's convenient to read/wire physically (e.g.
@@ -840,12 +849,11 @@ def setup_logging(log_dir: Path):
 
 def write_csv_header(csv_writer, policy_joint_order, physical_joint_names):
     # NOTE: this must match build_obs()'s actual layout exactly (pos x N,
-    # vel x N, 6 IMU terms, then a single motion_time scalar -- NOT an
-    # obs_ref per joint, which build_obs() computes but never appends). A
-    # previous version of this header didn't match, which silently shifted
-    # every column after it. If you've since added `ref` back into
-    # build_obs (the commented-out `obs.extend(ref)` line), update this to
-    # match.
+    # vel x N, 6 IMU terms, then sin(phase)/cos(phase) -- NOT an obs_ref per
+    # joint, which build_obs() computes but never appends). A previous
+    # version of this header didn't match, which silently shifted every
+    # column after it. If you've since added `ref` back into build_obs (the
+    # commented-out `obs.extend(ref)` line), update this to match.
     #
     # obs/action columns follow `policy_joint_order` (meta.json's order --
     # what the policy's own vectors are actually indexed by); the
@@ -862,7 +870,7 @@ def write_csv_header(csv_writer, policy_joint_order, physical_joint_names):
         "obs_imu_gravity_x", "obs_imu_gravity_y", "obs_imu_gravity_z",
         "obs_imu_ang_vel_x", "obs_imu_ang_vel_y", "obs_imu_ang_vel_z",
     ]
-    header += ["obs_motion_time"]
+    header += ["obs_phase_sin", "obs_phase_cos"]
     for name in policy_joint_order:
         header += [f"action_{name}"]
     for name in physical_joint_names:
@@ -974,19 +982,31 @@ class Deployment:
             "; ".join(f"{bus.port} -> {[j.name for j in bus.joints]}" for bus in self.buses),
         )
 
-        # See imu_sensor.py's module docstring -- the axis remap it uses by
-        # default (or robot_cfg.imu_axis_remap, if set) is an UNVERIFIED
-        # placeholder. Run imu_calibration_check.py before trusting this
-        # for a real balance policy.
+        # See imu_sensor.py's module docstring -- ITS OWN default AXIS_REMAP
+        # is still an unverified placeholder (no robot-config-level
+        # confirmation behind it). robot_cfg.imu_axis_remap is a separate
+        # value with its own per-config verification status -- see that
+        # field's own _imu_comment in the robot_config.json being used.
+        # robot_config_qmini_stepinplace.json's remap was verified against
+        # real hardware via imu_calibration_check.py on 2026-09-09; other
+        # robot_config*.json files may not have been.
         self.imu = imu_sensor.ImuSensor(
             address=robot_cfg.imu_i2c_address,
             axis_remap=robot_cfg.imu_axis_remap or imu_sensor.AXIS_REMAP,
         )
-        self.logger.info(
-            "IMU initialized (axis_remap=%s) -- UNVERIFIED, see imu_sensor.py "
-            "and run imu_calibration_check.py if you haven't already.",
-            self.imu.axis_remap,
-        )
+        if robot_cfg.imu_axis_remap:
+            self.logger.info(
+                "IMU initialized (axis_remap=%s, from robot_cfg -- verification "
+                "status is whatever robot_cfg.json's own _imu_comment says).",
+                self.imu.axis_remap,
+            )
+        else:
+            self.logger.info(
+                "IMU initialized (axis_remap=%s, imu_sensor.py's own default) "
+                "-- UNVERIFIED, see imu_sensor.py and run imu_calibration_check.py "
+                "if you haven't already.",
+                self.imu.axis_remap,
+            )
 
         if keyframes_path is None:
             raise ValueError(
@@ -1169,7 +1189,12 @@ class Deployment:
         obs.extend(gravity_dir)
         obs.extend(ang_vel_rad_s)
 
-        obs.append(self.motion_time)
+        # RE-ADOPTED 2026-09-08, back to sin(phase)/cos(phase) -- must match
+        # QminiLegEnv._get_observations exactly. See observation_space's
+        # comment there for the full story.
+        phase = 2.0 * math.pi * self.motion_time / self.motion.length
+        obs.append(math.sin(phase))
+        obs.append(math.cos(phase))
         # obs.extend(ref)
         return torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
 

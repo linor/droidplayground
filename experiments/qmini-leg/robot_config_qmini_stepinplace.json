@@ -4,7 +4,7 @@
   "action_scale": 0.5,
   "motor_temp_limit_c": 55.0,
   "_pose_comment": "default_pos_deg below is the static standing-balance pose (NOT the old forward_slow walking gait's keyframe-0) -- found empirically with tune_stance_lean_isaaclab.py against qmini_urdf-2legs.usda's real mass distribution (battery + Pi mount etc.), and what qmini.py's ArticulationCfg.InitialStateCfg.joint_pos / keyframes_standing_still.json's keyframe-0 both currently use for training. Use this config (not robot_config_qmini.json or the _forward_slow/_left_strafe/_left_turn variants) together with --keyframes keyframes_standing_still.json to deploy the standing-balance policy.",
-  "_imu_comment": "axis_remap is [[chip_axis_index, sign], ...] for base_link's own [X, Y, Z]. Confirmed in Isaac Sim: base_link +X points toward the LEFT leg, +Y toward the REAR, +Z is up. Chip mount: chip X+ = robot rear, chip Y+ = robot right leg, chip Z+ = up. So base_X=-chip_Y, base_Y=chip_X, base_Z=chip_Z. NOT yet verified against the real sensor -- run imu_calibration_check.py before trusting this on real hardware.",
+  "_imu_comment": "axis_remap is [[chip_axis_index, sign], ...] for base_link's own [X, Y, Z]. Confirmed in Isaac Sim: base_link +X points toward the LEFT leg, +Y toward the REAR, +Z is up. Chip mount: chip X+ = robot rear, chip Y+ = robot right leg, chip Z+ = up. So base_X=-chip_Y, base_Y=chip_X, base_Z=chip_Z. VERIFIED against the real sensor on 2026-09-09 via imu_calibration_check.py -- this remap is confirmed correct on real hardware, not just in sim.",
   "imu_i2c_address": null,
   "imu_axis_remap": [[1, -1.0], [0, 1.0], [2, 1.0]],
   "joints": [

@@ -6,6 +6,22 @@ from isaaclab_rl.rsl_rl import (
     RslRlPpoAlgorithmCfg,
 )
 
+# rsl_rl's OnPolicyRunner resolves the policy class via a plain
+# `eval(self.policy_cfg.pop("class_name"))`, evaluated against
+# on_policy_runner.py's OWN module globals -- not this file's, and not
+# anything reachable via a normal import alone. So making our
+# ClampedActorCritic subclass (see clamped_actor_critic.py's module
+# comment for why it exists) resolvable by name means injecting it into
+# that module's namespace directly, at import time, here -- this is the
+# one place guaranteed to run before the runner ever constructs its
+# policy, since Isaac Lab loads this cfg file to resolve the
+# rsl_rl_cfg_entry_point before training starts.
+import rsl_rl.runners.on_policy_runner as _rsl_rl_on_policy_runner
+
+from .clamped_actor_critic import ClampedActorCritic
+
+_rsl_rl_on_policy_runner.ClampedActorCritic = ClampedActorCritic
+
 
 @configclass
 class QMiniLegPPORunnerCfg(RslRlOnPolicyRunnerCfg):
@@ -39,7 +55,15 @@ class QMiniLegPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # target).
     clip_actions = 3.0
 
+    # class_name swapped from the default "ActorCritic" to our
+    # "ClampedActorCritic" (see clamped_actor_critic.py) on 2026-09-06 --
+    # puts a hard ceiling on the learned exploration std, which rsl_rl
+    # otherwise leaves completely unbounded and which caused two separate
+    # catastrophic divergences in this project (see that file's comment
+    # for the full mechanism, and clip_actions' comment above for how the
+    # two failures compound).
     policy = RslRlPpoActorCriticCfg(
+        class_name="ClampedActorCritic",
         init_noise_std=0.5,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
@@ -133,6 +157,87 @@ class QMiniLegPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # thing that makes "freeze in a static pose" actually risky. A
         # policy standing dead-still and never having to react to anything
         # has no pressure against exactly the collapse seen here.
+        #
+        # LOWERED 0.02 -> 0.01 on 2026-09-05, for the STEPPING task this
+        # time (the paragraphs above are all about the standing task --
+        # different reward structure, kept for context since the underlying
+        # entropy-annealing lesson still applies). Resuming from
+        # model_32200.pt (foot_swing_reward_weight freshly raised 5->7,
+        # see that cfg's comment) with entropy_coef=0.02 held constant
+        # reproduced the EXACT mechanism documented above, just worse:
+        # ~32k iterations of genuine sustained stepping (the longest this
+        # project has achieved -- foot_swing_reward real and stable,
+        # episode_length ~495-500, orientation/reward ~0.97-0.98), then a
+        # sudden, irrecoverable divergence starting ~iteration 60k --
+        # Mean action noise std climbed to 8.9 (not 0.81 this time) and was
+        # still climbing at the final iteration, mean_reward went negative,
+        # tracking errors up to 30deg. Direct confirmation the raw actor
+        # output itself had diverged (not just the logged std): manually
+        # reconstructing the actor from the raw checkpoint and feeding it
+        # an all-zero "perfectly calm" observation produced action logits
+        # in the hundreds, at every point in the cycle, not just near any
+        # particular phase -- this is unrelated to the sin/cos phase-input
+        # defect (see observation_space's comment in qmini_leg_env.py),
+        # which stayed fixed the whole time (verified via the same sweep
+        # method against model_58000.pt, a checkpoint from partway through
+        # the good stretch: clean, no spikes, worst action 0.28). Resuming
+        # from model_58000.pt (last validated-good checkpoint, well before
+        # the 60k divergence) with entropy_coef dropped to 0.01 -- the only
+        # other value this project has data on below 0.02. That value
+        # previously caused a DIFFERENT collapse (frozen static pose,
+        # described above), but in the standing task under a different
+        # reward structure -- genuinely untested whether it behaves the
+        # same way for stepping. If it also fails, that's real evidence
+        # toward a value strictly between 0.01 and 0.02, or toward capping
+        # run length instead of hunting for a single constant that's safe
+        # indefinitely (erosion took ~28-32k iterations to manifest both
+        # times now, a real, reproducible number to plan around).
+        #
+        # RAISED 0.01 -> 0.015 on 2026-09-05, same day -- 0.01 collapsed
+        # even faster than its earlier (standing-task) precedent: Mean
+        # action noise std dropped and went completely flat at 0.06 by
+        # ~2000 iterations post-resume, stayed flat for the next 3700+ with
+        # zero recovery, episode_length/orientation_reward pinned at
+        # their max (499/500, ~0.99), foot_swing_reward flat at the noise
+        # floor (~0.004), heading/yaw_rate_dps down to ~10 deg/s (lowest
+        # yet, i.e. barely moving at all) -- the same frozen-consolidation
+        # shape as before, just without that case's specific roll-sign-flip
+        # mechanism (roll tracking was actually tight here, ~0.8deg error,
+        # no sign flip -- so the ESCAPE ROUTE differs, but the frozen
+        # end-state doesn't). Stopped well before the 98000-iteration
+        # target once the plateau was clearly permanent rather than still
+        # settling. 0.015 is the untested middle point between a value
+        # that collapses fast (0.01) and one that erodes slowly (0.02) --
+        # still resuming from model_58000.pt (the same last-validated-good
+        # checkpoint both previous attempts used), not either failed run.
+        #
+        # REVERTED 0.015 -> 0.02 on 2026-09-05, same day. 0.015 didn't
+        # freeze like 0.01 (Mean action noise std kept genuinely oscillating
+        # in a real band, ~0.09-0.11, for the ~22000 iterations it was
+        # watched -- confirmed via a zoomed-in view, not just coarse
+        # resolution hiding a flat line), but it also never recovered real
+        # stepping after the resume: foot_swing_reward sat flat at the same
+        # noise floor (~0.003-0.004) the whole time, with exactly one
+        # exception (a genuine spike to ~0.041 around iteration 68k,
+        # matched by dips in episode_length/orientation_reward and a
+        # fall_rate blip -- a real stepping/recovery attempt) that reverted
+        # to the same flat baseline within about 1000 iterations on its own
+        # and never recurred. Net effect across all three values tried:
+        # 0.01 and 0.015 BOTH abandoned the good stepping behavior almost
+        # immediately after resuming from model_58000.pt (they just failed
+        # differently once there -- hard freeze vs. stable-but-stuck) --
+        # neither comes close to reproducing what 0.02 already
+        # demonstrated (~32k iterations of genuine sustained stepping
+        # before eroding). So 0.02 is the right value for actually
+        # consolidating stepping, it just isn't safe to run indefinitely --
+        # this isn't "find a constant that's safe forever" so much as "0.02
+        # then stop before ~28-32k iterations post-resume." Going back to
+        # 0.02 and resuming from model_58000.pt again, this time watching
+        # for and manually stopping somewhere around 20-25k iterations
+        # post-resume (absolute iteration ~78000-83000) rather than
+        # running to any particular configured target -- checkpoints save
+        # every 100 iterations regardless, so there's no need to change the
+        # configured iteration count to do this.
         entropy_coef=0.02,
         num_learning_epochs=5,
         num_mini_batches=4,

@@ -80,11 +80,53 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # qmini_step_in_place isaac joint listing / keyframes_forward_slow_all_joints_4x.json.
     action_space = 10
     # 10 joint_pos + 10 joint_vel + 3 projected_gravity_b (IMU accel-like,
-    # unit vector) + 3 root_ang_vel_b (IMU gyro-like, rad/s) + 1 motion_time.
-    # See _get_observations -- this layout must match robot_deploy.py's
-    # build_obs() exactly (joint pos/vel, then the 6 IMU terms, then
-    # motion_time), since that's what a real IMU reading gets slotted into.
-    observation_space = 27
+    # unit vector) + 3 root_ang_vel_b (IMU gyro-like, rad/s) + 1
+    # motion_time. See _get_observations -- this layout must match
+    # robot_deploy.py's build_obs() exactly (joint pos/vel, then the 6 IMU
+    # terms, then motion_time), since that's what a real IMU reading gets
+    # slotted into.
+    #
+    # RE-ADOPTED sin(phase)/cos(phase) (observation_space=28) on 2026-09-08,
+    # back OUT of the raw motion_time scalar (observation_space=27) that had
+    # been in place since the 2026-09-07 revert. Full story, for whoever
+    # reads this next:
+    #
+    # sin/cos was first tried 2026-09-04 and confirmed (via the motion_time
+    # sweep methodology) to fully close a real, video-confirmed real-
+    # hardware phase-discontinuity landmine -- necessary for deployment, not
+    # cosmetic. But no training run under it ever produced genuine,
+    # video-confirmed stepping, so on 2026-09-07 it was reverted back to the
+    # raw scalar as a controlled A/B test, isolating phase encoding as the
+    # one remaining untested variable (see git history for that revert's
+    # full comment). That test came back NEGATIVE -- raw scalar alone did
+    # NOT bring stepping back either, ruling out phase encoding as the
+    # blocker. Continued investigation (reconstructing the last confirmed-
+    # good config from this file's own dated comment history) found the
+    # real cause: tracking_linear_penalty_weight had been raised 0.2 -> 1.0
+    # on 2026-09-06 (see that field's comment), an always-on, unbounded
+    # per-step penalty that was suppressing exactly the bigger joint
+    # excursions genuine stepping requires. Reverting THAT back to 0.2
+    # (2026-09-07/08, run 2026-09-07_22-00-51), together with a cluster of
+    # other stay-still pressure already loosened that same night
+    # (push_interval_range_s, orientation_margin_deg, orientation_reward_scale,
+    # position_reward_weight/heading_reward_weight), finally produced real,
+    # sustained, video-confirmed stepping -- still under the raw scalar,
+    # confirming phase encoding was never the issue.
+    #
+    # So: now that the actual blocker is fixed, re-adopting sin/cos to get
+    # back the real-hardware fix it provides, on top of a reward config
+    # that's now proven to support genuine stepping. If stepping survives
+    # this switch, sin/cos and genuine stepping are compatible and further
+    # polishing (gait aggressiveness/fall rate, see
+    # tracking_linear_penalty_weight and heading_reward_weight's comments)
+    # can continue on top of it. If stepping does NOT survive this specific
+    # switch, that's real, well-isolated evidence sin/cos itself is
+    # incompatible with this reward config specifically (not with stepping
+    # in general, which is now well established) and the next step is a
+    # richer, still-continuous phase representation rather than either
+    # extreme. Requires a fresh training run, not a resume -- the input
+    # layer's shape changes either direction.
+    observation_space = 28
     state_space = 0
     action_scale = 0.5
 
@@ -526,7 +568,19 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # matters here, sampled and re-sampled independently per env (see
     # _resample_push_countdown / _steps_until_push), not tied to any
     # shared global counter anymore.
-    push_interval_range_s: tuple[float, float] = (3.0, 5.0)
+    # DISABLED AGAIN (2026-09-07), as part of a controlled revert-to-
+    # last-known-good test -- see position_reward_weight's comment for the
+    # full reasoning. This is the same 1000.0-effectively-off value used
+    # the last (and only) time this project had genuine, video-confirmed
+    # full-leg stepping (run 2026-08-24_22-29-06). Pushes were re-enabled
+    # 2026-08-28, AFTER that run, and this project's own history above
+    # (point 4) already documents that pushes contaminate foot_swing_reward
+    # by making passive push-recovery motion look like real stepping --
+    # exactly the ambiguity that kept coming up reviewing videos this
+    # session. Re-enable only once genuine stepping is unambiguously back,
+    # and verify with video immediately after, per this field's standing
+    # instruction above.
+    push_interval_range_s: tuple[float, float] = (1000.0, 1000.0)
     push_velocity_range_mps: tuple[float, float] = (-0.4, 0.4)
 
     # Weight on the action-rate penalty in _get_rewards (-weight *
@@ -597,6 +651,55 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # provides a strong, separately-tuned incentive -- is barely affected,
     # avoiding the need to re-tune every other already-established reward
     # weight in this file. UNTUNED starting guess.
+    #
+    # RAISED 0.2 -> 1.0 on 2026-09-06, before a fresh from-scratch run.
+    # Re-read BD-X's Table I directly: leg joint positions get weight 15.0
+    # against torso orientation's 1.0 (a 15:1 ratio) -- ours currently has
+    # this backwards (tracking_reward's outer weight is 2.0 against
+    # orientation_reward_weight's 3.0). More importantly, their leg term is
+    # PURELY the unbounded -||q-q_hat||^2 penalty, no exponential at all.
+    # That reconciles two separate findings in this file under one cause:
+    # today's (a policy can flatten/skip the hard, fast parts of the gait
+    # and only pay a bounded, shrinking cost under the exp term) and the
+    # earlier one a few hundred lines below re: foot_swing_reward_weight's
+    # 1.0->3.0 raise (a policy that already tracks well gets almost no
+    # marginal reward left for the extra risk of real foot clearance,
+    # because the exp term is already near its max). An exponential is flat
+    # at BOTH tails -- saturates near-max for already-good tracking (no
+    # incentive to keep polishing) and near-zero for already-bad tracking
+    # (no growing penalty for further slacking). The unbounded linear term
+    # doesn't have either flat region, so it's the more surgical fix versus
+    # just raising the outer 2.0x weight, which would only rescale the
+    # still-flat exponential without touching the shape problem at either
+    # end. Not adopting BD-X's exact 15.0 or its squared (vs. linear) form
+    # outright -- our error/reward scales aren't directly comparable to
+    # theirs, and a smaller, directional correction is more appropriate
+    # given this is genuinely untested at any value above 0.2. Safe to be
+    # more assertive than a typical single-change tweak here specifically
+    # because this is going into a fresh from-scratch run, not a resume --
+    # no existing policy/optimizer state to destabilize.
+    #
+    # REVERTED 1.0 -> 0.2 on 2026-09-07, as the next step in the same
+    # revert-to-last-known-good test as push_interval_range_s/
+    # orientation_margin_deg/orientation_reward_scale/position_reward_weight/
+    # heading_reward_weight (see position_reward_weight's comment for the
+    # full reasoning/history). Reverting that whole cluster and running
+    # fresh to iteration ~22.5k did NOT reproduce genuine stepping either
+    # (video-confirmed: standing/swaying in place, same as every run since
+    # the 2026-08-24 reference, with foot_swing_reward peaks again tracing
+    # back to falls, not real lift) -- ruling out the "stay-still pressure"
+    # cluster as the SOLE blocker, on top of the phase-encoding revert
+    # already having ruled out sin/cos. This term is the next largest
+    # remaining divergence from the 2026-08-24 config that hasn't been
+    # tested in isolation: unlike the terms above, it was never gated by a
+    # margin or push-cooldown -- it's a small but unbounded, always-active
+    # per-step penalty on joint-angle deviation across all 10 joints, which
+    # plausibly discourages exactly the bigger transient joint excursions a
+    # real step requires more than a small in-place wobble does. Keeping
+    # foot_swing_reward_weight=7.0 and action_delay_range_steps' widening
+    # unchanged for now -- this is a single-variable isolation, not a full
+    # revert to Aug 24 -- so if stepping still doesn't reappear, those two
+    # become the next candidates.
     tracking_linear_penalty_weight: float = 0.2
     velocity_linear_penalty_weight: float = 0.05
 
@@ -690,8 +793,16 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # is back near its pre-margin value; if that happens, split the
     # difference rather than reverting all the way to 8.0, since the
     # margin is still doing real work 8.0 didn't have.
+    # scale REVERTED 20.0 -> 8.0 (2026-09-07), back to the pre-2026-08-31
+    # value, as part of the same revert-to-last-known-good test as
+    # push_interval_range_s/orientation_margin_deg/position_reward_weight/
+    # heading_reward_weight -- see position_reward_weight's comment for the
+    # full reasoning. This scale was raised specifically to make leaning
+    # past orientation_margin_deg cost more, which is direct tension with
+    # what genuine single-support stepping requires (leaning to shift
+    # weight onto the stance leg).
     orientation_reward_weight: float = 3.0
-    orientation_reward_scale: float = 20.0
+    orientation_reward_scale: float = 8.0
 
     # Degrees of lean given a FULL orientation_reward bonus (no penalty at
     # all) before tilt beyond this starts costing reward -- see the margin
@@ -763,7 +874,15 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # its own, that points at needing a different checkpoint (or more
     # entropy/exploration right at this stage) rather than more reward
     # tuning.
-    orientation_margin_deg: float = 2.0
+    #
+    # LOOSENED 2.0 -> 6.0 (2026-09-07), back to the pre-tightening value,
+    # as part of the same revert-to-last-known-good test as
+    # push_interval_range_s and position_reward_weight above/below -- this
+    # was tightened 6->2 on 2026-08-25, AFTER the only run this project has
+    # ever had genuine, video-confirmed full-leg stepping on (see
+    # position_reward_weight's comment). See that comment for the full
+    # reasoning; this field is reverted for the same test.
+    orientation_margin_deg: float = 6.0
 
     # --- stay in place -----------------------------------------------------
     # Nothing before this penalized the base for translating in the world --
@@ -801,7 +920,30 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # (unlike orientation) -- stepping in place shouldn't require nonzero
     # average velocity the way lifting a foot requires some lean, so
     # there's no legitimate drift speed to protect.
-    position_reward_weight: float = 1.0
+    #
+    # DISABLED (1.0 -> 0.0) on 2026-09-07, as part of a controlled revert-
+    # to-last-known-good test. This term, heading_reward_weight below,
+    # orientation_margin_deg, orientation_reward_scale, and
+    # push_interval_range_s were reconstructed (via qmini_leg_env.py's own
+    # dated comment history) to be the full set of changes made SINCE the
+    # only run in this project's history with genuine, video-confirmed
+    # full-leg stepping (run 2026-08-24_22-29-06, iterations 282000-286999,
+    # foot_swing_reward ~0.83-0.85 real left-leg lift -- see
+    # foot_swing_left_weight's comment). Every training run since --
+    # multiple entropy_coef values, both phase encodings, the BD-X tracking
+    # penalty raise, foot_swing_reward_weight escalations, ClampedActorCritic
+    # -- has failed to reproduce genuine stepping, and single-variable tests
+    # (sin/cos phase revert) already ruled out the phase encoding. This
+    # term specifically penalizes the base for ANY translation, which is
+    # direct tension with what genuine single-support stepping physically
+    # requires (shifting weight off-center) -- added right after the Aug 24
+    # run specifically because that run drifted, without ever being tested
+    # against whether it makes rediscovering stepping harder. Disabling
+    # here, not deleting, so this is a clean, reversible A/B test: if
+    # genuine stepping reappears with this whole cluster of "stay still"
+    # pressure removed, re-enable this and the others one at a time to find
+    # how much stepping can actually tolerate before it's undone again.
+    position_reward_weight: float = 0.0
     position_reward_scale: float = 10.0
 
     # --- stay facing the same way -------------------------------------
@@ -854,6 +996,35 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # choosing at all (more likely a passive side-effect of the swing
     # motion imparting net reaction torque) and weight/scale tuning on
     # this term won't fix it either.
+    # DISABLED (2.5 -> 0.0) on 2026-09-07, same revert-to-last-known-good
+    # test as position_reward_weight above -- see that field's comment for
+    # the full reasoning. This term didn't exist at all during the last
+    # genuinely-confirmed-stepping run (added 2026-08-31).
+    #
+    # RE-ENABLED (0.0 -> 2.5) on 2026-09-08, resuming from
+    # 2026-09-07_22-00-51/model_39999.pt -- that run, with
+    # tracking_linear_penalty_weight reverted 1.0 -> 0.2 (see that field's
+    # comment), finally produced real, video-confirmed, sustained genuine
+    # stepping (foot_swing_reward steady ~1.6-1.65 the whole run, not a
+    # spike; heel/toe clearance actually positive; close-up frame review
+    # showed real alternating single-support swing/stance cycling). So
+    # tracking_linear_penalty_weight, not the phase encoding or the
+    # position/heading/push cluster, was the actual blocker all along. But
+    # that run's gait is aggressive and falls more than it should
+    # (heading/yaw_rate_dps ~100-127, way above anything seen in a healthy
+    # run before; mean_episode_length only ~250-260 despite
+    # orientation/fall_rate reading a "low" ~0.003 -- misleading at a
+    # glance, but that's a PER-STEP rate, and compounded over up to 499
+    # steps/episode it implies most episodes are in fact ending in a fall,
+    # matching what video shows). This term exists specifically to penalize
+    # uncommanded yaw spinning (see its addition above, originally added for
+    # the exact same "turning around more" symptom once real stepping made
+    # it possible) and does NOT touch tracking_linear_penalty_weight, so
+    # re-enabling it alone is a single-variable test for whether it calms
+    # the spin/fall rate down without undoing the stepping breakthrough.
+    # Resuming, not restarting fresh -- obs/action shapes are unchanged, and
+    # a resume preserves the actual learned stepping skill this run just
+    # found rather than asking a from-scratch run to rediscover it.
     heading_reward_weight: float = 2.5
     heading_reward_scale: float = 5.0
 
@@ -1149,7 +1320,30 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # measurable and one plausibly made things worse, reverting both back
     # to the last independently-validated state before trying
     # action_delay_range_steps' widening in isolation.
-    foot_swing_reward_weight: float = 5.0
+    #
+    # Raised again 5.0 -> 7.0 on 2026-09-05, for an unrelated reason this
+    # time: the first from-scratch run under the new sin/cos phase encoding
+    # (see observation_space's comment) fully converged (noise_std down to
+    # ~0.13-0.18, stable) but into a genuine "stop lifting" collapse --
+    # foot_swing_reward flat at ~0.003 for the whole second half of
+    # training, orientation/reward at an all-time high ~0.98, fall_rate 0,
+    # right_swing_target pinned at 0.0. The noise_std/foot_swing_reward
+    # curves both show a repeated sawtooth through iterations 0-20k (the
+    # policy visibly rediscovering then losing real stepping several times)
+    # before settling into standing-still for good around 20-25k -- this
+    # reads as a genuine reward-balance loss, not incomplete training (no
+    # exploration budget left to rediscover it from here). 5.0 clearly
+    # isn't enough under this new encoding. Not jumping straight back to
+    # 8.0 -- that attempt was confounded with motion_time_noise_std_s
+    # (active at the same time, since disabled), so 8.0 alone was never
+    # actually isolated and shouldn't be written off. 7.0 splits the
+    # difference: a real push in the same proven direction without
+    # repeating that specific combination. Resuming from
+    # model_18500.pt (this run's own lineage, from before the final
+    # collapse locked in -- the last visible sawtooth peak in both
+    # noise_std and foot_swing_reward), not the fully-collapsed final
+    # checkpoint.
+    foot_swing_reward_weight: float = 7.0
 
     # TEMPORARY per-side multipliers on foot_swing_reward, on top of the
     # weight above. Added after the ankle-tracking fix (joint_tracking_weight)
@@ -1747,13 +1941,23 @@ class QminiLegEnv(DirectRLEnv):
         joint_vel = joint_vel + torch.randn_like(joint_vel) * math.radians(self.cfg.joint_vel_noise_std_deg_s)
 
         # Phase-input realism noise -- see cfg.motion_time_noise_std_s's
-        # comment. Same pattern again: perturbs only what the policy
-        # OBSERVES here. self.motion_time itself stays exact everywhere else
+        # comment (currently disabled, 0.0). Same pattern as the other
+        # observation noise above: perturbs only what the policy OBSERVES
+        # here. self.motion_time itself stays exact everywhere else
         # (reference sampling for rewards, the action-delay buffer's
         # indexing, episode timing), only this observed copy is jittered.
+        #
+        # RE-ADOPTED sin(phase)/cos(phase) 2026-09-08 -- see
+        # observation_space's comment for the full reasoning. Noise is
+        # applied to the raw scalar BEFORE the sin/cos transform (not to
+        # sin/cos independently), so it stays a physically meaningful
+        # phase-timing jitter rather than an arbitrary perturbation of two
+        # otherwise-coupled unit-circle coordinates.
         motion_time_obs = self.motion_time.unsqueeze(1) + torch.randn_like(
             self.motion_time.unsqueeze(1)
         ) * self.cfg.motion_time_noise_std_s
+        phase_obs = 2.0 * math.pi * motion_time_obs / self.motion.length
+        phase_sin_cos_obs = torch.cat((torch.sin(phase_obs), torch.cos(phase_obs)), dim=-1)
 
         observations = torch.cat(
             (
@@ -1762,7 +1966,7 @@ class QminiLegEnv(DirectRLEnv):
                 imu_gravity,
                 imu_ang_vel,
                 # reference,
-                motion_time_obs
+                phase_sin_cos_obs
             ),
             dim=-1
         )
@@ -2062,6 +2266,23 @@ class QminiLegEnv(DirectRLEnv):
         # fire for every env on the same step, so "steps since the last
         # push" is a per-env tensor, not one shared global scalar.
         in_push_cooldown = self._steps_since_push < self.cfg.foot_swing_push_cooldown_steps
+
+        # DIAGNOSTIC ONLY -- not fed into the training reward, computed here
+        # purely so it can be logged below. Added 2026-09-06 after a direct
+        # video review (2026-09-06_01-16-02 run, iteration ~29800) noted the
+        # policy appeared to lift a leg briefly right after being pushed --
+        # a real, if small, protective-stepping reflex -- but this can never
+        # show up in tracking/foot_swing_reward or motion/*_clearance above,
+        # since both are unconditionally zeroed/computed pre-push during
+        # exactly this window by design (see this cfg's comment for why
+        # that's still correct for the actual reward: push-induced motion
+        # isn't a genuine policy choice). This metric exists only so we can
+        # watch whether that reflex is real and improving over training,
+        # without changing what the policy is actually optimized against.
+        cooldown_mask = in_push_cooldown.float()
+        n_in_cooldown = cooldown_mask.sum().clamp_min(1.0)
+        foot_swing_during_push_cooldown = (foot_swing_reward * cooldown_mask).sum() / n_in_cooldown
+
         foot_swing_reward = torch.where(in_push_cooldown, torch.zeros_like(foot_swing_reward), foot_swing_reward)
 
         # Track commanded base xy velocity (currently always zero -- stay
@@ -2127,6 +2348,11 @@ class QminiLegEnv(DirectRLEnv):
             "tracking/joint_limit_penalty": joint_limit_penalty.mean(),
             "tracking/target_limit_penalty": target_limit_penalty.mean(),
             "tracking/foot_swing_reward": foot_swing_reward.mean(),
+            # See foot_swing_during_push_cooldown's comment above -- watch
+            # this to see whether push-recovery stepping is real and
+            # improving, since it's invisible in the reward-facing metric
+            # above by design.
+            "tracking/foot_swing_during_push_cooldown": foot_swing_during_push_cooldown,
             # Logged as the MINIMUM of heel/toe height (the bottleneck that
             # actually determines clearance below), not heel alone -- see
             # cfg.left/right_toe_local_m's comment for why heel alone isn't
