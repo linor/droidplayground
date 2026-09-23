@@ -91,7 +91,7 @@ from pathlib import Path
 SUMMARY_FIELDS = [
     "label", "checkpoint", "timestamp", "num_envs", "eval_seconds", "seed",
     "completed_episodes", "fall_rate", "mean_episode_length_s",
-    "mean_tracking_err_deg", "mean_tilt_deg",
+    "mean_tracking_err_deg", "mean_tilt_deg", "mean_roll_deg", "mean_pitch_deg",
     "target_violation_rate", "mean_overshoot_deg", "mean_action_delta_deg",
     "p99_left_swing_target", "p99_right_swing_target",
     "p99_left_foot_height_cm", "p99_right_foot_height_cm",
@@ -124,6 +124,8 @@ def print_table(rows: list[dict]):
         ("mean_episode_length_s", "ep_len_s"),
         ("mean_tracking_err_deg", "track_err_deg"),
         ("mean_tilt_deg", "tilt_deg"),
+        ("mean_roll_deg", "roll_deg"),
+        ("mean_pitch_deg", "pitch_deg"),
         ("target_violation_rate", "tgt_viol_rate"),
         ("mean_overshoot_deg", "overshoot_deg"),
         ("mean_action_delta_deg", "act_delta_deg"),
@@ -245,10 +247,20 @@ def load_csv_rows(path: Path) -> list[dict]:
         return list(csv_module.DictReader(f))
 
 
+# Added 2026-09-22 (per-step commanded-target change, what robot_deploy.py's
+# max_step_deg check measures). Deliberately appended AFTER the err_deg_*
+# columns so they never shift the position of any column already in an
+# accumulated CSV (write_csv_rows appends without rewriting the header --
+# an existing CSV must be migrated to include these columns once, see git
+# history / the 2026-09-22 migration).
+EXTRA_FIELDS = ["step_over5_rate", "p99_step_deg"]
+
+
 def write_csv_rows(path: Path, rows: list[dict]):
     fieldnames = list(SUMMARY_FIELDS)
     joint_keys = sorted({k for row in rows for k in row if k.startswith("err_deg_")})
     fieldnames += [k for k in joint_keys if k not in fieldnames]
+    fieldnames += [k for k in EXTRA_FIELDS if k not in fieldnames]
     file_exists = path.exists()
     with open(path, "a", newline="") as f:
         writer = csv_module.DictWriter(f, fieldnames=fieldnames)
@@ -275,6 +287,9 @@ def _flat_policy_obs(obs):
     return obs["policy"]
 
 
+DUMP_HEIGHTS_PATH = None
+
+
 def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: float) -> dict:
     """Runs `num_steps` deterministic control steps and returns aggregate
     physical metrics. Reads env.unwrapped directly (same fields
@@ -298,11 +313,30 @@ def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: fl
     log_sums: dict[str, float] = {}
     log_count = 0
     tilt_deg_sum = 0.0
+    # Split out of tilt_deg (which is the combined xy-gravity-vector norm,
+    # i.e. total lean regardless of axis) -- added 2026-09-15 to check
+    # whether roll or pitch is the bigger contributor after video review
+    # flagged roll specifically as visibly worse than reference footage of
+    # this robot class, something mean_tilt_deg alone can't distinguish.
+    # projected_gravity_b's X component is ROLL, Y is PITCH -- per
+    # robot_config_qmini_stepinplace.json's _imu_comment (base_link +X
+    # points toward the LEFT leg, +Y toward the REAR) and the standard
+    # convention (roll = rotation about the fore-aft/sagittal axis, i.e.
+    # about body Y here; that rotation projects world gravity onto body X).
+    roll_deg_sum = 0.0
+    pitch_deg_sum = 0.0
     target_violation_step_count = 0
     overshoot_deg_sum = 0.0
     overshoot_deg_count = 0
     action_delta_deg_sum = 0.0
     prev_actions = torch.zeros(num_envs, unwrapped.cfg.action_space, device=device)
+    # Per-step commanded-target change (degrees), per env, reset to 0 on env
+    # reset exactly like the training env's _prev_actions -- so the first
+    # step of an episode counts (it is hardware's first commanded step too).
+    prev_actions_step = torch.zeros(num_envs, unwrapped.cfg.action_space, device=device)
+    step_over5_count = 0
+    step_max_deg_samples: list = []
+    step_excess_sum_samples: list = []  # per env-step: sum_j clamp(delta_j - 4deg, 0, 30deg) in rad (x weight = training penalty)
 
     # Population-wide 99th PERCENTILE (not mean, and NOT a raw max) of the
     # foot-swing-reward signal's components -- added to investigate a run
@@ -347,6 +381,12 @@ def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: fl
     left_swing_product_samples: list = []
     right_swing_product_samples: list = []
     PERCENTILE = 0.99
+
+    # OPTIONAL raw dump (--dump-heights PATH): full per-step, per-env arrays
+    # (NOT masked/percentiled) so per-swing peak heights, medians, and left/
+    # right asymmetry can be analysed offline -- p99 alone is a tail number
+    # that can hide what a typical swing looks like.
+    dump_rows: list = []
 
     # Skip this many steps right after EACH env's reset, AND right after
     # each push-disturbance event, before trusting body_pos_w-derived
@@ -427,6 +467,21 @@ def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: fl
         left_clearance = torch.clamp(left_foot_height / unwrapped.cfg.foot_swing_target_height_m, min=0.0, max=1.0)
         right_clearance = torch.clamp(right_foot_height / unwrapped.cfg.foot_swing_target_height_m, min=0.0, max=1.0)
 
+        if DUMP_HEIGHTS_PATH is not None:
+            _fh = unwrapped.foot_height_motion.sample(unwrapped.motion_time)
+            dump_rows.append(torch.stack([
+                torch.minimum(left_heel_height, left_toe_height), torch.maximum(left_heel_height, left_toe_height),
+                torch.minimum(right_heel_height, right_toe_height), torch.maximum(right_heel_height, right_toe_height),
+                left_swing_target, right_swing_target, settled_mask.float(),
+                _fh[:, 0], _fh[:, 1], _fh[:, 2], _fh[:, 3],
+                # cols 11-20 actual joint_pos, 21-30 reference joint_pos (rad, articulation order,
+                # names saved next to the .npy), 31 base z, 32-34 projected_gravity_b
+                *unwrapped.robot.data.joint_pos[:, :num_joints].T,
+                *reference[:, :num_joints].T,
+                unwrapped.robot.data.root_pos_w[:, 2],
+                *unwrapped.robot.data.projected_gravity_b.T,
+            ], dim=1).cpu())
+
         if settled_mask.any():
             left_swing_target_samples.append(left_swing_target[settled_mask].cpu())
             right_swing_target_samples.append(right_swing_target[settled_mask].cpu())
@@ -460,6 +515,10 @@ def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: fl
         gxy = unwrapped.robot.data.projected_gravity_b[:, :2]
         tilt_rad = torch.asin(torch.clamp(gxy.norm(dim=1), max=1.0))
         tilt_deg_sum += float(torch.rad2deg(tilt_rad).mean())
+        roll_rad = torch.asin(torch.clamp(gxy[:, 0].abs(), max=1.0))
+        pitch_rad = torch.asin(torch.clamp(gxy[:, 1].abs(), max=1.0))
+        roll_deg_sum += float(torch.rad2deg(roll_rad).mean())
+        pitch_deg_sum += float(torch.rad2deg(pitch_rad).mean())
 
         limits = unwrapped.robot.data.joint_pos_limits[:, :num_joints, :]
         lower, upper = limits[..., 0], limits[..., 1]
@@ -474,10 +533,27 @@ def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: fl
         action_delta_deg = torch.rad2deg(action_scale * (actions - prev_actions).abs()).mean()
         action_delta_deg_sum += float(action_delta_deg)
         prev_actions = actions.clone()
+        _step_deg = torch.rad2deg(action_scale * (actions - prev_actions_step).abs()).max(dim=1).values
+        step_over5_count += int((_step_deg > 5.0).sum())
+        step_max_deg_samples.append(_step_deg.cpu())
+        _dj = torch.rad2deg(action_scale * (actions - prev_actions_step).abs())
+        step_excess_sum_samples.append(torch.deg2rad(torch.clamp(_dj - unwrapped.cfg.step_limit_threshold_deg, min=0.0, max=unwrapped.cfg.step_limit_penalty_max_excess_deg)).sum(dim=1).cpu())
+        prev_actions_step = actions.clone()
+        prev_actions_step[dones_bool] = 0.0
 
         if (step + 1) % 100 == 0 or step + 1 == num_steps:
             print(f"    step {step + 1}/{num_steps}")
 
+    if DUMP_HEIGHTS_PATH is not None and dump_rows:
+        import numpy as _np
+        _np.save(DUMP_HEIGHTS_PATH, torch.stack(dump_rows).numpy())  # [steps, envs, 35]
+        with open(str(DUMP_HEIGHTS_PATH) + ".joints.json", "w") as _f:
+            json.dump(list(unwrapped.robot.joint_names[:num_joints]), _f)
+        print(f"    dumped raw heights to {DUMP_HEIGHTS_PATH}")
+
+    if step_excess_sum_samples:
+        _ex = torch.cat(step_excess_sum_samples)
+        print(f"    step-limit penalty at cfg weight {unwrapped.cfg.step_limit_penalty_weight}: mean {float(_ex.mean()) * unwrapped.cfg.step_limit_penalty_weight:.3f}/step, p99 {float(torch.quantile(_ex, 0.99)) * unwrapped.cfg.step_limit_penalty_weight:.2f}, max {float(_ex.max()) * unwrapped.cfg.step_limit_penalty_weight:.2f}")
     mean_log = {k: v / log_count for k, v in log_sums.items()} if log_count else {}
     joint_err_keys = [k for k in mean_log if k.startswith("tracking/") and k.endswith("_error")]
     mean_tracking_err_deg = (
@@ -496,9 +572,13 @@ def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: fl
         "mean_episode_length_s": (sum(episode_lengths_s) / completed) if completed else float("nan"),
         "mean_tracking_err_deg": mean_tracking_err_deg,
         "mean_tilt_deg": tilt_deg_sum / num_steps,
+        "mean_roll_deg": roll_deg_sum / num_steps,
+        "mean_pitch_deg": pitch_deg_sum / num_steps,
         "target_violation_rate": target_violation_step_count / (num_steps * num_envs),
         "mean_overshoot_deg": (overshoot_deg_sum / overshoot_deg_count) if overshoot_deg_count else 0.0,
         "mean_action_delta_deg": action_delta_deg_sum / num_steps,
+        "step_over5_rate": step_over5_count / (num_steps * num_envs),
+        "p99_step_deg": float(torch.quantile(torch.cat(step_max_deg_samples), PERCENTILE)),
         "p99_left_swing_target": _percentile(left_swing_target_samples),
         "p99_right_swing_target": _percentile(right_swing_target_samples),
         "p99_left_foot_height_cm": _percentile(left_foot_height_cm_samples),
@@ -523,7 +603,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="env seed, held identical across every checkpoint compared -- see module docstring's WHY A FIXED SEED MATTERS")
     parser.add_argument("--out", type=Path, default=None, help="CSV path to append results to (created with header if new); the printed table is built from the FULL accumulated file, not just this run's checkpoints")
     parser.add_argument("--print-only", type=Path, default=None, help="skip Isaac Sim entirely, just load and print an existing --out csv")
+    parser.add_argument("--dump-heights", type=str, default=None, help="optional .npy path: save raw per-step per-env foot heights [steps, envs, 11] for offline distribution analysis")
     args_cli, extra = parser.parse_known_args()
+    global DUMP_HEIGHTS_PATH
+    DUMP_HEIGHTS_PATH = args_cli.dump_heights
 
     if args_cli.print_only:
         print_table(load_csv_rows(args_cli.print_only))
@@ -653,7 +736,7 @@ def main():
             print(
                 f"  fall_rate={row['fall_rate']:.3f}  mean_ep_len_s={row['mean_episode_length_s']:.2f}  "
                 f"mean_tracking_err_deg={row['mean_tracking_err_deg']:.2f}  "
-                f"target_violation_rate={row['target_violation_rate']:.4f}"
+                f"target_violation_rate={row['target_violation_rate']:.4f}  step_over5_rate={row.get('step_over5_rate', float('nan')):.4f}  p99_step_deg={row.get('p99_step_deg', float('nan')):.1f}"
             )
             print(
                 f"  p99_left_swing_product={row['p99_left_swing_product']:.3f}  "

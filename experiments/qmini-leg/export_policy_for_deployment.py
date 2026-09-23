@@ -69,15 +69,6 @@ def _build_actor_and_load(checkpoint_path: Path, obs_dim: int, action_dim: int,
     act_map = {"elu": torch.nn.ELU, "relu": torch.nn.ReLU, "tanh": torch.nn.Tanh}
     act_cls = act_map[activation]
 
-    layers = []
-    in_dim = obs_dim
-    for h in actor_hidden_dims:
-        layers.append(torch.nn.Linear(in_dim, h))
-        layers.append(act_cls())
-        in_dim = h
-    layers.append(torch.nn.Linear(in_dim, action_dim))
-    actor = torch.nn.Sequential(*layers)
-
     # weights_only=False: this is your own training checkpoint, not an
     # untrusted download, so it's fine to unpickle fully here.
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -85,7 +76,7 @@ def _build_actor_and_load(checkpoint_path: Path, obs_dim: int, action_dim: int,
 
     # rsl_rl typically prefixes actor weights with "actor." inside the
     # combined ActorCritic state dict -- pull those out and re-key them to
-    # match our plain nn.Sequential above (0.weight, 0.bias, 2.weight, ...).
+    # match our plain nn.Sequential below (0.weight, 0.bias, 2.weight, ...).
     actor_state = {}
     for k, v in state_dict.items():
         if k.startswith("actor."):
@@ -98,13 +89,61 @@ def _build_actor_and_load(checkpoint_path: Path, obs_dim: int, action_dim: int,
             "to match how your policy was actually trained/saved."
         )
 
-    missing, unexpected = actor.load_state_dict(actor_state, strict=False)
-    if missing or unexpected:
-        print(f"[WARN] state_dict mismatch. missing={missing} unexpected={unexpected}", file=sys.stderr)
-        print("[WARN] Double check actor_hidden_dims/activation match training config.", file=sys.stderr)
-
+    # Infer layer sizes from the weights themselves instead of trusting
+    # --actor-hidden-dims (a mismatch there used to only print a warning
+    # under strict=False). actor_hidden_dims/activation args are kept only
+    # for CLI compatibility.
+    weight_keys = sorted((k for k in actor_state if k.endswith(".weight")), key=lambda k: int(k.split(".")[0]))
+    layers = []
+    for i, k in enumerate(weight_keys):
+        out_f, in_f = actor_state[k].shape
+        layers.append(torch.nn.Linear(in_f, out_f))
+        if i < len(weight_keys) - 1:
+            layers.append(act_cls())
+    if actor_state[weight_keys[0]].shape[1] != obs_dim or actor_state[weight_keys[-1]].shape[0] != action_dim:
+        raise RuntimeError(
+            f"Checkpoint actor maps {actor_state[weight_keys[0]].shape[1]} -> "
+            f"{actor_state[weight_keys[-1]].shape[0]} but --joint-order implies "
+            f"{obs_dim} -> {action_dim}."
+        )
+    actor = torch.nn.Sequential(*layers)
+    actor.load_state_dict(actor_state, strict=True)
     actor.eval()
+
+    # OBSERVATION NORMALIZER -- rsl_rl trains with actor_obs_normalization=True
+    # (see rsl_rl_qmini_leg_ppo_cfg.py) and keeps its running mean/std in
+    # "actor_obs_normalizer.*". The policy only works on (obs - mean) /
+    # (std + eps); rsl_rl's own export_policy_as_jit bakes this in, but this
+    # raw-checkpoint path used to build the bare actor WITHOUT it, so every
+    # bundle exported this way (checked 2026-09-21: deploy_bundle_2026-09-08_
+    # sincos and deploy_bundle_2026-09-11_target_limit_fix both match the
+    # bare un-normalized actor exactly) expected obs on a completely
+    # different scale than it saw in training. eps=0.01 is rsl_rl's
+    # EmpiricalNormalization default -- verified numerically against a run's
+    # own exported/policy.pt (max diff 0.0 at eps=0.01, ~490 at eps=0).
+    mean_key, std_key = "actor_obs_normalizer._mean", "actor_obs_normalizer._std"
+    if mean_key in state_dict and std_key in state_dict:
+        mean = state_dict[mean_key].reshape(1, -1).clone()
+        std = state_dict[std_key].reshape(1, -1).clone()
+        return _NormalizedActor(actor, mean, std, eps=NORMALIZER_EPS)
+    print("[WARN] checkpoint has no actor_obs_normalizer.* keys -- exporting the bare actor. "
+          "If this run used actor_obs_normalization=True that is WRONG.", file=sys.stderr)
     return actor
+
+
+NORMALIZER_EPS = 1e-2
+
+
+class _NormalizedActor(torch.nn.Module):
+    def __init__(self, actor, mean, std, eps):
+        super().__init__()
+        self.actor = actor
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+        self.eps = float(eps)
+
+    def forward(self, x):
+        return self.actor((x - self.mean) / (self.std + self.eps))
 
 
 def load_policy(checkpoint_path: Path, obs_dim: int, action_dim: int,
@@ -223,6 +262,7 @@ def main():
         "action_scale": args.action_scale,
         "action_smoothing": args.action_smoothing,
         "source_checkpoint": str(args.checkpoint),
+        "obs_normalization_baked_in": source_kind == "traced_from_state_dict",
         "policy_sha256": sha256,
     }
     meta_out_path = args.output_dir / "policy.meta.json"

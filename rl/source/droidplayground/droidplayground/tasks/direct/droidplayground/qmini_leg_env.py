@@ -11,7 +11,7 @@ from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.envs.common import ViewerCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_apply, sample_uniform
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, sample_uniform, wrap_to_pi
 from isaaclab.utils import configclass
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
@@ -68,6 +68,36 @@ def _load_reference_keyframes(json_path: Path, joint_names: list[str]):
 
     keyframes = [(t, [pose[c] for c in columns]) for t, pose in data["keyframes"]]
     return keyframes, bool(data.get("degrees", True))
+
+
+def _load_reference_foot_heights(json_path: Path):
+    """Load the per-frame reference foot-height curve, same `times` as the
+    joint keyframes. See `reference_foot_heights_m`'s own comment in the
+    keyframes JSON (written by gen_reference_heights.py) for how these 4
+    columns (left_heel, left_toe, right_heel, right_toe, meters, each
+    foot's own height above ITS OWN cycle minimum) were computed. Raises
+    if the field is missing, rather than silently falling back to
+    something -- see foot_height_target_floor_m's comment in this file for
+    why this replaced the old constant target and must not go quietly
+    missing.
+    """
+    with open(json_path) as f:
+        data = json.load(f)
+    if "reference_foot_heights_m" not in data:
+        raise KeyError(
+            f"{json_path} has no 'reference_foot_heights_m' field -- run "
+            f"gen_reference_heights.py to generate it (see "
+            f"foot_height_target_floor_m's comment in qmini_leg_env.py)."
+        )
+    heights = data["reference_foot_heights_m"]
+    times = [t for t, _ in data["keyframes"]]
+    if len(times) != len(heights):
+        raise ValueError(
+            f"{json_path}: 'keyframes' has {len(times)} frames but "
+            f"'reference_foot_heights_m' has {len(heights)} -- re-run "
+            f"gen_reference_heights.py, they must stay in sync."
+        )
+    return list(zip(times, heights))
 
 
 @configclass
@@ -580,6 +610,62 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # session. Re-enable only once genuine stepping is unambiguously back,
     # and verify with video immediately after, per this field's standing
     # instruction above.
+    #
+    # RE-ENABLED AGAIN (2026-09-23, 4.0s, same value as the 2026-08-28
+    # attempt) as a FRESH START, not a resume. Motivated by 2026-09-22/23
+    # hardware: with the power supply issue resolved (see
+    # imu_fault_diagnosis notes), the real remaining failures are (a) a
+    # phase-locked disturbance at motion_time~1.0-1.5s the joint_tracking_
+    # weight work has been chasing joint-by-joint without eliminating it,
+    # and (b) the policy occasionally grazing the hip-roll hard limit --
+    # both consistent with a policy that has never had to recover from an
+    # off-reference state, only ever track the clean reference. That's
+    # exactly this field's own 2026-08-28 rationale, for exactly the same
+    # kind of hardware failure (targets near/past joint limits). NOT
+    # expected to directly shrink the phase-locked disturbance itself
+    # (that's the policy's OWN commanded motion diverging from sim under
+    # real dynamics, not an external-disturbance-recovery problem) -- this
+    # is a complementary robustness step, not a replacement for that work.
+    # Safe to try via fresh start where a resume already failed once
+    # (collapse to a frozen roll-tilted pose within ~5700 iterations, see
+    # point 3 above) -- same lesson as roll_reward_weight's whole history:
+    # introducing a genuinely new disturbance onto an already-converged,
+    # low-entropy policy (noise_std ~0.05 currently) is fragile via
+    # resume. The reward terms suspended during push cooldown
+    # (foot_swing_reward, position_reward, heading_reward, plus
+    # foot_overswing_penalty/heading_deviation_penalty) are the same as
+    # before, but target_limit_penalty/step_limit_penalty/
+    # action_rate_penalty/joint_limit_penalty and the core tracking/
+    # orientation/roll rewards all stay active THROUGHOUT a push now --
+    # none of those existed during the 2026-08-28 attempt, so recovery
+    # motion is more constrained this time than what caused that collapse.
+    # Per this field's standing instruction: verify with video immediately
+    # after training, and check compare_policies_isaaclab.py's
+    # target_violation_rate/step_over5_rate specifically, not just
+    # foot_swing_reward (still contaminable by push-recovery motion).
+    #
+    # RESULT: failed, and by the OTHER mechanism this field's own point 1
+    # already warned about (not the resume-collapse point 3 this was
+    # written to avoid). Fresh start, stopped at iteration ~4975/40000:
+    # foot_swing_reward peaked ~0.08 near iteration 100 then collapsed to
+    # ~0.008 and stayed there, while orientation/reward sat at ~0.997,
+    # fall_rate at ~0, episode length maxed at ~496 -- the classic
+    # never-discovers-stepping local optimum, not a slow-to-converge run
+    # (every healthy fresh start in this project reaches ~0.7-1.3 by
+    # iteration 2000-3000). Pushes active from iteration 0, before
+    # stepping was ever discovered, made "survive every episode
+    # (including pushes) by standing still" more attractive than
+    # discovering the riskier genuine-stepping skill -- exactly point 1's
+    # mechanism. Both fresh-start (this) and resume (point 3, 2026-08-28)
+    # have now independently failed at introducing pushes in this project;
+    # a real future attempt would need something in between (introduce
+    # pushes AFTER stepping is established but BEFORE exploration noise
+    # collapses, not at either endpoint) rather than repeating either of
+    # these two. DISABLED AGAIN (1000.0) -- back to the last known-good
+    # state. Not attempted further as of 2026-09-23; two other, better-
+    # localized hardware issues (hip-roll grazing its limit at
+    # motion_time~1.0s, yaw3's right-hip-pitch step-size violations at
+    # ~0.36-0.40s) are the priority instead.
     push_interval_range_s: tuple[float, float] = (1000.0, 1000.0)
     push_velocity_range_mps: tuple[float, float] = (-0.4, 0.4)
 
@@ -588,6 +674,75 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # Start small (e.g. 0.01-0.05) and increase if deployed targets are
     # still visibly jittery -- too high will fight the tracking_reward and
     # produce a sluggish policy that can't keep up with the gait.
+    #
+    # RAISED 0.02 -> 0.1 on 2026-09-09, directly triggered by this field's
+    # own documented condition above: first real-hardware attempts with the
+    # 2026-09-08 sin/cos checkpoint (model_39999, run 2026-09-08_22-14-51)
+    # hit repeated SAFETY ABORTs on max_step_deg (5deg default, still
+    # aborted at 15deg loosened) within ~0.2s of policy control starting.
+    # Cross-checked the actual deploy-side decode math against the logged
+    # control_loop CSV (target_deg = default_pos_deg + degrees(action_scale
+    # * action)) and it matches exactly -- not a decode bug. The real
+    # per-step TARGET deltas were genuinely escalating (roughly 2-8deg/step
+    # early, climbing to 7-15deg/step by the 8th-11th control tick) with
+    # IMU ang_vel_deg_s climbing alongside it (single digits -> 50-70+
+    # deg/s over the same ~10 steps) -- a real, growing oscillation, not a
+    # one-off spike. This is the same checkpoint already characterized in
+    # sim as "aggressive, sometimes falls" (large tracking errors, high
+    # yaw_rate_dps) -- expected, since this checkpoint was deliberately
+    # picked to verify sin/cos survives genuine stepping BEFORE doing any
+    # gait-quality polishing (see tracking_linear_penalty_weight and
+    # heading_reward_weight's comments for that whole arc). Real hardware's
+    # actuator latency/backlash/structural compliance isn't perfectly
+    # modeled in sim, so a jerky, large-step-to-step policy that looks
+    # merely energetic in sim is exactly the kind most exposed by that
+    # sim-to-real gap. NOT raising max_step_deg further -- that would mask
+    # the safety margin rather than fix the underlying jerkiness. 0.1 (5x)
+    # is a first, moderate step per this field's own "start small and
+    # increase if" guidance; resume (not fresh-start) from model_39999.pt
+    # to keep the already-hard-won genuine stepping skill while adding this
+    # new smoothness pressure on top. Watch tracking/action_rate_penalty
+    # and whether deployed step sizes actually shrink; if still tripping
+    # max_step_deg, raise further before considering action_smoothing
+    # (already tried once as a permanent EMA and reverted, see that cfg's
+    # comment -- this reward-based penalty is more surgical, doesn't blindly
+    # low-pass filter every command the way a fixed EMA does).
+    #
+    # RAISED AGAIN 0.1 -> 0.3 on 2026-09-10, after the resumed run trained
+    # under 0.1 was checked with compare_policies_isaaclab.py against the
+    # pre-change checkpoint (experiments/qmini-leg/compare_action_smoothness.csv)
+    # and the result was underwhelming: mean_action_delta_deg only dropped
+    # ~1.274 -> ~1.227 deg (~4%) and mean_tracking_err_deg barely moved --
+    # a 5x weight increase (0.02->0.1) bought almost nothing. That csv is a
+    # MEAN over every joint/env/step, though, not a worst-case -- the real
+    # hardware SAFETY ABORT this whole change was meant to fix was a
+    # single-joint, single-step OUTLIER (10-15+ deg), which a small drop in
+    # the average doesn't confirm or rule out either way. Raising
+    # aggressively rather than incrementally this time specifically to get
+    # a clearer signal one way or the other; re-verify with
+    # compare_policies_isaaclab.py again after this run (one-checkpoint-
+    # per-invocation, per that script's own multi-checkpoint-session
+    # caveat) before ever attempting real hardware again.
+    #
+    # REVERTED 0.3 -> 0.02 (its original pre-2026-09-09 value) on 2026-09-16.
+    # Two fresh-start runs since the 2026-09-07/08 breakthrough (which found
+    # genuine stepping at 0.02) failed to find any stepping at all
+    # (foot_swing_reward stayed ~0.006-0.008 for 40k/5600+ iterations, vs
+    # ~1.5 by iteration 3000 on both prior successful fresh starts). Dug
+    # into the SECOND failed run's own per-iteration tensorboard data
+    # (free, no extra training needed) rather than guessing further: right
+    # as foot_swing_reward briefly rose during a transient rediscovery
+    # (iterations ~3075-3210), THIS term grew ~9x (0.11->1.38) in lockstep,
+    # BEFORE episode_length or fall_rate moved at all -- i.e. a direct,
+    # immediate mechanical consequence of genuine stepping's bigger/faster
+    # joint motions, not a side effect of falling. See
+    # target_limit_penalty_weight's comment for the paired finding (that
+    # term moved even more, ~150x). Reverting both for a fresh-start
+    # confirmatory test; once genuine stepping is re-established, harden
+    # this back up gradually via RESUME (not fresh start) the same way it
+    # worked the first time, watching compare_policies_isaaclab.py's
+    # mean_action_delta_deg/target_violation_rate at each step rather than
+    # jumping straight back to 0.3.
     action_rate_penalty_weight: float = 0.02
 
     # Per-joint-TYPE multiplier on the action-rate penalty's squared term,
@@ -738,12 +893,70 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # a runaway exploit needing to be shut down. UNTUNED -- watch
     # tracking/*_ankle_error and whether the video shows full (not just
     # toe) clearance, and whether the right foot starts participating too.
+    # RAISED 2026-09-23: roll 3.0->6.0, ankle 2.0->3.0. Root-caused via
+    # hardware -- 10 separate 2026-09-22 runs (both the original tighter
+    # IMU-fault threshold and the loosened one) all hit their worst
+    # disturbance at motion_time~1.0-1.3s, every single cycle (30+ cycles
+    # observed). That's exactly the keyframes' own documented swing-onset
+    # discontinuity window (see this file's _comment: pitch/knee/ankle
+    # re-smoothed there on 2026-09-03 after a real robot_deploy.py
+    # runaway) -- but that same comment explicitly says roll's OWN
+    # reference was checked and is already smooth through this region, and
+    # ankle's was re-smoothed too. So the policy's large roll/ankle
+    # excursion there (hardware FK-style replay: ~17deg hip-roll swing and
+    # ~23-25deg right-ankle swing, against references of ~2.7deg and
+    # ~6deg respectively) isn't the reference asking for it -- it's the
+    # policy choosing it, right when pitch/knee are making their fastest
+    # transition, almost certainly as a fast balance lever. This is the
+    # SAME exploit category roll=3.0 was originally added to shut down
+    # (see that history above) recurring in a new form 3.0 wasn't enough
+    # to prevent. Resume, not fresh start -- this reshapes tracking_reward's
+    # existing per-joint weighting, not a separate additive penalty term
+    # with its own escalation dynamics (unlike foot_overswing_penalty_weight,
+    # which broke at big single jumps); the original roll=3.0/ankle=2.0
+    # values were themselves introduced this way. Still watch
+    # foot_swing_reward and video closely -- pushing joint tracking too
+    # hard on ANY joint has suppressed genuine stepping before
+    # (tracking_linear_penalty_weight's whole history), and this is
+    # deliberately a real, not timid, step (2x on roll) given the
+    # measured excess is ~3x the reference amplitude.
+    #
+    # RESULT (2026-09-23, compare_policies_isaaclab.py on model_159996.pt
+    # vs the pre-change checkpoint): roll error improved 1.85/1.56 ->
+    # 1.51/1.17deg, ankle 2.31/2.33 -> 2.13/1.55deg -- both real, confirmed
+    # in eval not just training curves. But NOT a clean fix: yaw error got
+    # notably worse (1.61/0.81 -> 2.67/2.04deg) and pitch somewhat worse
+    # (4.13/2.79 -> 4.66/4.03deg); mean_tracking_err_deg and body tilt/
+    # roll/pitch all ticked up slightly too. Read: the balance-correction
+    # need at that gait phase didn't go away, it partly moved to yaw and
+    # pitch instead of roll/ankle -- the same whack-a-mole pattern
+    # roll=3.0 was originally introduced to fight, recurring one level
+    # down.
+    #
+    # RAISED yaw 1.0 -> 3.0 on 2026-09-23 to follow it there. Yaw
+    # specifically, not pitch, even though pitch also got worse: yaw's
+    # reference is EXACTLY 0 always (this gait never asks for any yaw
+    # motion), so tightening it has essentially no risk of suppressing
+    # genuine stepping -- any yaw error is pure unwanted behavior by
+    # construction. Pitch is different: it's the primary joint actually
+    # driving genuine stepping (hip-pitch/knee-pitch lift), with a large
+    # legitimate reference range (~15-22deg) that a further-tightened
+    # weight could bite into, repeating the exact suppression failure mode
+    # tracking_linear_penalty_weight caused earlier in this project (see
+    # that field's whole history). Leaving pitch/knee alone this round to
+    # isolate whether fixing yaw alone is enough before touching the one
+    # joint most dangerous to over-constrain. Resume from this same
+    # checkpoint (2026-09-22_13-45-07/model_159996.pt), same reasoning as
+    # the roll/ankle change re: why resume is fine here. Watch
+    # tracking/left_yaw_error /right_yaw_error, whether pitch/tracking_err
+    # keep degrading anyway (would mean yaw wasn't the real outlet), and
+    # foot_swing_reward for any suppression.
     joint_tracking_weight: dict = {
-        "yaw": 1.0,
-        "roll": 3.0,
+        "yaw": 3.0,
+        "roll": 6.0,
         "pitch": 1.0,
         "knee": 1.0,
-        "ankle": 2.0,
+        "ankle": 3.0,
     }
 
     # --- balance (now that the base is free-floating, not welded to the
@@ -801,8 +1014,24 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # past orientation_margin_deg cost more, which is direct tension with
     # what genuine single-support stepping requires (leaning to shift
     # weight onto the stance leg).
+    #
+    # scale RAISED 8.0 -> 12.0 (2026-09-10), a deliberately PARTIAL move
+    # (not back to 20.0). Across the three action_rate_penalty /
+    # target_limit_penalty tuning iterations, mean_tilt_deg in the
+    # compare_policies_isaaclab.py eval crept 8.16 -> 8.56 -> 9.00 -- the
+    # policy leans progressively more as it gets more dynamic. Still 0%
+    # fall_rate in that eval so it's tolerable now, but it's a consistent
+    # trend and left unchecked could eventually cost stability. 12.0 adds a
+    # real, felt cost specifically for the larger leans (per the reward-
+    # curve numbers above: ~7-10% more orientation_reward lost at 12-20deg
+    # tilt vs scale 8.0) while barely touching routine 8-9deg leans, so it
+    # arrests the tail without re-creating the "too rigid to step" pressure
+    # that reverting fully to 20.0 would. Keeping orientation_margin_deg at
+    # 6.0 -- margin is the riskier knob (it was the one deliberately
+    # loosened 2->6 to unlock stepping); tighten it only if scale=12.0
+    # doesn't hold the tilt.
     orientation_reward_weight: float = 3.0
-    orientation_reward_scale: float = 8.0
+    orientation_reward_scale: float = 12.0
 
     # Degrees of lean given a FULL orientation_reward bonus (no penalty at
     # all) before tilt beyond this starts costing reward -- see the margin
@@ -883,6 +1112,247 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # position_reward_weight's comment). See that comment for the full
     # reasoning; this field is reverted for the same test.
     orientation_margin_deg: float = 6.0
+
+    # --- roll specifically ----------------------------------------------
+    # Added 2026-09-15 after extending compare_policies_isaaclab.py to
+    # split orientation_reward's combined tilt metric into per-axis
+    # numbers (see that script's mean_roll_deg/mean_pitch_deg) and finding
+    # roll at 7.33deg vs pitch at only 2.70deg -- roll is the dominant,
+    # almost the ENTIRE contributor to mean_tilt_deg (8.20deg =~
+    # sqrt(7.33^2 + 2.70^2)), not a balanced mix. Confirms a real-hardware
+    # observation (video comparison against reference footage of this
+    # robot class showed a visibly stable torso there vs visible roll here)
+    # with an actual number, and lines up with this project's oldest
+    # documented real-hardware failure mode -- the very first attempts,
+    # months before any of the heading/overswing work, all failed on "a
+    # smooth, accelerating left_hip_roll divergence within the first ~1s"
+    # (see orientation_reward_scale's history above).
+    #
+    # projected_gravity_b's X component encodes ROLL specifically (Y is
+    # pitch) -- see robot_config_qmini_stepinplace.json's _imu_comment
+    # (base_link +X points toward the LEFT leg, the lateral axis; a roll
+    # rotation, about the fore-aft/Y axis, is what projects gravity onto
+    # X) and compare_policies_isaaclab.py's matching comment.
+    #
+    # This is an ADDITIONAL bonus on top of orientation_reward above, not
+    # a replacement -- orientation_reward's combined margin/scale are
+    # already working (best-yet orientation/reward this whole series), so
+    # this adds dedicated, undiluted pressure on roll specifically rather
+    # than risking that by restructuring it. Reuses orientation_margin_deg
+    # (6deg) rather than a tighter number for now -- see the conversation
+    # this was added from: that margin was deliberately chosen (and a
+    # tightening to 2deg deliberately reverted) because single-support
+    # stepping physically requires some roll to shift weight onto the
+    # stance leg, not just error to eliminate. Giving roll its own
+    # UNDILUTED margin/weight (rather than sharing one budget with pitch,
+    # which barely uses its share) is already a real tightening in
+    # practice without needing to shrink the number too. If roll is still
+    # too high after this, tighten roll_margin_deg specifically as the
+    # next single-variable step -- don't change this AND the margin in the
+    # same run, or a failure won't tell you which one mattered.
+    # UNTUNED starting guess for the weight.
+    #
+    # LOWERED 2.0 -> 1.0 on 2026-09-15. The first run at 2.0 (resumed
+    # 2026-09-14_12-14-23/model_279993.pt -> 2026-09-15_00-14-19,
+    # iterations 280000-319992) DID work -- model_315000.pt showed
+    # mean_roll_deg down 17% (7.33->6.10) and mean_tilt_deg at its best
+    # value of the whole tuning series (7.09) -- but the run also finished
+    # in an apparent catastrophic state (model_319992.pt: fall_rate 87%,
+    # mean_action_delta_deg 126). Dug into the raw per-iteration
+    # tensorboard data (not just the coarse checkpoints) rather than
+    # guessing: this was NOT a single one-way collapse. Loss/value_function
+    # showed 17 distinct spike events (>3000, vs a ~300-800 baseline)
+    # across the 40k-iteration run, at ESCALATING frequency (3 in
+    # 280k-290k, 1 in 290k-300k, 5 in 300k-310k, 8 in 310k-320k) and
+    # escalating peak severity (up to 59614 at step ~315956) -- and 16 of
+    # those 17 fully self-recovered within a few hundred iterations,
+    # including one bigger than the "catastrophic" final one. Training just
+    # happened to hit its iteration budget mid-spike on the 17th (started
+    # step 319936), which is why the final checkpoint looked uniquely bad --
+    # it wasn't a point of no return, just unlucky timing. Every spike
+    # inspected showed orientation/roll_deg jumping in lockstep with
+    # Loss/value_function and tracking/target_limit_penalty, which is why
+    # this is being lowered rather than left alone: roll_reward and
+    # orientation_reward both respond to the same physical signal (body
+    # tilt), so a rare large-roll event now moves TWO reward terms at once,
+    # plausibly making the value function's job harder around exactly that
+    # part of state space -- and that's a real, escalating-frequency cost
+    # even though every individual event (but the last, unlucky one) self-
+    # corrected. Resuming from model_315000.pt (the last verified-stable
+    # checkpoint, NOT the collapsed 319992), watching whether spike
+    # frequency drops at this lower weight while still holding most of the
+    # roll improvement.
+    # DISABLED (1.0 -> 0.0) on 2026-09-16. Lowering the weight (2.0->1.0,
+    # see history above) was meant to test whether roll_reward was driving
+    # the recurring resumed-run instability -- instead the SAME lower
+    # weight run showed FAR worse instability (70 spike events vs 17,
+    # peaks up to 306945 vs 59614, one sustained 2634-iteration collapse)
+    # and the final checkpoint never recovered, unlike the 2.0 run's
+    # otherwise-comparable collapse. That doesn't fit "weight too high" as
+    # the mechanism. A subsequent completely FRESH start (no resume, to
+    # rule out resume-chain state as the cause) was run with everything
+    # else unchanged, and it revealed something more fundamental: genuine
+    # stepping never appeared at all this time (foot_swing_reward ~0.006
+    # for the whole 40k-iteration run, vs ~1.5 by iteration 3000 on both
+    # prior successful fresh starts, 2026-09-07/08) -- the policy instead
+    # converged onto the "stand very still, track reference joint angles
+    # tightly" local optimum this project has hit and had to fix multiple
+    # times before (see tracking_linear_penalty_weight and
+    # position_reward_weight's comments): tracking/reward abnormally HIGH
+    # (6.49 vs the usual ~3-4.5), orientation/reward and roll_reward both
+    # pinned near-max (0.999/1.000), noise_std very low (0.09, confidently
+    # converged onto something -- just not stepping).
+    #
+    # Likely mechanism: roll_reward is a SECOND, independent reward channel
+    # for staying level, stacked on top of orientation_reward rather than
+    # sharing its existing budget (both use the same 6deg margin on the
+    # same physical signal) -- roughly doubling the "stay level" pressure
+    # against what genuine single-support stepping requires (leaning to
+    # shift weight onto the stance leg). A RESUMED run has an established
+    # stepping skill with some inertia defending it against that pull; a
+    # FRESH run has nothing to defend and falls straight into the safer
+    # optimum instead of ever discovering stepping. This also reframes the
+    # resumed-run instability above: those runs still had real stepping
+    # (with recurring destabilization), which is a different, less
+    # fundamental problem than never finding it at all -- suggesting
+    # roll_reward's strength is a real, independent problem, not purely a
+    # resume-chain artifact.
+    #
+    # Disabling entirely as a clean, single-variable confirmatory test:
+    # another fresh start with everything else unchanged. If genuine
+    # stepping reappears reliably (matching the 2026-09-07/08 pattern),
+    # that confirms the diagnosis, and roll stability should be
+    # reintroduced more gently next time -- e.g. folded into
+    # orientation_reward's existing budget instead of stacked as a second
+    # channel, or at a much lower weight -- rather than as-is.
+    #
+    # That confirmatory test passed (fresh start under this AND
+    # action_rate_penalty_weight/target_limit_penalty_weight/
+    # target_limit_penalty_linear_coef all reverted together found genuine
+    # stepping again by iteration ~2000-3000, matching 2026-09-07/08) -- but
+    # video review of that run showed the body itself swinging/rotating a
+    # lot to shift weight, unlike reference footage of this robot class
+    # (Qmini_simulation.gif, the Disney BD-X recording), where the torso
+    # stays visually still and weight-shift happens at the hip-roll JOINT
+    # instead (confirmed in that run's own log: reference hip-roll amplitude
+    # was tiny, ~0.5deg, while actual roll was -3 to -7deg -- the policy
+    # wasn't tracking the small joint-level reference, the body was
+    # absorbing the difference).
+    #
+    # RE-ENABLED (0.0 -> 1.0) on 2026-09-16 for a NEW fresh start (not a
+    # resume) alongside the now-reverted action_rate_penalty_weight/
+    # target_limit_penalty_weight/target_limit_penalty_linear_coef --
+    # testing whether shaping roll from the very start of training, rather
+    # than layering it onto an already-established aggressive gait via
+    # resume (which is what caused the earlier instability, see the history
+    # above), lets the policy find a genuinely calmer gait across the board
+    # from the outset instead of learning "big and fast" first and fighting
+    # to rein it in after. This is a different, cleaner scenario than every
+    # previous roll_reward attempt: those were all resumes on top of an
+    # already-aggressive policy; this is present from iteration 0, alongside
+    # the gentler action_rate/target_limit values already confirmed to
+    # allow fresh-start stepping discovery on their own. 1.0 chosen as a
+    # middle value (not the original 2.0, not the even-more-unstable-in-
+    # resume 1.0 from before -- though note that instability was measured
+    # under resume conditions this isn't repeating). If stepping fails to
+    # appear again, roll_reward is confirmed to fight cold-start discovery
+    # regardless of the other terms and needs a fundamentally gentler shape
+    # (e.g. folded into orientation_reward's budget rather than a stacked
+    # second channel, per the note above) rather than just a lower weight.
+    #
+    # That fresh start at 1.0/margin=2.0 worked cleanly: only 1 tiny
+    # Loss/value_function spike across the whole 40k-iteration run (vs. 17
+    # and 70 in the two resumed attempts), and mean_roll_deg/mean_tilt_deg/
+    # mean_pitch_deg all hit new project bests (4.84/5.67/2.02 deg via
+    # compare_policies_isaaclab.py). Still clearly more body roll than
+    # reference footage of this robot class shows (near-zero visible torso
+    # movement), so pushing further. RAISED 1.0 -> 2.0 on 2026-09-17, back
+    # to the original pre-resume-chaos value, for ANOTHER fresh start (not
+    # a resume) -- deliberately not tightening roll_margin_deg further in
+    # the same step (already a 3x cut, 6->2, don't stack two changes).
+    # Important: resuming was considered and rejected here even though it
+    # would be cheaper -- the second failed resume attempt (2.0 -> 1.0)
+    # wasn't introducing a new term, it was changing the weight of an
+    # ALREADY-active roll_reward, and that was the WORSE of the two
+    # failures (70 spike events, one 2634-iteration sustained collapse).
+    # So "already has roll_reward trained in, just changing the weight" is
+    # not evidence resuming is safer for this term -- only training it in
+    # from iteration 0 has ever worked cleanly. If this fresh start also
+    # trains stably, that's real evidence the weight itself isn't what
+    # caused the earlier resume failures (it was resuming specifically);
+    # if THIS destabilizes too, that's real evidence 2.0 is simply too
+    # aggressive regardless of resume vs fresh, and 1.0 was closer to the
+    # ceiling.
+    #
+    # That fresh start at 2.0 answered the question: it destabilized
+    # genuine stepping specifically (tracking/foot_swing_reward plateaued
+    # ~0.66-0.70 instead of climbing to the ~1.35 the 1.0 run reached, with
+    # general tracking error also markedly worse across almost every
+    # joint), even though orientation/roll_deg DID improve further
+    # (~4.25deg vs ~5.15deg at weight=1.0). Real trade-off, not worth it --
+    # roughly halving genuine stepping quality for another ~1deg of roll.
+    # REVERTED 2.0 -> 1.0 on 2026-09-17, back to the confirmed-clean value
+    # (only 1 stability spike across its whole 40k-iteration run, best-yet
+    # tilt/roll/pitch). Next lever for pushing roll down further is
+    # roll_margin_deg, not this weight -- see that field's comment.
+    roll_reward_weight: float = 1.0
+    # TIGHTENED 6.0 -> 2.0 on 2026-09-16, before ever training with
+    # roll_reward_weight=1.0 active (so this is the only change relative to
+    # the previous, roll_reward=0 fresh-start baseline -- not bundled with
+    # the weight re-enable itself, which was already its own single-
+    # variable step). Motivated by two concrete numbers, not just the
+    # reference footage looking calm: (1) the roll_reward=0 fresh-start run
+    # already measured orientation/roll_deg ~5.86deg -- sitting right at
+    # the edge of the OLD 6deg margin, meaning roll_reward at that margin
+    # would have given this near-maximum reward already, with almost no
+    # gradient pushing it lower (a plausible reason the very first
+    # roll_reward attempt, back when it was margin=6/weight=2, only bought
+    # a 17% reduction); (2) the REFERENCE motion's own hip-roll joint
+    # amplitude (what tracking_reward is already trying to match) is only
+    # ~0.5-2.5deg across the gait cycle -- if the intended gait doesn't
+    # need much joint-level roll, the body shouldn't need 6deg of slack
+    # either. Deliberately NOT touching orientation_margin_deg (still 6.0) --
+    # that one also covers pitch and was already proven necessary to stay
+    # loose for stepping in general (the 6->2 tightening that broke
+    # stepping was on THAT combined field, not this roll-only one), so this
+    # is a narrower, lower-risk bet than repeating that mistake. Still a
+    # real guess, not a measured reference number -- watch whether this
+    # reopens the "safe standing" suppression pattern (foot_swing_reward
+    # failing to reach ~1.5 by iteration ~3000) the same way the combined
+    # margin did; if so, this specific number was too tight, not the
+    # roll-only approach itself.
+    #
+    # TIGHTENED 2.0 -> 1.0 on 2026-09-17, alongside reverting
+    # roll_reward_weight back to 1.0 (see that field's comment -- raising
+    # the weight to 2.0 instead hurt genuine stepping too much for the
+    # roll improvement it bought). Trying the other lever instead: direct
+    # video review showed the body still visibly rolling to shift weight
+    # rather than doing that through hip-roll/hip-pitch/knee-pitch/
+    # ankle-pitch joint articulation the way reference footage of this
+    # robot class does it, with the torso staying flat -- the goal right
+    # now is specifically a flatter torso via more joint-driven stepping,
+    # not a broader "calm everything down" pass (yaw/heading are a
+    # separate, deliberately deprioritized concern for later). Same
+    # single-variable discipline as the weight test: only this field
+    # changes this run, weight stays at the confirmed-good 1.0. Watch the
+    # same signal as every fresh-start test -- foot_swing_reward reaching
+    # ~1.5 by iteration ~3000 means stepping wasn't blocked; if it plateaus
+    # low like the weight=2.0 attempt did, 1.0deg was too tight for this
+    # lever too, and margin/weight together may just have a joint ceiling
+    # around the 1.0 run's ~5deg roll for now.
+    #
+    # REVERTED 1.0 -> 2.0 on 2026-09-18: the 1.0 run's own eval data
+    # confirmed the predicted outcome above -- roll_deg did NOT improve
+    # over the margin=2.0/weight=1.0 baseline, and tracking got worse on
+    # top of that (a strictly worse tradeoff, not just a smaller-than-hoped
+    # gain). margin=2.0/weight=1.0 remains the best-evidenced setting; both
+    # escalation levers tried so far (weight 1.0->2.0, margin 2.0->1.0)
+    # have failed to beat it, suggesting either a real floor for this
+    # reward shape or that roll needs to come from elsewhere (e.g. the
+    # foot_overswing_margin_m tightening alongside this revert, which
+    # targets the excess-lift symptom directly instead of squeezing roll
+    # harder).
+    roll_margin_deg: float = 2.0
 
     # --- stay in place -----------------------------------------------------
     # Nothing before this penalized the base for translating in the world --
@@ -1028,6 +1498,60 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     heading_reward_weight: float = 2.5
     heading_reward_scale: float = 5.0
 
+    # --- stay facing the same way, part 2: ABSOLUTE heading -----------
+    # Added 2026-09-11 after real-hardware attempts (2026-09-11, sin/cos
+    # checkpoint with the target_limit_penalty fixes) diverged into a
+    # visible, escalating body rotation and safety-aborted, even though
+    # sim's own compare_policies_isaaclab.py eval on the exact same
+    # checkpoint showed 0% fall_rate. Root cause, pieced together from
+    # real control_loop CSVs: heading_reward above (and everything else in
+    # this file) only ever tracks yaw RATE -- nothing anywhere tracks or
+    # restores absolute heading. In sim that's tolerable (left/right
+    # dynamics are symmetric by construction, episodes just keep running
+    # regardless of net rotation, no hard trip-wire). Real hardware isn't
+    # symmetric: replaying the reference open-loop (--open-loop-ref, no
+    # policy at all, control_loop_20260829_144353.csv /
+    # control_loop_20260829_150136.csv) showed a small but completely
+    # consistent real gyro bias (+0.78 and +1.28 deg/s in two separate
+    # recordings, same sign both times -- integrating to +85deg and +78deg
+    # of real drift over 110s/61s) that has NOTHING to do with the policy.
+    # On top of that, the policy's OWN gait already produces much larger
+    # yaw rate from genuine stepping reaction torque (attempt 2's first 15
+    # real control steps: already +8 to +17 deg/s, matching sim's own
+    # long-standing heading/yaw_rate_dps ~47-70 deg/s that no amount of
+    # raising heading_reward_weight ever fixed -- see that field's
+    # comment). Neither of these is corrected by a rate-only reward; they
+    # just integrate. On real hardware that integration compounds with the
+    # confirmed physical bias and, per the control_loop CSVs, correlates
+    # with the broader divergence (hip roll, then everything else) that
+    # eventually trips the safety abort.
+    #
+    # This term gives the policy an actual restoring incentive: track
+    # ACCUMULATED yaw deviation from this env's own reset-time heading
+    # (self._reset_yaw, captured in _reset_idx), not just its rate.
+    # Margined (heading_deviation_margin_deg) so ordinary within-stride yaw
+    # wobble from genuine stepping isn't penalized, only sustained drift
+    # beyond it. LINEAR, not quadratic -- same non-vanishing-gradient
+    # reasoning as target_limit_penalty_linear_coef's fix: a quadratic
+    # penalty barely notices the first several degrees of real drift,
+    # exactly the region that matters here given how fast this compounds
+    # on hardware (attempt 2 went from ~0 to unrecoverable in ~1.2s).
+    # Capped before scaling, same reasoning as
+    # target_limit_penalty_max_overshoot_deg and position_reward_weight's
+    # own move away from an unbounded absolute-anchor penalty (a single
+    # bad episode's random-walk drift could otherwise blow up the critic
+    # the same way an uncapped target overshoot once did). UNTUNED
+    # starting guess for both weight and margin -- watch
+    # heading/deviation_deg in tensorboard (population value, unlike the
+    # env-0-only gravity_x/y readings) and whether real hardware's net
+    # rotation over ~1-2s actually shrinks; also watch that this doesn't
+    # fight genuine turning later if a nonzero commanded yaw rate is ever
+    # added (the margin would need to move with the command at that
+    # point, not just wrap around a fixed reset heading).
+    heading_deviation_penalty_weight: float = 1.0
+    heading_deviation_margin_deg: float = 15.0
+    heading_deviation_penalty_max_deg: float = 60.0
+
     # Terminate the episode once the base has tipped this far from
     # upright, measured as projected_gravity_b's z component (-1.0 =
     # perfectly upright, 0.0 = tipped 90 deg, +1.0 = upside down). -0.5
@@ -1120,7 +1644,64 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # weight was first tuned (foot_swing_reward_weight 3->5,
     # heading_reward added) -- the same physical overshoot matters even
     # less now than when 2.0 was chosen, independent of the margin fix.
-    target_limit_penalty_weight: float = 5.0
+    # RAISED AGAIN 5.0 -> 15.0 on 2026-09-10. compare_policies_isaaclab.py
+    # against the 2026-09-08 sin/cos checkpoint (before the
+    # action_rate_penalty raise) and its resumed successor (after) showed
+    # target_violation_rate barely moved (10.99% -> 9.14%) despite this
+    # weight already having been raised once for exactly this reason --
+    # see the 2.0->5.0 history above. Same root cause recurring: total
+    # reward scale has grown further since 5.0 was chosen
+    # (foot_swing_reward_weight, heading_reward re-enabling, etc.), and this
+    # term is QUADRATIC near the boundary, so its gradient vanishes for
+    # precisely the small-but-real overshoots a real hard limit has zero
+    # tolerance for -- raising the weight partially compensates but doesn't
+    # fix the underlying near-zero-gradient shape, worth remembering if
+    # 15.0 still doesn't move target_violation_rate meaningfully (next
+    # lever would be the shape itself, e.g. a linear-near-zero term, not
+    # another weight increase). Re-verify with compare_policies_isaaclab.py
+    # (one checkpoint per invocation -- see that script's multi-checkpoint-
+    # session caveat) before any further real hardware attempt.
+    #
+    # REVERTED 15.0 -> 5.0 on 2026-09-16, its value at the 2026-08-28
+    # raise, i.e. what was active through both 2026-09-07/08 fresh starts
+    # that found genuine stepping from scratch. Two fresh starts since
+    # (with this at 15.0 and the linear-coef shape added, see
+    # target_limit_penalty_linear_coef's comment) found NO stepping at all
+    # -- dug into the second failure's raw per-iteration tensorboard data
+    # rather than guessing further (see action_rate_penalty_weight's
+    # comment for the paired finding): right as foot_swing_reward briefly
+    # rose during a transient rediscovery, THIS term grew ~150x
+    # (0.01->1.5) in lockstep, before any fall/episode-length crash --
+    # i.e. genuine stepping's larger joint excursions were being hit hard
+    # and immediately, not just failing policies. This is the term that
+    # actually matters most for real-hardware safety (target_violation_rate
+    # went from ~11% to ~0.01% because of the 5.0->15.0 raise + the linear
+    # shape), so don't just leave it at 5.0 once stepping is back --
+    # re-harden it gradually via RESUME on top of the re-established
+    # stepping skill, the same escalation that worked the first time,
+    # checking compare_policies_isaaclab.py's target_violation_rate AND
+    # tracking/foot_swing_reward at each step rather than jumping straight
+    # back to 15.0.
+    #
+    # RE-HARDENING STARTED 2026-09-21: 5.0 -> 15.0 (stage 1, paired with
+    # target_limit_penalty_linear_coef 0.0 -> 0.5), via RESUME from
+    # 2026-09-20_20-50-50/model_39999.pt (the fresh start trained under
+    # the current dynamic reference-foot-height reward). Trigger: first
+    # hardware runs with correctly normalized policies (2026-09-21, see
+    # deploy_bundle_2026-09-21_overswing_w25) all aborted at gait phase
+    # t~1.0s. Replaying the logged observations through the policy showed
+    # the abort is the policy's own phase-locked feed-forward, not a
+    # sim2real input mismatch: with every sensor input replaced by its
+    # training mean the left hip-roll target still ramped 0 -> -16deg in 6
+    # steps (limit +-15), and a full-cycle sweep shows hip-roll kicks to
+    # -24.5deg (t~1.1s) and +29deg (t~2.1s) against a reference of +-2.7deg
+    # -- ~12% of the cycle has a target beyond a joint limit, matching the
+    # sim eval's ~9% target_violation_rate. Sim just saturates the joint at
+    # the limit, so this was nearly free; hardware's safety check aborts.
+    # Escalate in the same stages that worked before (weight 15 + linear
+    # 0.5, then linear 1.0), checking target_violation_rate AND
+    # foot_swing_reward after each; do NOT jump straight to 15 + 1.0.
+    target_limit_penalty_weight: float = 15.0
 
     # Degrees of buffer inside each hard limit before target_limit_penalty
     # starts applying at all -- same idea as joint_limit_margin above, just
@@ -1153,6 +1734,103 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # whole run. 30 deg is generous headroom above any overshoot a
     # correctly-behaving policy should ever produce.
     target_limit_penalty_max_overshoot_deg: float = 30.0
+
+    # Coefficient on a LINEAR overshoot term added alongside the quadratic
+    # one (final penalty per joint = weight * (over**2 + linear_coef *
+    # over), over in radians, both margined and capped as above). Added
+    # 2026-09-10. Two rounds of raising target_limit_penalty_weight
+    # (2.0->5.0->15.0) only got target_violation_rate from ~11% down to
+    # ~7% (see experiments/qmini-leg/compare_action_smoothness.csv) --
+    # diminishing returns, for the structural reason this field's own
+    # neighbor comments already spell out: a pure quadratic has a gradient
+    # that VANISHES as the overshoot approaches zero, i.e. it gives almost
+    # no push to close out precisely the small 1-3deg overshoots that a
+    # real hardware safety check still refuses outright (it has zero
+    # tolerance regardless of magnitude). A linear term has a constant,
+    # non-vanishing gradient all the way down to zero overshoot, so it
+    # keeps pushing the policy fully inside the envelope rather than just
+    # "not far past it". Kept the quadratic too -- it still does the useful
+    # job of scaling the signal up for large overshoots ("this is very
+    # wrong, not just marginally"). 0.5 chosen so that at a ~2deg overshoot
+    # past the margin the linear part contributes ~15x the quadratic part
+    # (making it the dominant near-boundary signal) while at the 30deg cap
+    # the two are the same order (quadratic still meaningfully present).
+    # UNTUNED starting guess -- if genuine stepping quality regresses
+    # (foot_swing_reward drops, tracking degrades), lower this or
+    # target_limit_penalty_weight; if target_violation_rate still doesn't
+    # approach zero, raise it. Re-verify with compare_policies_isaaclab.py
+    # (one checkpoint per invocation) after the run.
+    #
+    # RAISED 0.5 -> 1.0 (2026-09-11). The 0.5 run worked well:
+    # target_violation_rate 7.13% -> 5.33% and mean_overshoot_deg 4.26 ->
+    # 1.75 (now BELOW target_limit_margin_deg=3.0, i.e. the typical
+    # overshoot sits inside the safety buffer rather than past the hard
+    # limit), with mean_tilt_deg creep also reversed by the paired
+    # orientation_reward_scale bump. Still ~1-in-19 commanded targets would
+    # be refused by real hardware's safety check though -- probably enough
+    # to still trip aborts. Doubling the linear coefficient to push the
+    # violation rate toward ~2-3%, per the trajectory
+    # (10.99->9.14->7.13->5.33%). Watch foot_swing_reward: it dipped
+    # slightly under 0.5 (~1.96 -> ~1.83 smoothed) as constraint pressure
+    # rose -- still clearly genuine stepping on video, but if it keeps
+    # eroding under 1.0, that's the signal this lever has gone far enough
+    # and the remaining violation rate needs a different fix (e.g. reducing
+    # action_scale so the raw action range can't reach as far past a limit
+    # in the first place). Resume from model_159996.pt.
+    #
+    # DISABLED (1.0 -> 0.0) on 2026-09-16, alongside target_limit_penalty_weight's
+    # revert to 5.0 -- see that field's comment. This whole linear term
+    # didn't exist yet during the 2026-09-07/08 fresh starts that found
+    # genuine stepping from scratch (pure quadratic then, weight 5.0); 0.0
+    # here reproduces that exact shape. Re-introduce this the same way as
+    # the weight -- gradually, via resume on top of re-established
+    # stepping, not from a fresh start.
+    #
+    # RE-INTRODUCED at 0.5 on 2026-09-21 (stage 1 of the re-hardening --
+    # see target_limit_penalty_weight's comment for why). Raise to 1.0 as
+    # stage 2 if target_violation_rate is still well above ~1% and
+    # foot_swing_reward held.
+    target_limit_penalty_linear_coef: float = 0.5
+
+    # Penalty on the per-step CHANGE of the commanded joint target beyond a
+    # threshold (degrees). Added 2026-09-22. robot_deploy.py aborts the
+    # whole run if any joint's commanded target moves more than
+    # max_step_deg (robot_config: 5.0 for step-in-place, 15.0 when relaxed)
+    # between consecutive control steps; sim has no such check, and
+    # action_rate_penalty is quadratic on RAW action deltas (tiny for the
+    # 10-25deg single-step "snaps" seen on hardware-replay). Found by
+    # sweeping the phase input of the 2026-09-21_12-52-39 policy with
+    # neutral sensor inputs (matches the logged hardware behavior at the
+    # one phase hardware confirmed): right knee extends slowly to +11.5deg
+    # then snaps -24deg in ONE 20ms step at t~1.2s; other joints reach
+    # 5-6deg steps. Computed on the raw pre-delay action exactly like
+    # action_rate_penalty, in target degrees = degrees(action_scale *
+    # |a_t - a_{t-1}|), which is what the deploy check measures. The first
+    # step after reset is deliberately INCLUDED (prev action is 0, so the
+    # delta is the first target's distance from the default pose): resets
+    # always start at motion_time=0 like hardware, and hardware's first
+    # commanded step is the same quantity (first hardware logs had 8-9deg
+    # first-step jumps). LINEAR in the excess over the threshold (constant
+    # gradient, same reasoning as target_limit_penalty_linear_coef) and
+    # capped (a single outlier once blew up the value function).
+    # threshold 4.0 sits under the 5.0 deploy limit as a safety buffer.
+    # Weight 10 (per rad of excess). Measured on the 2026-09-21_12-52-39
+    # policy with compare_policies_isaaclab.py (deterministic eval, obs
+    # noise + pushes on): 18.3% of env-steps have SOME joint step >5deg and
+    # the p99 of the per-step max is 38.6deg -- much more than the neutral-
+    # sensor phase sweep showed, i.e. sim obs noise/pushes add jitter on
+    # top of the feed-forward snap. At weight 20 that policy would pay
+    # 0.56/step on average (p99 12.6, max 33.8) against ~8/step total
+    # reward -- judged too big a first shock for a resume (see the
+    # foot_overswing_penalty_weight 40/70 history), so 10: ~0.28/step
+    # mean, p99 ~6, max ~17, while a 20deg snap still costs ~3.5 (about
+    # 40% of a step's reward). Meant as a nudge the feed-forward policy can
+    # satisfy by smoothing the snap, not by giving up stepping. UNTUNED:
+    # watch foot_swing_reward, and tracking/step_over_rate /
+    # mean_max_step_deg (should fall). If they barely move, raise to ~20.
+    step_limit_penalty_weight: float = 10.0
+    step_limit_threshold_deg: float = 4.0
+    step_limit_penalty_max_excess_deg: float = 30.0
 
     # --- foot-height swing reward -----------------------------------------
     # Added because pure joint-angle tracking let the policy alias "roughly
@@ -1234,7 +1912,221 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # clearance target precisely, just needs to be "clearly off the
     # ground" for this robot's scale. UNTUNED guess -- watch actual foot
     # trajectories in sim (or the height itself, if you log it) and adjust.
-    foot_swing_target_height_m: float = 0.03
+    # LOWERED 0.03 -> 0.02 on 2026-09-18 (fresh start). The corrected FK
+    # pass (see foot_overswing_margin_m's CORRECTION note) shows the
+    # reference itself only lifts the swing foot ~2.2cm, so 3cm was already
+    # above anything the animation asks for while the policy's p99 heights
+    # ran 12-13cm, partly via torso lean rather than joint lift (close-up
+    # video). Reward now saturates at 2cm; the overswing free zone becomes
+    # 2 + 1 = 3cm total. Watch that foot_swing_reward still reaches ~1.5 by
+    # ~3k iterations on the fresh start (a lower target could also weaken
+    # the lift incentive). Note compare_policies_isaaclab.py reads this cfg
+    # value for its clearance/swing_product diagnostics, so those columns
+    # are not comparable with rows recorded at 0.03.
+    #
+    # SUPERSEDED 2026-09-20 as the value driving _get_rewards' clearance/
+    # overswing calc -- see foot_height_target_floor_m's comment for the
+    # full story. Kept alive ONLY as a legacy constant that
+    # compare_policies_isaaclab.py's diagnostic columns still read; nothing
+    # in the actual training reward uses this field anymore. Do not raise
+    # or lower this expecting it to change training behavior.
+    foot_swing_target_height_m: float = 0.02
+
+    # Numerical floor (meters) under the PER-PHASE reference foot-height
+    # target (see reference_foot_heights_m in the keyframes JSON, sampled
+    # every step via self.foot_height_motion alongside the joint-angle
+    # reference). Added 2026-09-20, replacing the flat
+    # foot_swing_target_height_m constant as what foot_swing_reward's
+    # clearance and foot_overswing_penalty's threshold are actually
+    # measured against -- three separate attempts to fix the "policy
+    # lifts way higher than the reference" problem by pushing
+    # foot_overswing_penalty_weight (5->25 worked, 25->40 and 25->70 both
+    # destabilized training, once via resume and once even from a fresh
+    # start) established that hand-tuning a single constant target height
+    # is fundamentally the wrong lever: it doesn't generalize to a
+    # different future reference clip (e.g. a walking gait with a taller
+    # natural lift) without manual re-tuning, and the failed attempts were
+    # really about a structural asymmetry (foot_swing_reward gives smooth
+    # partial credit for UNDER-lifting, foot_overswing_penalty grows
+    # sharply for OVER-lifting, so a strong enough penalty makes
+    # under-lifting the cheap escape) that a bigger penalty weight can't
+    # fix on its own. The reference's OWN foot-height curve (precomputed
+    # via forward kinematics in fk_reference_heights.py/
+    # gen_reference_heights.py against qmini_urdf-2legs.usda, validated
+    # against the known standing-pose heel height) is now the target at
+    # every phase, so it automatically matches whatever gait is loaded.
+    # This floor only exists so the clearance division
+    # (height / max(reference_height, floor)) doesn't blow up near-zero
+    # during stance -- it is NOT a tunable "how high should it lift" knob;
+    # swing_target already zeroes foot_swing_reward during stance
+    # regardless of what this is set to. Keep small.
+    foot_height_target_floor_m: float = 0.005
+
+    # Penalty for foot height PAST foot_swing_target_height_m (plus this
+    # margin) -- e.g. a real swing to 10cm gets flagged, one that peaks at
+    # 5cm doesn't. Added 2026-09-14: foot_swing_reward above SATURATES at
+    # foot_swing_target_height_m (clamped to max=1.0, see left/right_clearance)
+    # but nothing has ever penalized going higher -- a fast, tall flick and
+    # a controlled swing that both clear 3cm score identically. This is a
+    # long-standing suspected-but-never-tested gap: DEFAULT_GAINS["ankle"]'s
+    # damping comment (qmini.py) already names this exact mechanism ("a fast
+    # flick cheaper than a controlled swing") as the likely explanation for
+    # an earlier, unrelated shake problem, but nothing was ever added to
+    # test it. Motivated freshly by comparing sim video against real
+    # reference footage of this robot class (Recording_2026-09-14_112246.mp4,
+    # Qmini_simulation.gif) -- both show a nearly rock-solid torso through
+    # the whole gait cycle and a moderate foot lift, versus this project's
+    # p99 foot heights running 10-13cm (3-4x past where foot_swing_reward
+    # even cares) alongside persistent ~8-9deg mean_tilt_deg that's never
+    # budged across six full tuning iterations. A bigger/faster swing than
+    # necessary imparts more real reaction torque on the body for zero
+    # extra reward -- a plausible direct physical driver of the roll (and
+    # possibly yaw) instability, not yet addressed by anything tried so
+    # far (all of which targeted joint-angle tracking or overall tilt
+    # magnitude, never swing dynamics itself). Margin set equal to
+    # foot_swing_target_height_m itself (free up to 6cm total) so genuine,
+    # already-working ~3-5cm swings aren't taxed -- only the excess above
+    # that. LINEAR (constant gradient, same non-vanishing-gradient
+    # reasoning as target_limit_penalty_linear_coef) and capped (same
+    # anti-blowup reasoning as target_limit_penalty_max_overshoot_deg --
+    # foot height is physically bounded by leg length so a runaway blowup
+    # is less likely here, but capping costs nothing and keeps the pattern
+    # consistent). UNTUNED starting guess for both weight and margin --
+    # watch p99 foot heights actually shrink toward something closer to
+    # foot_swing_target_height_m, and whether mean_tilt_deg (and the
+    # heading/deviation numbers) improve as a side effect; if p99 heights
+    # don't move, this wasn't the mechanism and the next lead is a direct
+    # roll-specific term (orientation_reward currently only tracks total
+    # tilt magnitude, not per-axis).
+    #
+    # TIGHTENED 0.03 -> 0.015 on 2026-09-18 (fresh start 2026-09-18_10-40-15).
+    # RESULT: no measurable effect -- training-time penalty rose 0.063 ->
+    # 0.079 but eval p99 foot heights stayed ~12-13cm; at weight 5.0 the
+    # penalty is ~0.08/step vs foot_swing_reward ~1.4, too weak to change
+    # behavior. Margin alone is not the lever; weight (or the target
+    # height itself) would be.
+    #
+    # CORRECTION (2026-09-18, later): an earlier version of this comment
+    # cited a reference swing of ~4.8cm and "offset causes no tilt (0.01
+    # deg)". Both came from a forward-kinematics script with two bugs (ankle
+    # joint rotation sign flipped because that joint's body0/body1 order is
+    # reversed vs the others; tilt measured about the wrong axis -- the
+    # sagittal/pitch axis is the foot's local X, so "tilt about X" was
+    # invisible to it). Validated fix: at the init stance pose heel/toe
+    # heights match and base-to-heel is ~0.42m only with the corrected sign.
+    # Corrected numbers for keyframes_step_in_place_all_joints_2x_base_offset
+    # .json (left leg, base_link fixed): swing-foot heel/toe rises only
+    # ~2.2cm above the opposite foot (BELOW foot_swing_target_height_m=3cm),
+    # identical with/without the stance offset; foot pitch relative to the
+    # torso is exactly constant through the cycle -- 0deg in the original
+    # (ankle cancels hip+knee, flat foot) vs a constant 7deg toe-up with
+    # the offset (pitch+knee-ankle offsets = -16+10-1). So the offset does
+    # not change the swing shape, only tilts the whole foot by a constant
+    # 7deg -- the same tilt as the tune_stance_lean stance pose.
+    # 0.015 -> 0.01 alongside foot_swing_target_height_m 0.03 -> 0.02
+    # (total free zone 3cm).
+    foot_overswing_margin_m: float = 0.01
+    # RAISED 5.0 -> 25.0 on 2026-09-19, alongside a resume (not fresh start)
+    # from the foot_swing_target_height_m=0.02 fresh-start checkpoint.
+    # RATIONALE: that fresh start lowered p99 eval foot heights only
+    # ~18-20% (11.75/12.98cm -> 9.68/10.69cm, still ~4-5x the 2cm target
+    # and the reference's own ~2.2cm swing) despite tightening the free
+    # zone to 3cm total, because this penalty is a PER-STEP cost and only
+    # fires near the swing peak -- most of the gait cycle the foot is near
+    # the ground, so the time-averaged penalty stayed low (~0.096) even
+    # with the peak far past the free zone. At weight 5.0 that's cheap
+    # against tracking_reward+foot_swing_reward's combined ~3.9 budget.
+    # 25.0 is a straight 5x, chosen to make the peak-height excess (~6-7cm
+    # over the free zone) cost something comparable to that budget instead
+    # of ~2.5%. Resume, not fresh start: this term isn't roll_reward or one
+    # of the two terms (action_rate_penalty/target_limit_penalty) known to
+    # block cold-start discovery via resume -- target_limit_penalty itself
+    # was tightened via resume successfully before. Watch foot_swing_reward
+    # doesn't collapse (this is now a much bigger penalty relative to it)
+    # and whether p99 heights actually approach the 3cm free zone this
+    # time.
+    #
+    # RESULT (2026-09-19, resume from the 0.02 fresh start, 40k more
+    # iterations, logs/rsl_rl/qmini-leg/2026-09-19_11-41-39): p99 heights
+    # 9.68/10.69cm -> 8.34/8.59cm (~14% further, ~30% cumulative from the
+    # original 11.75/12.98cm baseline) -- real but still ~3-4x the 3cm free
+    # zone. First run where tracking_err/tilt/roll ALL improved together
+    # (4.66/5.46/4.18deg, best-yet on every one) instead of trading off --
+    # the direction is working, just not enough bite yet at this weight.
+    # Two brief instability spikes during the resume (steps ~65-66k and
+    # ~70-71k: peak value_function loss 2302, fall_rate peak 2.9%,
+    # episode_length dipped to ~224-233) but both fully recovered within
+    # ~1-2k iterations and are ~100x smaller than the sustained roll_reward
+    # resume failures.
+    #
+    # RAISED 25.0 -> 70.0 on 2026-09-19, resuming again from
+    # 2026-09-19_11-41-39/model_79998.pt. Same lever, same reasoning as the
+    # 5->25 step. 70 is a much bigger bite than the 5x step that worked
+    # cleanly last time -- it's not yet established where the point is
+    # where this starts suppressing genuine lift instead of just the
+    # excess, so watch foot_swing_reward for a real sustained collapse
+    # (not just a brief spike like last time) more carefully than before.
+    #
+    # RESULT: bad. Two collapses (steps ~85k and ~108-112k, episode_length
+    # down to ~108, fall_rate up to 2-5%) that this time did NOT fully
+    # recover -- last 2000 iterations averaged foot_swing_reward 0.67 (was
+    # 1.36-1.5 going in), with both left AND right swing_target down
+    # across the whole run (video: user reported the left leg visibly not
+    # lifting anymore). orientation/reward and roll_deg hit best-ever
+    # values (0.98, 3.25deg) in the same run -- the classic exploit this
+    # project has hit before (see qmini.py's DEFAULT_GAINS damping
+    # comment): a policy that barely steps also barely tilts, so it read
+    # as a very good, not a bad, checkpoint on the orientation/roll
+    # metrics while actually having found a "safe, don't lift" local
+    # optimum. REVERTED 70.0 -> 40.0 and reset to resume from the last
+    # known-good checkpoint (2026-09-19_11-41-39/model_79998.pt, NOT the
+    # 120k checkpoint this produced) rather than continuing on top of a
+    # policy that already found the shortcut -- past project history
+    # (qmini.py, same comment) found this kind of collapse hard to
+    # explore back out of once settled. 40 is a smaller step up from 25
+    # than 70 was (1.6x vs 2.8x) -- watch foot_swing_reward closely again;
+    # if even 40 trends toward a sustained plateau below ~1.2, that's the
+    # ceiling for this lever and the next move should be a different one
+    # (e.g. lowering foot_swing_target_height_m further) rather than
+    # continuing to push this weight.
+    #
+    # RESULT: also bad, and a DIFFERENT failure shape than 70 -- not one
+    # suppression plateau but repeated, WORSENING collapses (episode_length
+    # crashes to <150 for 330, then 1486, then 3861 iterations, each one
+    # longer than the last, with a 4th still ongoing and 35% of all
+    # iterations since the resume at fall_rate>1% when this was stopped
+    # partway through, well before its scheduled end). Between this and
+    # the 70 result: two different target weights (1.6x and 2.8x over 25),
+    # both destabilizing the SAME resumed checkpoint. That points at the
+    # resume itself being the fragile part here, not the specific
+    # magnitude -- the same category of problem already found with
+    # roll_reward (see roll_reward_weight's comment): changing this term's
+    # weight via resume on an already-converged policy is what breaks,
+    # independent of the target value. STOPPED this run early (the
+    # worsening trend made waiting out the remaining iterations not worth
+    # it) and switching strategy to match how roll_reward's resume-
+    # fragility was actually solved: same target value (40), but as a
+    # FRESH START instead of a resume. If a fresh start with this weight
+    # active from iteration 0 trains cleanly (the roll_reward precedent),
+    # that confirms resume-on-this-checkpoint was the actual problem, not
+    # the weight itself.
+    #
+    # RESULT: also bad -- a fresh start with weight=40 plateaued at
+    # foot_swing_reward ~0.5-0.65 from iteration ~3000 onward (a known-good
+    # fresh start at the same target-height config reached ~1.3 by the
+    # same point and held it), so 40 suppresses genuine lift even with no
+    # resume involved. That rules out resume-fragility as the explanation
+    # here and points at the structural problem described in
+    # foot_height_target_floor_m's comment instead: foot_swing_reward
+    # gives smooth partial credit for UNDER-lifting while this penalty
+    # grows for OVER-lifting, so past some weight, under-lifting becomes
+    # the cheap escape regardless of how it's introduced. REVERTED 40.0 ->
+    # 25.0 (the one value that's actually worked) and stopped pushing this
+    # weight further -- see foot_height_target_floor_m's comment for the
+    # replacement approach (a per-phase reference target instead of a
+    # flat constant) tried instead of continuing to escalate this weight.
+    foot_overswing_penalty_weight: float = 25.0
+    foot_overswing_penalty_max_m: float = 0.15
 
     # RAISED from 1.0 to 3.0 -- after the roll-specific fix
     # (joint_tracking_weight) closed that particular exploit, the SAME
@@ -1639,6 +2531,21 @@ class QminiLegEnv(DirectRLEnv):
             degrees=degrees,
         )
 
+        # Per-phase reference foot-height target -- see
+        # cfg.foot_height_target_floor_m's comment for why this replaced
+        # the flat foot_swing_target_height_m constant. Reuses MotionPlayer
+        # (already a generic multi-channel linear interpolator over
+        # `times`) for a second, independent set of channels
+        # ([left_heel, left_toe, right_heel, right_toe], meters, not
+        # degrees) sampled at the SAME self.motion_time as the joint-angle
+        # reference every step in _get_rewards.
+        foot_height_keyframes = _load_reference_foot_heights(KEYFRAMES_PATH)
+        self.foot_height_motion = MotionPlayer(
+            keyframes=foot_height_keyframes,
+            device=self.device,
+            degrees=False,
+        )
+
         # --- foot-height swing reward: per-foot swing-phase target -------
         # "How much should this foot be lifted right now" is derived from
         # the reference clip's OWN knee angle at the current motion_time
@@ -1693,6 +2600,18 @@ class QminiLegEnv(DirectRLEnv):
         self._right_knee_swing_extreme_rad = _swing_extreme(clip_values[:, right_knee_idx], right_knee_stance)
 
         self.motion_time = torch.zeros(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        # Per-env world-frame yaw captured at each env's last reset -- see
+        # cfg.heading_deviation_penalty_weight's comment for why this
+        # exists (heading_reward above only ever tracks yaw RATE, never
+        # absolute heading). Set for real in _reset_idx right after the
+        # root pose is written there; zeros here is just a safe placeholder
+        # before the first reset.
+        self._reset_yaw = torch.zeros(
             self.num_envs,
             device=self.device,
             dtype=torch.float32,
@@ -2101,6 +3020,18 @@ class QminiLegEnv(DirectRLEnv):
         action_rate_penalty = self.cfg.action_rate_penalty_weight * torch.sum(
             self._action_rate_joint_weight * (self.actions - self._prev_actions) ** 2, dim=1
         )
+        # Per-step target change beyond cfg.step_limit_threshold_deg -- see
+        # cfg.step_limit_penalty_weight's comment. Must be computed BEFORE
+        # _prev_actions is overwritten just below.
+        step_delta_rad = self.cfg.action_scale * (self.actions - self._prev_actions).abs()
+        step_excess_rad = torch.clamp(
+            step_delta_rad - math.radians(self.cfg.step_limit_threshold_deg),
+            min=0.0,
+            max=math.radians(self.cfg.step_limit_penalty_max_excess_deg),
+        )
+        step_limit_penalty = self.cfg.step_limit_penalty_weight * torch.sum(step_excess_rad, dim=1)
+        step_over_rate = (step_delta_rad > math.radians(self.cfg.step_limit_threshold_deg)).any(dim=1).float().mean()
+        mean_max_step_deg = torch.rad2deg(step_delta_rad.max(dim=1).values).mean()
         self._prev_actions = self.actions.clone()
 
         # Penalize joints sitting near their hard mechanical limits -- see
@@ -2152,8 +3083,14 @@ class QminiLegEnv(DirectRLEnv):
         # function in a prior run.
         max_overshoot_rad = math.radians(self.cfg.target_limit_penalty_max_overshoot_deg)
         target_over_limit = torch.clamp(target_over_limit, max=max_overshoot_rad)
+        # over**2 + linear_coef*over -- the linear term gives a
+        # non-vanishing gradient down to zero overshoot (see
+        # cfg.target_limit_penalty_linear_coef's comment); the quadratic
+        # still scales the signal up for large overshoots.
         target_limit_penalty = self.cfg.target_limit_penalty_weight * torch.sum(
-            target_over_limit ** 2, dim=1,
+            target_over_limit ** 2
+            + self.cfg.target_limit_penalty_linear_coef * target_over_limit,
+            dim=1,
         )
 
         # Keep the body level: projected_gravity_b's xy components vanish
@@ -2175,6 +3112,15 @@ class QminiLegEnv(DirectRLEnv):
         margin_sin = math.sin(math.radians(self.cfg.orientation_margin_deg))
         orientation_error = torch.clamp(tilt_sin - margin_sin, min=0.0) ** 2
         orientation_reward = torch.exp(-self.cfg.orientation_reward_scale * orientation_error)
+
+        # ROLL specifically -- see cfg.roll_reward_weight's comment. Same
+        # margined-exp shape as orientation_reward above, just isolated to
+        # projected_gravity_b's X component (roll) instead of the combined
+        # xy norm, with its own undiluted margin/weight.
+        roll_sin = projected_gravity[:, 0].abs()
+        roll_margin_sin = math.sin(math.radians(self.cfg.roll_margin_deg))
+        roll_error = torch.clamp(roll_sin - roll_margin_sin, min=0.0) ** 2
+        roll_reward = torch.exp(-self.cfg.orientation_reward_scale * roll_error)
 
         # Foot-height swing reward -- see cfg.foot_swing_reward_weight's
         # comment for the full rationale. left/right_swing_target is how
@@ -2245,15 +3191,25 @@ class QminiLegEnv(DirectRLEnv):
         left_toe_height = left_toe_pos_w[:, 2] - self._left_toe_stance_height
         right_toe_height = right_toe_pos_w[:, 2] - self._right_toe_stance_height
 
+        # Per-phase reference height target -- see cfg.foot_height_target_
+        # floor_m's comment for why this replaced a flat constant. Columns
+        # match gen_reference_heights.py's write order:
+        # [left_heel, left_toe, right_heel, right_toe].
+        foot_height_reference = self.foot_height_motion.sample(self.motion_time)
+        target_left_heel = torch.clamp(foot_height_reference[:, 0], min=self.cfg.foot_height_target_floor_m)
+        target_left_toe = torch.clamp(foot_height_reference[:, 1], min=self.cfg.foot_height_target_floor_m)
+        target_right_heel = torch.clamp(foot_height_reference[:, 2], min=self.cfg.foot_height_target_floor_m)
+        target_right_toe = torch.clamp(foot_height_reference[:, 3], min=self.cfg.foot_height_target_floor_m)
+
         # Clearance requires BOTH the heel AND the toe to have risen --
         # the min(), not e.g. an average, is what actually rules out
         # rotating around either fixed contact point (a rotation that
         # lifts one point while the other stays near zero would otherwise
         # still earn partial credit through an average).
-        left_heel_clearance = torch.clamp(left_heel_height / self.cfg.foot_swing_target_height_m, min=0.0, max=1.0)
-        right_heel_clearance = torch.clamp(right_heel_height / self.cfg.foot_swing_target_height_m, min=0.0, max=1.0)
-        left_toe_clearance = torch.clamp(left_toe_height / self.cfg.foot_swing_target_height_m, min=0.0, max=1.0)
-        right_toe_clearance = torch.clamp(right_toe_height / self.cfg.foot_swing_target_height_m, min=0.0, max=1.0)
+        left_heel_clearance = torch.clamp(left_heel_height / target_left_heel, min=0.0, max=1.0)
+        right_heel_clearance = torch.clamp(right_heel_height / target_right_heel, min=0.0, max=1.0)
+        left_toe_clearance = torch.clamp(left_toe_height / target_left_toe, min=0.0, max=1.0)
+        right_toe_clearance = torch.clamp(right_toe_height / target_right_toe, min=0.0, max=1.0)
         left_clearance = torch.minimum(left_heel_clearance, left_toe_clearance)
         right_clearance = torch.minimum(right_heel_clearance, right_toe_clearance)
         foot_swing_reward = self.cfg.foot_swing_reward_weight * (
@@ -2285,6 +3241,37 @@ class QminiLegEnv(DirectRLEnv):
 
         foot_swing_reward = torch.where(in_push_cooldown, torch.zeros_like(foot_swing_reward), foot_swing_reward)
 
+        # Penalize foot height past target+margin -- see
+        # cfg.foot_overswing_penalty_weight's comment. Uses the max of
+        # heel/toe (either point being far too high means the foot is too
+        # high), unlike foot_swing_reward's min() (which exists to rule out
+        # gaming clearance by rotating around one fixed point -- not a
+        # concern here, a real overswing lifts both). Each point is
+        # measured against its OWN per-phase reference target (heel and
+        # toe targets differ slightly), not a single shared constant --
+        # see foot_height_target_floor_m's comment.
+        left_heel_overswing = torch.clamp(
+            left_heel_height - (target_left_heel + self.cfg.foot_overswing_margin_m), min=0.0
+        )
+        left_toe_overswing = torch.clamp(
+            left_toe_height - (target_left_toe + self.cfg.foot_overswing_margin_m), min=0.0
+        )
+        right_heel_overswing = torch.clamp(
+            right_heel_height - (target_right_heel + self.cfg.foot_overswing_margin_m), min=0.0
+        )
+        right_toe_overswing = torch.clamp(
+            right_toe_height - (target_right_toe + self.cfg.foot_overswing_margin_m), min=0.0
+        )
+        left_overswing = torch.maximum(left_heel_overswing, left_toe_overswing)
+        right_overswing = torch.maximum(right_heel_overswing, right_toe_overswing)
+        overswing_max_m = self.cfg.foot_overswing_penalty_max_m
+        left_overswing = torch.clamp(left_overswing, max=overswing_max_m)
+        right_overswing = torch.clamp(right_overswing, max=overswing_max_m)
+        foot_overswing_penalty = self.cfg.foot_overswing_penalty_weight * (left_overswing + right_overswing)
+        foot_overswing_penalty = torch.where(
+            in_push_cooldown, torch.zeros_like(foot_overswing_penalty), foot_overswing_penalty
+        )
+
         # Track commanded base xy velocity (currently always zero -- stay
         # in place) -- see cfg.position_reward_weight's comment for why
         # this is velocity, not a position anchor.
@@ -2300,6 +3287,19 @@ class QminiLegEnv(DirectRLEnv):
         yaw_rate_error = (self.robot.data.root_ang_vel_w[:, 2] - commanded_yaw_rate) ** 2
         heading_reward = torch.exp(-self.cfg.heading_reward_scale * yaw_rate_error)
 
+        # ABSOLUTE heading tracking -- see cfg.heading_deviation_penalty_weight's
+        # comment for the full story (heading_reward above only tracks
+        # yaw RATE, never corrects accumulated drift, which is exactly
+        # what real hardware showed). Margined and linear-then-capped, same
+        # pattern as target_limit_penalty.
+        _, _, current_yaw = euler_xyz_from_quat(self.robot.data.root_quat_w)
+        heading_deviation_rad = wrap_to_pi(current_yaw - self._reset_yaw).abs()
+        heading_deviation_margin_rad = math.radians(self.cfg.heading_deviation_margin_deg)
+        heading_deviation_over = torch.clamp(heading_deviation_rad - heading_deviation_margin_rad, min=0.0)
+        heading_deviation_max_rad = math.radians(self.cfg.heading_deviation_penalty_max_deg)
+        heading_deviation_over = torch.clamp(heading_deviation_over, max=heading_deviation_max_rad)
+        heading_deviation_penalty = self.cfg.heading_deviation_penalty_weight * heading_deviation_over
+
         # Same push-recovery cooldown as foot_swing_reward above, and for
         # the same underlying reason: a push forces real base velocity/yaw
         # rate that the policy didn't choose and can't avoid, so scoring it
@@ -2313,6 +3313,9 @@ class QminiLegEnv(DirectRLEnv):
         # behavior change.
         position_reward = torch.where(in_push_cooldown, torch.zeros_like(position_reward), position_reward)
         heading_reward = torch.where(in_push_cooldown, torch.zeros_like(heading_reward), heading_reward)
+        heading_deviation_penalty = torch.where(
+            in_push_cooldown, torch.zeros_like(heading_deviation_penalty), heading_deviation_penalty
+        )
 
         # Same fall condition as _get_dones() -- recomputed independently
         # here rather than reading self.reset_terminated, since this repo
@@ -2328,6 +3331,7 @@ class QminiLegEnv(DirectRLEnv):
             2.0*tracking_reward
             + velocity_reward
             + self.cfg.orientation_reward_weight * orientation_reward
+            + self.cfg.roll_reward_weight * roll_reward
             + foot_swing_reward
             + self.cfg.position_reward_weight * position_reward
             + self.cfg.heading_reward_weight * heading_reward
@@ -2335,6 +3339,9 @@ class QminiLegEnv(DirectRLEnv):
             - termination_penalty
             - joint_limit_penalty
             - target_limit_penalty
+            - heading_deviation_penalty
+            - foot_overswing_penalty
+            - step_limit_penalty
         )
 
         # ---------------------------------
@@ -2353,6 +3360,10 @@ class QminiLegEnv(DirectRLEnv):
             # improving, since it's invisible in the reward-facing metric
             # above by design.
             "tracking/foot_swing_during_push_cooldown": foot_swing_during_push_cooldown,
+            "tracking/foot_overswing_penalty": foot_overswing_penalty.mean(),
+            "tracking/step_limit_penalty": step_limit_penalty.mean(),
+            "tracking/step_over_rate": step_over_rate,
+            "tracking/mean_max_step_deg": mean_max_step_deg,
             # Logged as the MINIMUM of heel/toe height (the bottleneck that
             # actually determines clearance below), not heel alone -- see
             # cfg.left/right_toe_local_m's comment for why heel alone isn't
@@ -2362,6 +3373,8 @@ class QminiLegEnv(DirectRLEnv):
             "motion/left_swing_target": left_swing_target[0],
             "motion/right_swing_target": right_swing_target[0],
             "orientation/reward": orientation_reward.mean(),
+            "orientation/roll_reward": roll_reward.mean(),
+            "orientation/roll_deg": torch.rad2deg(torch.asin(torch.clamp(roll_sin, max=1.0))).mean(),
             "orientation/termination_penalty": termination_penalty.mean(),
             "orientation/fall_rate": fell.float().mean(),
             "orientation/gravity_x": projected_gravity[0, 0],
@@ -2371,6 +3384,8 @@ class QminiLegEnv(DirectRLEnv):
             "position/base_speed_cmps": torch.sqrt(base_vel_error[0]) * 100.0,
             "heading/reward": heading_reward.mean(),
             "heading/yaw_rate_dps": torch.rad2deg(torch.sqrt(yaw_rate_error[0])),
+            "heading/deviation_penalty": heading_deviation_penalty.mean(),
+            "heading/deviation_deg": torch.rad2deg(heading_deviation_rad.mean()),
         }
         for i, label in enumerate(joint_labels):
             log[f"tracking/{label}_error"] = torch.rad2deg(torch.mean(torch.abs(error[:, i])))
@@ -2445,6 +3460,14 @@ class QminiLegEnv(DirectRLEnv):
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+
+        # Capture this env's world-frame yaw right now as its heading
+        # reference for cfg.heading_deviation_penalty_weight -- computed
+        # from the quaternion actually just written above (not assumed to
+        # be exactly 0) so this stays correct even if default_root_state's
+        # orientation ever changes.
+        _, _, reset_yaw = euler_xyz_from_quat(default_root_state[:, 3:7])
+        self._reset_yaw[env_ids] = reset_yaw
 
         default_joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         default_joint_vel = self.robot.data.default_joint_vel[env_ids].clone()

@@ -876,6 +876,19 @@ def write_csv_header(csv_writer, policy_joint_order, physical_joint_names):
     for name in physical_joint_names:
         header += [f"target_deg_{name}", f"actual_deg_{name}", f"temp_{name}", f"err_{name}"]
     header += ["imu_ms", "policy_ms", "bus_ms"]  # per-step timing breakdown, see analyze_delay.py
+    # IMU diagnostic columns, added 2026-09-23 while investigating repeated
+    # ImuTelemetryFault hits on the step-in-place policy -- see
+    # imu_sensor.py's module docstring (DIAGNOSTIC LOGGING section) for what
+    # each of these means and how to read them. Appended at the end so
+    # existing column positions/scripts reading this CSV by index are
+    # unaffected.
+    header += [
+        "imu_accel_chip_x", "imu_accel_chip_y", "imu_accel_chip_z",
+        "imu_gyro_chip_x", "imu_gyro_chip_y", "imu_gyro_chip_z",
+        "imu_accel_norm_mps2", "imu_accel_read_ms", "imu_gyro_read_ms",
+        "imu_accel_retries", "imu_gyro_retries",
+        "imu_mismatch_deg", "imu_plausible_deg", "imu_consecutive_mismatches",
+    ]
     csv_writer.writerow(header)
 
 
@@ -1236,7 +1249,20 @@ class Deployment:
 
                 print(f"CURRENT  LEFT HIP YAW: {math.degrees(readings['left_hip_yaw'].output_pos_rad):10.5f}  HIP ROLL: {math.degrees(readings['left_hip_roll'].output_pos_rad):10.5f}  HIP PITCH: {math.degrees(readings['left_hip_pitch'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['left_knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['left_ankle'].output_pos_rad):10.5f}")
                 print(f"CURRENT RIGHT HIP YAW: {math.degrees(readings['right_hip_yaw'].output_pos_rad):10.5f}  HIP ROLL: {math.degrees(readings['right_hip_roll'].output_pos_rad):10.5f}  HIP PITCH: {math.degrees(readings['right_hip_pitch'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['right_knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['right_ankle'].output_pos_rad):10.5f}")
-                obs = self.build_obs(readings)
+                try:
+                    obs = self.build_obs(readings)
+                except imu_sensor.ImuTelemetryFault:
+                    # Write the best-effort diagnostic row HERE, before
+                    # re-raising -- run()'s own `finally:` below closes
+                    # self.csv_file unconditionally as this exception
+                    # propagates out, so writing it any later (e.g. in
+                    # main()'s except clause, as an earlier version of this
+                    # fix tried) hits a closed file every time. See
+                    # blank_row_for_fault's docstring / imu_sensor.py's
+                    # DIAGNOSTIC LOGGING section.
+                    t_wall = loop_start - run_start
+                    self.blank_row_for_fault(t_wall)
+                    raise
                 imu_ms = self._last_imu_ms
                 gravity_dir, ang_vel_rad_s = self._last_imu_reading
                 print(
@@ -1341,6 +1367,42 @@ class Deployment:
             self.csv_file.close()
             self.logger.info("Deployment stopped, motors released, log file closed.")
 
+    def _imu_diagnostic_row(self):
+        """Row tail matching write_csv_header's IMU diagnostic columns --
+        see imu_sensor.py's last_diagnostics / DIAGNOSTIC LOGGING section.
+        Shared by _log_step (normal rows) and the fault handler in main()
+        (the one read that never reaches _log_step normally, see there)."""
+        d = self.imu.last_diagnostics
+        if d is None:
+            return [""] * 14
+        return [
+            d.accel_chip_mps2[0], d.accel_chip_mps2[1], d.accel_chip_mps2[2],
+            d.gyro_chip_rads[0], d.gyro_chip_rads[1], d.gyro_chip_rads[2],
+            d.accel_norm_mps2, d.accel_read_ms, d.gyro_read_ms,
+            d.accel_read_retries, d.gyro_read_retries,
+            d.mismatch_deg, d.plausible_deg, d.consecutive_mismatches,
+        ]
+
+    def blank_row_for_fault(self, t_wall):
+        """Writes a best-effort CSV row for a read that raised before a
+        normal _log_step call could happen (e.g. ImuTelemetryFault fires
+        inside build_obs(), before obs/action/targets exist for that step)
+        -- otherwise the single most diagnostically important read of the
+        whole run silently never appears in the CSV. Every column this
+        step doesn't have a value for is left blank; t_wall, motion_time,
+        and the IMU diagnostic tail (self.imu.last_diagnostics, populated
+        even on the read that triggered the fault -- see
+        read_robot_frame()) are filled in."""
+        n_joints = len(self.policy_joint_order)
+        n_phys = len(self.robot_cfg.joints)
+        normal_len = 2 + n_joints * 2 + 6 + 2 + n_joints + n_phys * 4 + 3
+        row = [""] * normal_len
+        row[0] = t_wall
+        row[1] = self.motion_time
+        row += self._imu_diagnostic_row()
+        self.csv_writer.writerow(row)
+        self.csv_file.flush()
+
     def _log_step(self, step, t_wall, readings, obs, action, targets, new_readings, imu_ms, policy_ms, bus_ms):
         # NOTE: 't' is now the measured wall-clock time since run() started,
         # NOT step * control_dt. If your loop is overrunning control_dt
@@ -1360,6 +1422,7 @@ class Deployment:
                 r.error_flag if r.error_flag is not None else "",
             ]
         row += [imu_ms, policy_ms, bus_ms]
+        row += self._imu_diagnostic_row()
         self.csv_writer.writerow(row)
         if step % 50 == 0:
             self.csv_file.flush()
@@ -1437,6 +1500,7 @@ def main():
     logger, csv_writer, csv_file, csv_path = setup_logging(args.log_dir)
     logger.info("Logging control loop to %s", csv_path)
 
+    deployment = None
     try:
         policy_joint_order = None
         if args.open_loop_ref:
@@ -1472,6 +1536,37 @@ def main():
         # of which except clause catches this; this just logs it clearly
         # instead of falling through to the generic "unhandled exception"
         # path below.
+        #
+        # Added 2026-09-23: dump the raw diagnostics and the rolling
+        # mismatch-history that led up to this (see ImuDiagnostics /
+        # DIAGNOSTIC LOGGING in imu_sensor.py's module docstring) and write
+        # a best-effort CSV row for the fatal read -- otherwise this exact
+        # read (the one that actually matters for diagnosing WHY) never
+        # appears anywhere: it fires inside build_obs(), before that step's
+        # normal _log_step() call would have happened.
+        diag = getattr(e, "diagnostics", None)
+        history = getattr(e, "mismatch_history", None)
+        if diag is not None:
+            logger.error(
+                "IMU fault diagnostics: accel_chip=(%.3f, %.3f, %.3f) m/s^2 "
+                "(norm=%.3f, expect ~9.81) gyro_chip=(%.4f, %.4f, %.4f) rad/s "
+                "accel_read_ms=%.2f gyro_read_ms=%.2f accel_retries=%d gyro_retries=%d",
+                diag.accel_chip_mps2[0], diag.accel_chip_mps2[1], diag.accel_chip_mps2[2],
+                diag.accel_norm_mps2,
+                diag.gyro_chip_rads[0], diag.gyro_chip_rads[1], diag.gyro_chip_rads[2],
+                diag.accel_read_ms, diag.gyro_read_ms,
+                diag.accel_read_retries, diag.gyro_read_retries,
+            )
+        if history:
+            logger.error(
+                "IMU mismatch buildup (mismatch_deg vs. plausible_deg, oldest first): %s",
+                ["%.1f/%.1f" % (m, p) for m, p in history],
+            )
+        # The best-effort diagnostic CSV row is written inside run()'s own
+        # try/except, BEFORE its finally: block closes self.csv_file -- by
+        # the time control reaches here that file is already closed, so
+        # there's nothing left to do for it at this point (see the
+        # build_obs() call site in run()).
         logger.error("Exiting after IMU telemetry fault: %s. Motors have been released.", e)
         sys.exit(1)
     except Exception:
