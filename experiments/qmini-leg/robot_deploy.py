@@ -910,6 +910,7 @@ class Deployment:
         startup_pose: str = "auto",
         startup_move_duration: float = 2.0,
         action_smoothing: float = 1.0,  # keep in sync with --action-smoothing's default
+        max_target_step_deg: Optional[float] = None,
     ):
         self.robot_cfg = robot_cfg
         self.policy = policy
@@ -980,6 +981,23 @@ class Deployment:
         # policy's metadata sidecar.
         self.action_smoothing = action_smoothing
         self._smoothed_targets: dict = {}
+
+        # Opt-in per-step RATE LIMITER on the final commanded targets
+        # (--max-target-step-deg, default off): each joint's target may move
+        # at most this many degrees from the previously commanded one. NOT a
+        # low-pass filter like action_smoothing (which was tried and
+        # reverted because it blanket-suppressed genuine swing motion): it
+        # is inactive unless a single step exceeds the limit, so ordinary
+        # commands pass through unchanged and only outlier jumps are capped.
+        # Added 2026-09-25 for the cycle-1 right_hip_pitch chatter (targets
+        # flipping 10-30deg per 20ms step at motion_time~1.15s on hardware
+        # while sim's p99 step is ~9deg). Deploy-only, so the policy was not
+        # trained against it: when active it turns a max_step_deg SAFETY
+        # ABORT into a capped command, so keep it at or below max_step_deg
+        # only deliberately and check the clamp log lines afterwards.
+        self.max_target_step_deg = max_target_step_deg
+        self._prev_commanded_targets: dict = {}
+        self.rate_limit_clamp_count = 0
 
         # One MotorBus per unique port in robot_config.json -- joints that
         # share a port share a bus, joints with different ports get their
@@ -1318,6 +1336,22 @@ class Deployment:
                         self._smoothed_targets[name] = smoothed
                         targets[name] = smoothed
 
+                if self.max_target_step_deg is not None:
+                    limit_rad = math.radians(self.max_target_step_deg)
+                    for name, t in list(targets.items()):
+                        prev = self._prev_commanded_targets.get(name)
+                        if prev is not None and abs(t - prev) > limit_rad:
+                            clamped = prev + math.copysign(limit_rad, t - prev)
+                            self.rate_limit_clamp_count += 1
+                            self.logger.warning(
+                                "RATE LIMIT: %s target step %+.2f deg capped to %+.2f deg (clamp #%d)",
+                                name, math.degrees(t - prev), math.degrees(clamped - prev),
+                                self.rate_limit_clamp_count,
+                            )
+                            t = clamped
+                            targets[name] = t
+                        self._prev_commanded_targets[name] = t
+
                 print(f"TARGETS  LEFT HIP YAW: {math.degrees(targets['left_hip_yaw']):10.5f}  HIP ROLL: {math.degrees(targets['left_hip_roll']):10.5f}  HIP PITCH: {math.degrees(targets['left_hip_pitch']):10.5f}  KNEE: {math.degrees(targets['left_knee']):10.5f}  ANKLE: {math.degrees(targets['left_ankle']):10.5f}")
                 print(f"TARGETS RIGHT HIP YAW: {math.degrees(targets['right_hip_yaw']):10.5f}  HIP ROLL: {math.degrees(targets['right_hip_roll']):10.5f}  HIP PITCH: {math.degrees(targets['right_hip_pitch']):10.5f}  KNEE: {math.degrees(targets['right_knee']):10.5f}  ANKLE: {math.degrees(targets['right_ankle']):10.5f}")
 
@@ -1454,6 +1488,16 @@ def main():
              "tune_pid_isaaclab.py -- NOT for normal operation.",
     )
     parser.add_argument(
+        "--max-target-step-deg", type=float, default=None,
+        help="Opt-in per-step rate limiter: cap how far any joint's commanded "
+             "target may move from the previous commanded target (degrees "
+             "per control step). Default off. Unlike --action-smoothing it "
+             "does nothing unless a single step exceeds the limit. When set "
+             "below robot_config's max_step_deg it converts that safety "
+             "abort into a capped command -- every clamp is logged as a "
+             "'RATE LIMIT' warning, so check the log afterwards.",
+    )
+    parser.add_argument(
         "--action-smoothing", type=float, default=1.0,
         help="EMA low-pass factor applied to the final decoded joint "
              "target every step, same formula as qmini_leg_env.py's "
@@ -1522,6 +1566,7 @@ def main():
             keyframes_path=args.keyframes, open_loop_ref=args.open_loop_ref,
             startup_pose=args.startup_pose, startup_move_duration=args.startup_move_duration,
             action_smoothing=args.action_smoothing,
+            max_target_step_deg=args.max_target_step_deg,
         )
         deployment.startup_sequence()
         deployment.run()

@@ -1413,8 +1413,63 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # genuine stepping reappears with this whole cluster of "stay still"
     # pressure removed, re-enable this and the others one at a time to find
     # how much stepping can actually tolerate before it's undone again.
+    #
+    # RE-ENABLED 2026-09-25 (0.0 -> 1.0, scale 10 -> 25), by resume. The
+    # 2026-09-07 disable was a controlled test at a time when stepping was
+    # not yet reproducible; the real blocker turned out to be
+    # tracking_linear_penalty_weight (see the stepping-breakthrough notes),
+    # and stepping has been robust since, so the "stay still fights genuine
+    # stepping" worry no longer blocks re-trying it. Motivation is hardware:
+    # 2026-09-25 rate-limited runs (10 attempts, ~145 cycles) now end almost
+    # only because the robot walks off the doormat or into the support
+    # frame, not from faults; sim shows the same drift (position/
+    # base_speed_cmps 7.7-19 across recent runs, position/reward ~0.67-
+    # 0.77). heading_reward/heading_deviation_penalty are already on.
+    # Scale raised because at 10 a 0.15 m/s drift still scores exp(-0.225)
+    # =0.80 vs 0.98 at 0.05 m/s, a weak gradient; at 25 those are 0.57 vs
+    # 0.94. Additive positive reward (max = weight), suspended during push
+    # cooldown like before, so a resume is the same kind of change as the
+    # earlier weight bumps. UNTUNED: watch foot_swing_reward (should stay
+    # ~1.5; if it falls below ~1.3 or fall_rate rises, back scale off to
+    # ~15 or weight to 0.5), position/base_speed_cmps (should fall from
+    # ~8-19 toward <5), and the per-joint tracking errors. Compare with
+    # compare_policies_isaaclab.py and check the hardware drift on the mat.
+    #
+    # REVERTED 1.0 -> 0.0 on 2026-09-28 (run 2026-09-27_21-20-39,
+    # model_357999, ~40000 iterations). RESULT: no effect. position/reward
+    # plateaued at 0.55-0.59 within the FIRST 7000 iterations of the resume
+    # and never moved from there; position/base_speed_cmps stayed flat at
+    # 16-18 cm/s the entire run (was already ~14-17 before this term was
+    # even active). compare_policies_isaaclab.py's --dump-heights was
+    # extended with root_lin_vel_b (see that flag's comment) to see WHY:
+    # base x-velocity averages +23 cm/s while the left foot swings and -20
+    # cm/s while the right foot swings (vs -0.3 cm/s in double support) --
+    # this term penalizes INSTANTANEOUS speed, and that +-20cm/s swing-
+    # phase surge is the weight shift every single-support step physically
+    # needs, already present in the reference motion, not a policy mistake.
+    # It mostly self-cancels (per-cycle net x displacement across all
+    # envs/cycles: mean +1.33cm, i.e. ~0.6cm/s of REAL residual drift, vs a
+    # std of 4.21cm from cycle-to-cycle noise) -- so the actual problem
+    # this term was meant to fix is a small quantity buried inside a much
+    # larger, necessary oscillation the reward can't tell apart from it.
+    # To raise position/reward above ~0.58 the policy would have to shrink
+    # the swing surge itself, i.e. shrink genuine stepping -- the same
+    # can't-distinguish-noise-from-signal trap that killed THREE earlier
+    # ankle-shake fixes (gain_randomization_range, ankle damping,
+    # action_rate_joint_weight) and the action_smoothing EMA attempt (see
+    # that cfg's comment). Don't re-enable this exact shape (instantaneous
+    # root_lin_vel_w/b tracked to zero) again without a materially
+    # different mechanism -- e.g. tracking NET displacement over a window
+    # (a gait cycle or an EMA-filtered velocity) instead of per-step speed,
+    # which would be blind to the swing's own cancelling oscillation and
+    # should only see the ~1cm/cycle residual that's the actual target.
+    # Not yet implemented. Hardware corroborates the "no benefit" read:
+    # 2026-09-28 attempts 5-8 on this exported bundle
+    # (deploy_bundle_2026-09-28_position1) all aborted on IMU faults, none
+    # ran long enough to compare drift distance against the pre-change
+    # pitchstep5 bundle.
     position_reward_weight: float = 0.0
-    position_reward_scale: float = 10.0
+    position_reward_scale: float = 25.0
 
     # --- stay facing the same way -------------------------------------
     # Same gap as position_reward closed for translation, but for
@@ -1717,7 +1772,44 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # the reference clip's own roll range is under 3deg peak-to-peak
     # already, well inside a target range that keeps this margin
     # untouched.
-    target_limit_margin_deg: float = 3.0
+    #
+    # CONVERTED to a per-joint-TYPE dict on 2026-09-23 (same matching
+    # convention as joint_tracking_weight/action_rate_joint_weight), roll
+    # widened 3.0 -> 8.0, everything else left at the original 3.0.
+    # Motivated by hardware, not sim: at weight=15/linear_coef=0.5 this
+    # term already drove sim's target_violation_rate down to ~0.0016%, yet
+    # 2026-09-22/23 battery-powered hardware testing (comms confound
+    # resolved, see imu_fault_diagnosis notes) hit a real "target outside
+    # joint limits: left_hip_roll" abort on 4 of 7 runs across BOTH
+    # roll6_ankle3 and yaw3 -- always the same joint, always within
+    # motion_time 1.02-1.05s of each other, always grazing by only
+    # 0.1-0.6deg (e.g. -15.10, -15.29, -15.31, -15.56 against the -15.00
+    # limit). A uniform 3deg margin is a much smaller buffer, in absolute
+    # terms, for a joint with a +-15deg range and a ~2.7deg reference
+    # amplitude than for e.g. knee (+-50/60deg range, ~16-30deg
+    # amplitude) -- the same margin doesn't mean the same safety headroom
+    # per joint. Raising ONLY roll's margin (not the global weight/
+    # linear_coef, which would also squeeze knee/pitch's much larger
+    # legitimate excursions) targets the joint that's actually tripping
+    # without repeating the "broad tracking tightening suppresses genuine
+    # stepping" mistake from earlier in this project. 8deg leaves the
+    # policy 2-3x the reference's own roll amplitude before the penalty
+    # even starts, well short of the limit at +-15deg. Resume, not fresh
+    # start -- reshapes an existing term's margin like joint_tracking_
+    # weight's roll/ankle/yaw increases did, not a new penalty term.
+    # 2026-09-24: roll widened again 8.0 -> 11.0. Offline replay of the
+    # hardware logs through the resume_roll_margin8 policy still put the
+    # left hip-roll target at -12.2..-13.2deg around motion_time 1.0s
+    # (yaw3: -14.8..-15.6), i.e. 2-3deg from the +-15 limit and well inside
+    # the 7deg zone this margin opened -- helped, not solved. 11deg starts
+    # the penalty at +-4deg, still above the ~2.7deg reference amplitude.
+    target_limit_margin_deg: dict = {
+        "yaw": 3.0,
+        "roll": 11.0,
+        "pitch": 3.0,
+        "knee": 3.0,
+        "ankle": 3.0,
+    }
 
     # The overshoot itself IS capped here (in degrees, before squaring) --
     # added after a 40000-iteration run diverged catastrophically at the
@@ -1831,6 +1923,38 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     step_limit_penalty_weight: float = 10.0
     step_limit_threshold_deg: float = 4.0
     step_limit_penalty_max_excess_deg: float = 30.0
+
+    # Per-joint-TYPE multiplier on step_limit_penalty_weight (same suffix
+    # matching as joint_tracking_weight). Added 2026-09-24: on 2026-09-23
+    # battery hardware runs (yaw3 attempts 12 and 14) right_hip_pitch
+    # commanded steps of +23.4/+16.9deg at motion_time 0.36-0.40s -- a
+    # different phase from the roll-limit problem -- and offline replay of
+    # those logs through the roll_margin8 policy still gave 25.0/13.5deg,
+    # so the uniform weight-10 penalty isn't shaping this joint enough
+    # (consistent with yaw tightening having shifted balance correction
+    # into pitch). Only pitch is doubled, not the global weight, so
+    # knee/ankle keep the already-working shaping. UNTUNED: watch
+    # foot_swing_reward, tracking/mean_max_step_deg and compare_policies'
+    # p99_step_deg; if stepping is suppressed drop back toward 1.5.
+    # 2026-09-24 (later): pitch 2.0 -> 5.0. The x2 run (resume_roll11_
+    # pitchstep2) barely helped: offline replay of hardware attempts 2-4
+    # (right_hip_pitch steps 16/22/34.5deg under roll_margin8) gave
+    # 20.2/19.8/28.6deg, still past the 15deg max_step_deg, and sim's
+    # p99_step_deg rose 7.6 -> 8.6. The trigger is NOT an out-of-
+    # distribution observation (max |z| < 3.5 vs the training normalizer
+    # during the spike), so this is an in-distribution over-reaction to a
+    # real event at mt~1.15s, and only a stronger cost on pitch steps can
+    # reshape it. Resume from resume_roll11_pitchstep2 model_279993 (a
+    # weight change on an existing term, like the earlier resumes). If
+    # foot_swing_reward falls below ~1.3 or fall_rate rises, back off to
+    # ~3.5. Compare hardware: roll11_pitchstep2 vs this one.
+    step_limit_joint_weight: dict = {
+        "yaw": 1.0,
+        "roll": 1.0,
+        "pitch": 5.0,
+        "knee": 1.0,
+        "ankle": 1.0,
+    }
 
     # --- foot-height swing reward -----------------------------------------
     # Added because pure joint-angle tracking let the policy alias "roughly
@@ -2489,6 +2613,37 @@ class QminiLegEnv(DirectRLEnv):
                     f"entry to cfg.joint_tracking_weight covering it."
                 )
 
+        # Per-joint-TYPE target-limit margin (radians) -- see
+        # cfg.target_limit_margin_deg's comment. Same matching convention
+        # as _joint_tracking_weight just above.
+        self._target_limit_margin_rad = torch.zeros(self.num_joints, device=self.device)
+        for i, name in enumerate(self.robot.joint_names[:self.num_joints]):
+            for suffix, deg in self.cfg.target_limit_margin_deg.items():
+                if name.endswith(suffix):
+                    self._target_limit_margin_rad[i] = math.radians(deg)
+                    break
+            else:
+                raise ValueError(
+                    f"Robot joint '{name}' doesn't end with any of "
+                    f"{list(self.cfg.target_limit_margin_deg)} -- add an "
+                    f"entry to cfg.target_limit_margin_deg covering it."
+                )
+
+        # Per-joint-TYPE step-limit multiplier -- see
+        # cfg.step_limit_joint_weight's comment.
+        self._step_limit_joint_weight = torch.ones(self.num_joints, device=self.device)
+        for i, name in enumerate(self.robot.joint_names[:self.num_joints]):
+            for suffix, weight in self.cfg.step_limit_joint_weight.items():
+                if name.endswith(suffix):
+                    self._step_limit_joint_weight[i] = weight
+                    break
+            else:
+                raise ValueError(
+                    f"Robot joint '{name}' doesn't end with any of "
+                    f"{list(self.cfg.step_limit_joint_weight)} -- add an "
+                    f"entry to cfg.step_limit_joint_weight covering it."
+                )
+
         # Per-joint-TYPE action-rate weight -- see
         # cfg.action_rate_joint_weight's comment. Same matching convention
         # as _joint_tracking_weight just above.
@@ -3029,7 +3184,7 @@ class QminiLegEnv(DirectRLEnv):
             min=0.0,
             max=math.radians(self.cfg.step_limit_penalty_max_excess_deg),
         )
-        step_limit_penalty = self.cfg.step_limit_penalty_weight * torch.sum(step_excess_rad, dim=1)
+        step_limit_penalty = self.cfg.step_limit_penalty_weight * torch.sum(self._step_limit_joint_weight * step_excess_rad, dim=1)
         step_over_rate = (step_delta_rad > math.radians(self.cfg.step_limit_threshold_deg)).any(dim=1).float().mean()
         mean_max_step_deg = torch.rad2deg(step_delta_rad.max(dim=1).values).mean()
         self._prev_actions = self.actions.clone()
@@ -3073,7 +3228,10 @@ class QminiLegEnv(DirectRLEnv):
         # already past it. A real safety abort has zero tolerance
         # regardless of overshoot size, so the training signal needs to
         # start well before the boundary, not at it.
-        margin_rad = math.radians(self.cfg.target_limit_margin_deg)
+        # Per-joint margin now (cfg.target_limit_margin_deg is a dict,
+        # matched to self._target_limit_margin_rad in __init__) -- roll
+        # gets a wider buffer than the rest, see that field's comment.
+        margin_rad = self._target_limit_margin_rad
         target_over_limit = (
             torch.clamp(self._last_position_targets - (upper - margin_rad), min=0.0)
             + torch.clamp((lower + margin_rad) - self._last_position_targets, min=0.0)

@@ -475,11 +475,15 @@ def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: fl
                 left_swing_target, right_swing_target, settled_mask.float(),
                 _fh[:, 0], _fh[:, 1], _fh[:, 2], _fh[:, 3],
                 # cols 11-20 actual joint_pos, 21-30 reference joint_pos (rad, articulation order,
-                # names saved next to the .npy), 31 base z, 32-34 projected_gravity_b
+                # names saved next to the .npy), 31 base z, 32-34 projected_gravity_b, 35-36
+                # root_lin_vel_b xy (m/s, base frame -- added 2026-09-28 alongside
+                # position_reward_weight going 0.0->1.0, to see WHERE/WHEN drift happens instead
+                # of just training's aggregate position/base_speed_cmps scalar)
                 *unwrapped.robot.data.joint_pos[:, :num_joints].T,
                 *reference[:, :num_joints].T,
                 unwrapped.robot.data.root_pos_w[:, 2],
                 *unwrapped.robot.data.projected_gravity_b.T,
+                *unwrapped.robot.data.root_lin_vel_b[:, :2].T,
             ], dim=1).cpu())
 
         if settled_mask.any():
@@ -546,7 +550,7 @@ def collect_metrics(env, policy, num_steps: int, num_envs: int, action_scale: fl
 
     if DUMP_HEIGHTS_PATH is not None and dump_rows:
         import numpy as _np
-        _np.save(DUMP_HEIGHTS_PATH, torch.stack(dump_rows).numpy())  # [steps, envs, 35]
+        _np.save(DUMP_HEIGHTS_PATH, torch.stack(dump_rows).numpy())  # [steps, envs, 37]
         with open(str(DUMP_HEIGHTS_PATH) + ".joints.json", "w") as _f:
             json.dump(list(unwrapped.robot.joint_names[:num_joints]), _f)
         print(f"    dumped raw heights to {DUMP_HEIGHTS_PATH}")
