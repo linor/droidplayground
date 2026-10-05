@@ -76,6 +76,10 @@ def print_reading(label, r: imu_sensor.ImuReading):
     norm = math.sqrt(sum(a * a for a in r.accel_robot_mps2))
     gravity_dir = [-a / norm for a in r.accel_robot_mps2] if norm > 1e-6 else [0, 0, -1]
     print(f"    robot gravity_dir (matches projected_gravity_b): {fmt3(gravity_dir)}   |accel|={norm:6.3f} m/s^2 (expect ~{EARTH_GRAVITY_MPS2:.2f})")
+    # Same pitch/roll definitions as the training env and log_viewer.html.
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, gravity_dir[1]))))
+    roll = math.degrees(math.asin(max(-1.0, min(1.0, gravity_dir[0]))))
+    print(f"    robot tilt: pitch {pitch:+5.2f} deg (+ = leaning back)   roll {roll:+5.2f} deg (+ = leaning left)")
 
 
 def wait_for_enter(prompt):
@@ -162,7 +166,13 @@ def main():
     print(f"Using imu_axis_remap={axis_remap} from {args.config}"
           f"{' (module default -- config had none)' if not raw.get('imu_axis_remap') else ''}")
 
-    sensor = imu_sensor.ImuSensor(address=address, axis_remap=axis_remap)
+    mount_pitch = raw.get("imu_mount_pitch_deg", 0.0)
+    mount_roll = raw.get("imu_mount_roll_deg", 0.0)
+    print(f"Using imu mount correction pitch {mount_pitch:+.2f} deg, roll {mount_roll:+.2f} deg "
+          f"(robot accel/gyro/tilt below include it; chip values don't)")
+
+    sensor = imu_sensor.ImuSensor(address=address, axis_remap=axis_remap,
+                                  mount_pitch_deg=mount_pitch, mount_roll_deg=mount_roll)
 
     if args.live:
         print("Live IMU monitor -- Ctrl+C to stop.\n")

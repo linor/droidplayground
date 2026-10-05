@@ -1,0 +1,447 @@
+<title>Qmini Log Replay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@400;500;600&display=swap">
+<style>
+/* Layout: instrument bench -- robot views pinned left, synced time strips right, one shared cursor. */
+:root {
+  --bg: #eef0ec; --panel: #fbfcfa; --ink: #1c211e; --muted: #5f6a64; --grid: #d9ded9; --line: #c4cbc6;
+  --left: #2a64ad; --right: #c9651f; --body: #1c211e; --ground: #8b958f; --warn: #b3261e; --ok: #2e7d4f;
+  --ghost: 0.38;
+  --ui: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #111513; --panel: #181d1a; --ink: #e2e7e3; --muted: #8e9993; --grid: #262d29; --line: #36403a;
+  --left: #6fa7ec; --right: #f0a062; --body: #e2e7e3; --ground: #6c7670; --warn: #f2786d; --ok: #6cc28f;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #111513; --panel: #181d1a; --ink: #e2e7e3; --muted: #8e9993; --grid: #262d29; --line: #36403a;
+  --left: #6fa7ec; --right: #f0a062; --body: #e2e7e3; --ground: #6c7670; --warn: #f2786d; --ok: #6cc28f;
+  color-scheme: dark }
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--ink); font-family: var(--ui); font-size: 14px; }
+.wrap { padding-inline: 16px; padding-block: 14px 28px; max-width: 1500px; margin: 0 auto; display: grid; gap: 12px; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: 0.01em; text-wrap: balance; }
+.file { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.fname { font-family: var(--mono); font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+button, select, label.btn { font: inherit; font-size: 13px; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 4px; padding: 5px 10px; cursor: pointer; }
+button:hover, label.btn:hover { border-color: var(--muted); }
+button:focus-visible, select:focus-visible, label.btn:focus-within, input:focus-visible { outline: 2px solid var(--left); outline-offset: 2px; }
+.transport { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.transport input[type=range] { width: min(380px, 60vw); accent-color: var(--ink); }
+.tnow { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; min-width: 11ch; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--muted); }
+.chips b { font-family: var(--mono); font-weight: 500; color: var(--ink); font-variant-numeric: tabular-nums; }
+.chips .flag b { color: var(--warn); }
+.main { display: grid; grid-template-columns: minmax(300px, 420px) minmax(0, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 860px) { .main { grid-template-columns: minmax(0, 1fr); } }
+.side { display: grid; gap: 10px; position: sticky; top: env(safe-area-inset-top, 0px); }
+@media (max-width: 860px) { .side { position: static; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; min-width: 0; }
+.ptitle { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+.views { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+canvas { display: block; width: 100%; }
+.view canvas { aspect-ratio: 3 / 4; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
+.sw { display: inline-block; width: 16px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+.sw.dash { border-top-style: dashed; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { text-align: right; padding: 2px 4px; font-variant-numeric: tabular-nums; }
+th { font-weight: 500; color: var(--muted); font-size: 11.5px; }
+td { font-family: var(--mono); }
+td:first-child, th:first-child { text-align: left; font-family: var(--ui); }
+td.big { color: var(--warn); }
+.strips { display: grid; gap: 8px; min-width: 0; }
+.strip canvas { height: 120px; touch-action: none; cursor: ew-resize; }
+.strip.tall canvas { height: 150px; }
+.note { font-size: 12.5px; color: var(--muted); line-height: 1.45; max-width: 75ch; margin: 2px 0 0; }
+.drop { position: fixed; inset: 0; display: grid; place-items: center; background: color-mix(in srgb, var(--bg) 85%, transparent);
+  font-size: 18px; border: 3px dashed var(--muted); z-index: 10; }
+.err { color: var(--warn); font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Qmini Log Replay</h1>
+    <div class="file">
+      <label class="btn" for="file">Open control_loop CSV<input id="file" type="file" accept=".csv,text/csv" hidden></label>
+      <span class="fname" id="fname"></span>
+    </div>
+  </header>
+  <div class="err" id="err" hidden></div>
+  <div class="transport">
+    <button id="play" type="button" aria-label="Play">Play</button>
+    <input id="scrub" type="range" min="0" max="0" value="0" step="1" aria-label="Time">
+    <span class="tnow" id="tnow">0.00 s</span>
+    <select id="speed" aria-label="Playback speed">
+      <option value="0.1">0.1×</option><option value="0.25" selected>0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option>
+    </select>
+    <button id="loop" type="button" aria-pressed="true">Loop on</button>
+  </div>
+  <div class="chips" id="chips"></div>
+
+  <div class="main">
+    <div class="side">
+      <div class="views">
+        <div class="panel view"><div class="ptitle"><span>Side</span><span>front ←</span></div><canvas id="vside"></canvas></div>
+        <div class="panel view"><div class="ptitle"><span>Front</span><span>robot left →</span></div><canvas id="vfront"></canvas></div>
+      </div>
+      <div class="legend">
+        <span><i class="sw" style="border-color:var(--left)"></i>left leg</span>
+        <span><i class="sw" style="border-color:var(--right)"></i>right leg</span>
+        <span><i class="sw dash" style="border-color:var(--muted)"></i>target (same base)</span>
+      </div>
+      <div class="panel">
+        <div class="ptitle"><span>At cursor</span><span id="rowinfo"></span></div>
+        <table id="readout"></table>
+      </div>
+      <p class="note">Body tilt comes from the IMU gravity vector, and the legs from the encoder angles. <b>Foot world pitch</b> combines the two (IMU tilt plus encoder chain) in the foot frame. A foot flat on the floor reads 0°. Anything else means the heel or toe lifted, or there is play the encoders can't see (gear backlash, flex, sole), or the IMU or joint zero is off.</p>
+    </div>
+
+    <div class="strips" id="strips"></div>
+  </div>
+</div>
+<div class="drop" id="drop" hidden>Drop a control_loop CSV</div>
+
+<script>
+const GEOM = __GEOM__;
+const SAMPLE = { name: "__SAMPLE_NAME__", csv: `__SAMPLE_CSV__` };
+
+const JT = ["hip_yaw", "hip_roll", "hip_pitch", "knee", "ankle"];
+const CHAIN = { hip_yaw: "yaw", hip_roll: "roll", hip_pitch: "pitch", knee: "knee", ankle: "ankle" };
+const LEGS = ["left", "right"];
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+
+/* ---------- small 3D math (column vectors; R row-major 9) ---------- */
+const mmul = (A, B) => { const C = new Array(9); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) C[3*i+j] = A[3*i]*B[j] + A[3*i+1]*B[3+j] + A[3*i+2]*B[6+j]; return C; };
+const mv = (A, v) => [A[0]*v[0]+A[1]*v[1]+A[2]*v[2], A[3]*v[0]+A[4]*v[1]+A[5]*v[2], A[6]*v[0]+A[7]*v[1]+A[8]*v[2]];
+const mtv = (A, v) => [A[0]*v[0]+A[3]*v[1]+A[6]*v[2], A[1]*v[0]+A[4]*v[1]+A[7]*v[2], A[2]*v[0]+A[5]*v[1]+A[8]*v[2]];
+const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const I3 = [1,0,0, 0,1,0, 0,0,1];
+function rod(ax, deg) {
+  const t = deg * D2R, c = Math.cos(t), s = Math.sin(t), C = 1 - c, [x, y, z] = ax;
+  return [c+x*x*C, x*y*C-z*s, x*z*C+y*s, y*x*C+z*s, c+y*y*C, y*z*C-x*s, z*x*C-y*s, z*y*C+x*s, c+z*z*C];
+}
+// Leg FK: every body frame equals base at the zero pose, so T_child = T_parent * Rot(pivot, axis, sign*q).
+// Validated against Isaac Sim (export_fk_geometry.py). Returns base-frame points and the foot rotation.
+function fkLeg(leg, ang) {
+  const g = GEOM.legs[leg]; let R = I3, p = [0, 0, 0]; const pts = [];
+  for (const st of g.chain) {
+    const piv = add(mv(R, st.pivot), p); pts.push(piv);
+    const Rk = rod(st.axis, st.sign * ang[st.joint]);
+    p = add(p, mv(R, sub(st.pivot, mv(Rk, st.pivot)))); R = mmul(R, Rk);
+  }
+  const heel = add(mv(R, g.heel), p), toe = add(mv(R, g.toe), p);
+  return { pts, heel, toe, R };
+}
+// Smallest rotation taking body-frame gravity g to world (0,0,-1). Yaw is unobservable, kept at 0.
+function worldFromGravity(g) {
+  const b = [0, 0, -1], v = [g[1]*b[2]-g[2]*b[1], g[2]*b[0]-g[0]*b[2], g[0]*b[1]-g[1]*b[0]], c = g[0]*b[0]+g[1]*b[1]+g[2]*b[2];
+  if (c < -0.9999) return [1,0,0, 0,-1,0, 0,0,-1];
+  const K = [0,-v[2],v[1], v[2],0,-v[0], -v[1],v[0],0], K2 = mmul(K, K), f = 1 / (1 + c);
+  return I3.map((e, i) => e + K[i] + K2[i] * f);
+}
+
+/* ---------- CSV ---------- */
+let D = null; // parsed log
+function parseCSV(text, name) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim().length);
+  if (lines.length < 3) throw new Error("This file has fewer than two data rows.");
+  const head = lines[0].split(",").map(s => s.trim());
+  const need = ["obs_imu_gravity_x", "obs_imu_gravity_y", "obs_imu_gravity_z"];
+  for (const leg of LEGS) for (const j of JT) need.push(`actual_deg_${leg}_${j}`, `target_deg_${leg}_${j}`);
+  const missing = need.filter(c => !head.includes(c));
+  if (missing.length) throw new Error(`Not a robot_deploy control_loop CSV: missing ${missing.slice(0, 4).join(", ")}${missing.length > 4 ? "…" : ""}`);
+  const idx = Object.fromEntries(head.map((h, i) => [h, i]));
+  const rows = [];
+  for (let k = 1; k < lines.length; k++) {
+    const c = lines[k].split(",");
+    if (c[idx.actual_deg_left_knee] === undefined || c[idx.actual_deg_left_knee] === "") continue;
+    rows.push(c);
+  }
+  const col = n => idx[n] === undefined ? null : Float64Array.from(rows, r => parseFloat(r[idx[n]]));
+  const N = rows.length;
+  let t = col("t_wall");
+  if (t && t.every(Number.isFinite)) { const t0 = t[0]; t = t.map(v => v - t0); }
+  else t = Float64Array.from({ length: N }, (_, i) => i * 0.02);
+  const out = { name, N, t, act: {}, tgt: {}, g: [], bodyPitch: new Float64Array(N), bodyRoll: new Float64Array(N),
+    footPitch: { left: new Float64Array(N), right: new Float64Array(N) }, footRoll: { left: new Float64Array(N), right: new Float64Array(N) },
+    motion: col("motion_time") };
+  for (const leg of LEGS) for (const j of JT) { out.act[`${leg}_${j}`] = col(`actual_deg_${leg}_${j}`); out.tgt[`${leg}_${j}`] = col(`target_deg_${leg}_${j}`); }
+  const gx = col("obs_imu_gravity_x"), gy = col("obs_imu_gravity_y"), gz = col("obs_imu_gravity_z");
+  for (let i = 0; i < N; i++) {
+    const n = Math.hypot(gx[i], gy[i], gz[i]) || 1, g = [gx[i]/n, gy[i]/n, gz[i]/n];
+    out.g.push(g);
+    out.bodyPitch[i] = Math.asin(Math.max(-1, Math.min(1, g[1]))) * R2D;
+    out.bodyRoll[i] = Math.asin(Math.max(-1, Math.min(1, g[0]))) * R2D;
+    for (const leg of LEGS) {
+      const { R } = fkLeg(leg, anglesAt(out, leg, i, "act"));
+      const gf = mtv(R, g);
+      out.footPitch[leg][i] = Math.asin(Math.max(-1, Math.min(1, gf[1]))) * R2D;
+      out.footRoll[leg][i] = Math.asin(Math.max(-1, Math.min(1, gf[0]))) * R2D;
+    }
+  }
+  return out;
+}
+function anglesAt(d, leg, i, which) {
+  const src = which === "act" ? d.act : d.tgt, a = {};
+  for (const j of JT) a[CHAIN[j]] = src[`${leg}_${j}`][i];
+  return a;
+}
+
+/* ---------- theme ---------- */
+let C = {};
+function readTheme() {
+  const s = getComputedStyle(document.documentElement);
+  for (const k of ["bg", "panel", "ink", "muted", "grid", "line", "left", "right", "body", "ground", "warn", "ok"]) C[k] = s.getPropertyValue(`--${k}`).trim();
+  C.ghost = parseFloat(s.getPropertyValue("--ghost")) || 0.4;
+  C.mono = s.getPropertyValue("--mono"); C.ui = s.getPropertyValue("--ui");
+}
+
+/* ---------- canvas helpers ---------- */
+function fitCanvas(cv) {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const ctx = cv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: r.width, h: r.height };
+}
+
+/* ---------- robot views ---------- */
+// Rough torso box around the hips (base frame); drawn as the hull of its projected corners.
+const BODY_PTS = [];
+for (const x of [-0.075, 0.075]) for (const y of [0.03, 0.17]) for (const z of [-0.03, 0.10]) BODY_PTS.push([x, y, z]);
+const BODY_C = [0, 0.10, 0];
+function hull(pts) {
+  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]), cr = (o, a, b) => (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0]);
+  const lo = [], up = [];
+  for (const q of p) { while (lo.length > 1 && cr(lo[lo.length-2], lo[lo.length-1], q) <= 0) lo.pop(); lo.push(q); }
+  for (const q of p.reverse()) { while (up.length > 1 && cr(up[up.length-2], up[up.length-1], q) <= 0) up.pop(); up.push(q); }
+  return lo.slice(0, -1).concat(up.slice(0, -1));
+}
+function poseWorld(i, which) {
+  const Rw = worldFromGravity(D.g[i]);
+  const legs = {};
+  for (const leg of LEGS) {
+    const k = fkLeg(leg, anglesAt(D, leg, i, which));
+    legs[leg] = { pts: k.pts.map(p => mv(Rw, p)), heel: mv(Rw, k.heel), toe: mv(Rw, k.toe) };
+  }
+  return { legs, body: BODY_PTS.map(p => mv(Rw, p)), c: mv(Rw, BODY_C), up: mv(Rw, add(BODY_C, [0, 0, 0.2])) };
+}
+function drawView(cv, i, mode) {
+  const { ctx, w, h } = fitCanvas(cv);
+  ctx.clearRect(0, 0, w, h);
+  if (!D) return;
+  const A = poseWorld(i, "act"), T = poseWorld(i, "tgt");
+  let zg = Infinity; for (const leg of LEGS) zg = Math.min(zg, A.legs[leg].heel[2], A.legs[leg].toe[2]);
+  // side: screen x = forward = -Y (forward to the left, i.e. robot faces left); front: screen x = +X (robot's left on the right)
+  const H = mode === "side" ? p => p[1] : p => p[0];
+  const span = 0.62, sc = Math.min(w / 0.42, h / span), cx = w / 2, gy = h - 18;
+  const hc = (H(A.legs.left.pts[4]) + H(A.legs.right.pts[4])) / 2; // centre on the ankles
+  const P = p => [cx + (H(p) - hc) * sc, gy - (p[2] - zg) * sc];
+  // ground + grid
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  for (let m = -0.2; m <= 0.2001; m += 0.05) { const x = cx + m * sc; ctx.beginPath(); ctx.moveTo(x, 6); ctx.lineTo(x, gy); ctx.stroke(); }
+  ctx.strokeStyle = C.ground; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(6, gy); ctx.lineTo(w - 6, gy); ctx.stroke();
+  // vertical reference through base origin + body up vector
+  const o = P(A.c), up = P(A.up);
+  ctx.setLineDash([3, 4]); ctx.strokeStyle = C.muted; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(o[0], o[1]); ctx.lineTo(o[0], o[1] - 0.2 * sc); ctx.stroke(); ctx.setLineDash([]);
+  ctx.strokeStyle = C.body; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(o[0], o[1]); ctx.lineTo(up[0], up[1]); ctx.stroke();
+  // torso
+  ctx.fillStyle = C.line; ctx.strokeStyle = C.body; ctx.lineWidth = 1.5; ctx.beginPath();
+  hull(A.body.map(P)).forEach((q, k) => { k ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); }); ctx.closePath(); ctx.globalAlpha = 0.5; ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+  // legs: draw far leg first. Side view: robot faces screen-left... both legs overlap; draw right then left.
+  const order = mode === "side" ? ["right", "left"] : ["left", "right"];
+  for (const ghost of [true, false]) for (const leg of order) {
+    const L = (ghost ? T : A).legs[leg], col = leg === "left" ? C.left : C.right;
+    ctx.strokeStyle = col; ctx.globalAlpha = ghost ? C.ghost : 1; ctx.lineWidth = ghost ? 1.5 : 3; ctx.setLineDash(ghost ? [5, 4] : []);
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    const seq = [...L.pts, L.heel, L.toe, L.pts[4]];
+    ctx.beginPath(); seq.forEach((p, k) => { const q = P(p); k ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); }); ctx.stroke();
+    if (!ghost) { ctx.fillStyle = col; for (const p of L.pts.slice(2)) { const q = P(p); ctx.beginPath(); ctx.arc(q[0], q[1], 3, 0, 7); ctx.fill(); } }
+  }
+  ctx.globalAlpha = 1; ctx.setLineDash([]);
+  // tilt label, on a backing so grid lines don't run through it
+  ctx.font = `12px ${C.mono}`;
+  const v = mode === "side" ? D.bodyPitch[i] : D.bodyRoll[i];
+  const lab = [`${mode === "side" ? "pitch" : "roll"} ${fmt(v)}°`, "grid 5 cm"];
+  ctx.fillStyle = C.panel; ctx.fillRect(4, 4, Math.max(...lab.map(s => ctx.measureText(s).width)) + 8, 36);
+  ctx.fillStyle = C.ink; ctx.fillText(lab[0], 8, 18); ctx.fillStyle = C.muted; ctx.fillText(lab[1], 8, 34);
+}
+
+/* ---------- strips ---------- */
+const STRIPS = [];
+function buildStrips() {
+  const host = document.getElementById("strips"); host.innerHTML = ""; STRIPS.length = 0;
+  const S = (title, unit, series, tall, sub) => STRIPS.push({ title, unit, series, tall, sub });
+  S("Pitch: IMU body vs foot in world", "° (+ = back / toe up)", [
+    { y: D.bodyPitch, c: "body", w: 2, label: "body (IMU)" },
+    { y: D.footPitch.left, c: "left", w: 1.6, label: "left foot" },
+    { y: D.footPitch.right, c: "right", w: 1.6, label: "right foot" }], true,
+    "A flat foot reads 0. If the body moves and the foot follows, that motion is not in the joint encoders.");
+  S("Roll: IMU body vs foot in world", "° (+ = leaning left)", [
+    { y: D.bodyRoll, c: "body", w: 2, label: "body (IMU)" },
+    { y: D.footRoll.left, c: "left", w: 1.6, label: "left foot" },
+    { y: D.footRoll.right, c: "right", w: 1.6, label: "right foot" }], false);
+  for (const j of JT) {
+    const ser = [];
+    for (const leg of LEGS) {
+      ser.push({ y: D.tgt[`${leg}_${j}`], c: leg, w: 1.2, dash: true, label: `${leg} target` });
+      ser.push({ y: D.act[`${leg}_${j}`], c: leg, w: 1.8, label: `${leg} actual` });
+    }
+    S(j.replace("_", " "), "°", ser, false);
+  }
+  for (const s of STRIPS) {
+    const el = document.createElement("div"); el.className = "panel strip" + (s.tall ? " tall" : "");
+    el.innerHTML = `<div class="ptitle"><span>${s.title}</span><span>${s.unit}</span></div>` +
+      `<div class="legend">${s.series.map(x => `<span><i class="sw${x.dash ? " dash" : ""}" style="border-color:var(--${x.c === "body" ? "body" : x.c})"></i>${x.label}</span>`).join("")}</div>` +
+      `<canvas aria-label="${s.title} over time"></canvas>` + (s.sub ? `<p class="note">${s.sub}</p>` : "");
+    host.appendChild(el); s.cv = el.querySelector("canvas");
+    // y range: every series, padded, at least 4 degrees tall
+    let lo = Infinity, hi = -Infinity;
+    for (const x of s.series) for (const v of x.y) if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    if (hi - lo < 4) { const m = (hi + lo) / 2; lo = m - 2; hi = m + 2; }
+    const pad = (hi - lo) * 0.08; s.lo = lo - pad; s.hi = hi + pad;
+    attachScrub(s.cv);
+  }
+}
+function niceStep(range, target) {
+  const raw = range / target, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p;
+  return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+}
+const PADL = 40, PADR = 8, PADT = 6, PADB = 18;
+function drawStrip(s, i) {
+  const { ctx, w, h } = fitCanvas(s.cv);
+  ctx.clearRect(0, 0, w, h);
+  const t = D.t, T0 = t[0], T1 = t[D.N - 1] || 1;
+  const X = v => PADL + (v - T0) / (T1 - T0) * (w - PADL - PADR), Y = v => PADT + (s.hi - v) / (s.hi - s.lo) * (h - PADT - PADB);
+  ctx.font = `10.5px ${C.mono}`; ctx.fillStyle = C.muted; ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  const ys = niceStep(s.hi - s.lo, 4);
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let v = Math.ceil(s.lo / ys) * ys; v <= s.hi; v += ys) {
+    const y = Y(v); ctx.beginPath(); ctx.moveTo(PADL, y); ctx.lineTo(w - PADR, y); ctx.stroke();
+    ctx.fillText(Math.abs(v) < 1e-9 ? "0" : +v.toFixed(2) + "", PADL - 4, y);
+  }
+  if (s.lo < 0 && s.hi > 0) { ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(PADL, Y(0)); ctx.lineTo(w - PADR, Y(0)); ctx.stroke(); }
+  const xs = niceStep(T1 - T0, 8);
+  ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.strokeStyle = C.grid;
+  for (let v = Math.ceil(T0 / xs) * xs; v <= T1 + 1e-9; v += xs) {
+    const x = X(v); ctx.beginPath(); ctx.moveTo(x, PADT); ctx.lineTo(x, h - PADB); ctx.stroke();
+    ctx.fillText(+v.toFixed(2) + "s", x, h - PADB + 3);
+  }
+  for (const x of s.series) {
+    ctx.strokeStyle = C[x.c]; ctx.lineWidth = x.w; ctx.setLineDash(x.dash ? [4, 3] : []); ctx.globalAlpha = x.dash ? 0.75 : 1;
+    ctx.beginPath(); let pen = false;
+    for (let k = 0; k < D.N; k++) { const v = x.y[k]; if (!Number.isFinite(v)) { pen = false; continue; }
+      const px = X(t[k]), py = Y(v); pen ? ctx.lineTo(px, py) : ctx.moveTo(px, py); pen = true; }
+    ctx.stroke();
+  }
+  ctx.setLineDash([]); ctx.globalAlpha = 1;
+  // cursor + endpoint dots
+  const cx = X(t[i]); ctx.strokeStyle = C.ink; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx, PADT); ctx.lineTo(cx, h - PADB); ctx.stroke();
+  for (const x of s.series) if (!x.dash && Number.isFinite(x.y[i])) { ctx.fillStyle = C[x.c]; ctx.beginPath(); ctx.arc(cx, Y(x.y[i]), 3, 0, 7); ctx.fill(); }
+}
+function attachScrub(cv) {
+  const go = e => {
+    const r = cv.getBoundingClientRect(), f = (e.clientX - r.left - PADL) / (r.width - PADL - PADR);
+    const tt = D.t[0] + Math.max(0, Math.min(1, f)) * (D.t[D.N - 1] - D.t[0]);
+    let k = 0; while (k < D.N - 1 && D.t[k + 1] <= tt) k++;
+    setFrame(k); stop();
+  };
+  cv.addEventListener("pointerdown", e => { cv.setPointerCapture(e.pointerId); go(e); });
+  cv.addEventListener("pointermove", e => { if (cv.hasPointerCapture(e.pointerId)) go(e); });
+}
+
+/* ---------- readout + summary ---------- */
+const fmt = v => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(1);
+function readout(i) {
+  const rows = [`<tr><th>joint</th><th>L tgt</th><th>L act</th><th>L err</th><th>R tgt</th><th>R act</th><th>R err</th></tr>`];
+  for (const j of JT) {
+    const c = [`<td>${j.replace("_", " ")}</td>`];
+    for (const leg of LEGS) {
+      const tg = D.tgt[`${leg}_${j}`][i], ac = D.act[`${leg}_${j}`][i], e = ac - tg;
+      c.push(`<td>${fmt(tg)}</td><td>${fmt(ac)}</td><td class="${Math.abs(e) > 5 ? "big" : ""}">${fmt(e)}</td>`);
+    }
+    rows.push(`<tr>${c.join("")}</tr>`);
+  }
+  rows.push(`<tr><td>body pitch / roll</td><td colspan="3">${fmt(D.bodyPitch[i])} / ${fmt(D.bodyRoll[i])}</td><td colspan="3"></td></tr>`);
+  rows.push(`<tr><td>foot pitch L / R</td><td colspan="3">${fmt(D.footPitch.left[i])} / ${fmt(D.footPitch.right[i])}</td><td colspan="3"></td></tr>`);
+  document.getElementById("readout").innerHTML = rows.join("");
+  document.getElementById("rowinfo").textContent = `row ${i + 1}/${D.N}` + (D.motion ? ` · mt ${D.motion[i].toFixed(2)}s` : "");
+}
+function median(a) { const s = Array.from(a).filter(Number.isFinite).sort((x, y) => x - y); return s.length ? s[s.length >> 1] : NaN; }
+function range(a) { let lo = Infinity, hi = -Infinity; for (const v of a) if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); } return [lo, hi]; }
+function summary() {
+  const [bl, bh] = range(D.bodyPitch), fl = median(D.footPitch.left), fr = median(D.footPitch.right);
+  const flag = Math.abs(fl) > 1.5 || Math.abs(fr) > 1.5;
+  document.getElementById("chips").innerHTML = [
+    `<span>duration <b>${(D.t[D.N - 1] - D.t[0]).toFixed(2)} s</b></span>`,
+    `<span>rows <b>${D.N}</b></span>`,
+    `<span>body pitch range <b>${fmt(bl)} … ${fmt(bh)}°</b></span>`,
+    `<span class="${flag ? "flag" : ""}">median foot pitch L / R <b>${fmt(fl)} / ${fmt(fr)}°</b></span>`,
+  ].join("");
+}
+
+/* ---------- playback ---------- */
+let frame = 0, playing = false, loop = true, last = 0, tPlay = 0;
+const scrub = document.getElementById("scrub");
+function render() {
+  if (!D) return;
+  drawView(document.getElementById("vside"), frame, "side");
+  drawView(document.getElementById("vfront"), frame, "front");
+  for (const s of STRIPS) drawStrip(s, frame);
+  readout(frame);
+  scrub.value = frame;
+  document.getElementById("tnow").textContent = `${D.t[frame].toFixed(2)} s`;
+}
+function setFrame(k) { frame = Math.max(0, Math.min(D.N - 1, k)); tPlay = D.t[frame]; render(); }
+function tick(ts) {
+  if (!playing) return;
+  const dt = last ? (ts - last) / 1000 : 0; last = ts;
+  tPlay += dt * parseFloat(document.getElementById("speed").value);
+  if (tPlay > D.t[D.N - 1]) { if (loop) tPlay = D.t[0]; else { tPlay = D.t[D.N - 1]; stop(); } }
+  let k = frame; if (D.t[k] > tPlay) k = 0; while (k < D.N - 1 && D.t[k + 1] <= tPlay) k++;
+  frame = k; render();
+  requestAnimationFrame(tick);
+}
+function play() { if (!D) return; playing = true; last = 0; document.getElementById("play").textContent = "Pause"; requestAnimationFrame(tick); }
+function stop() { playing = false; document.getElementById("play").textContent = "Play"; }
+document.getElementById("play").onclick = () => playing ? stop() : play();
+document.getElementById("loop").onclick = e => { loop = !loop; e.target.textContent = loop ? "Loop on" : "Loop off"; e.target.setAttribute("aria-pressed", loop); };
+scrub.oninput = () => { stop(); setFrame(+scrub.value); };
+document.addEventListener("keydown", e => {
+  if (!D || e.target.tagName === "SELECT") return;
+  if (e.key === " " && e.target === document.body) { e.preventDefault(); playing ? stop() : play(); }
+  if (e.key === "ArrowRight") { stop(); setFrame(frame + 1); }
+  if (e.key === "ArrowLeft") { stop(); setFrame(frame - 1); }
+});
+
+/* ---------- loading ---------- */
+function load(text, name) {
+  const errEl = document.getElementById("err");
+  try { D = parseCSV(text, name); } catch (e) { errEl.textContent = `Could not read ${name}: ${e.message}`; errEl.hidden = false; return; }
+  errEl.hidden = true;
+  document.getElementById("fname").textContent = name;
+  scrub.max = D.N - 1; stop(); buildStrips(); summary(); frame = 0; setFrame(0);
+}
+function loadFile(f) { if (!f) return; const r = new FileReader(); r.onload = () => load(r.result, f.name); r.readAsText(f); }
+document.getElementById("file").onchange = e => loadFile(e.target.files[0]);
+const drop = document.getElementById("drop");
+let dragDepth = 0;
+window.addEventListener("dragenter", e => { e.preventDefault(); dragDepth++; drop.hidden = false; });
+window.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; drop.hidden = true; } });
+window.addEventListener("dragover", e => e.preventDefault());
+window.addEventListener("drop", e => { e.preventDefault(); dragDepth = 0; drop.hidden = true; loadFile(e.dataTransfer.files[0]); });
+
+readTheme();
+new MutationObserver(() => { readTheme(); render(); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readTheme(); render(); });
+window.addEventListener("resize", render);
+if (document.fonts) document.fonts.ready.then(() => { readTheme(); render(); });
+load(SAMPLE.csv, SAMPLE.name);
+</script>

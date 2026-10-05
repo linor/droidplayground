@@ -254,6 +254,12 @@ class RobotConfig:
     # joints list above -- and lets --config alone fully describe a robot.
     imu_i2c_address: Optional[int] = None
     imu_axis_remap: Optional[list] = None  # [[chip_axis_index, sign], ...] for robot [X, Y, Z]
+    # Mounting tilt correction, see imu_sensor.mount_correction_matrix:
+    # degrees ADDED to the reported pitch (+ = back) and roll (+ = left).
+    imu_mount_pitch_deg: float = 0.0
+    imu_mount_roll_deg: float = 0.0
+    # Abort when the filtered body tilt (from vertical) exceeds this.
+    max_tilt_deg: float = 40.0
 
     @staticmethod
     def load(path: Path) -> "RobotConfig":
@@ -278,6 +284,9 @@ class RobotConfig:
             joints=joints,
             imu_i2c_address=raw.get("imu_i2c_address"),
             imu_axis_remap=raw.get("imu_axis_remap"),
+            imu_mount_pitch_deg=raw.get("imu_mount_pitch_deg", 0.0),
+            imu_mount_roll_deg=raw.get("imu_mount_roll_deg", 0.0),
+            max_tilt_deg=raw.get("max_tilt_deg", 40.0),
         )
 
     @property
@@ -783,6 +792,12 @@ class JointLimitExceeded(SafetyAbort):
         super().__init__(f"Commanded target outside joint limits: {'; '.join(parts)}")
 
 
+class TiltExceeded(SafetyAbort):
+    def __init__(self, tilt_deg: float, limit_deg: float):
+        self.tilt_deg = tilt_deg
+        super().__init__(f"Body tilt {tilt_deg:.1f} deg exceeds max_tilt_deg {limit_deg:.1f} -- robot is falling")
+
+
 class MotorErrorDetected(SafetyAbort):
     def __init__(self, joint_name: str, error_flag):
         self.joint_name = joint_name
@@ -1024,7 +1039,11 @@ class Deployment:
         self.imu = imu_sensor.ImuSensor(
             address=robot_cfg.imu_i2c_address,
             axis_remap=robot_cfg.imu_axis_remap or imu_sensor.AXIS_REMAP,
+            mount_pitch_deg=robot_cfg.imu_mount_pitch_deg,
+            mount_roll_deg=robot_cfg.imu_mount_roll_deg,
         )
+        self.logger.info("IMU mount correction: pitch %+.2f deg, roll %+.2f deg",
+                         robot_cfg.imu_mount_pitch_deg, robot_cfg.imu_mount_roll_deg)
         if robot_cfg.imu_axis_remap:
             self.logger.info(
                 "IMU initialized (axis_remap=%s, from robot_cfg -- verification "
@@ -1357,6 +1376,14 @@ class Deployment:
 
                 bus_start = time.perf_counter()
                 try:
+                    # Fall guard on the gyro-filtered gravity estimate (the one
+                    # the policy sees), added 2026-10-05 when imu_sensor's
+                    # accel/gyro consistency check was loosened -- that check
+                    # had been the only thing stopping a fall. Real runs peak
+                    # at ~29 deg (hanging back in the rope).
+                    tilt_deg = math.degrees(math.acos(max(-1.0, min(1.0, -gravity_dir[2]))))
+                    if tilt_deg > self.robot_cfg.max_tilt_deg:
+                        raise TiltExceeded(tilt_deg, self.robot_cfg.max_tilt_deg)
                     self._validate_targets_all(targets, self.robot_cfg.max_step_deg)
                     new_readings = self._send_targets_all(targets)
                     check_motor_safety(new_readings, self.robot_cfg.motor_temp_limit_c)

@@ -1,0 +1,48 @@
+{
+  "_comment": "Open-loop hold for the 2026-10-04 ankle balance sweep: standing pose (pitch -16, knee 10) with left ankle 3 deg (right mirrored). Sim reference: tips over backward from ankle +2 upward, settles at -2..+1. Run with --config robot_config_qmini_standing.json --open-loop-ref; the rope is a catch only.",
+  "degrees": true,
+  "joint_order": [
+    "left_yaw",
+    "left_roll",
+    "left_pitch",
+    "left_knee",
+    "left_ankle",
+    "right_yaw",
+    "right_roll",
+    "right_pitch",
+    "right_knee",
+    "right_ankle"
+  ],
+  "keyframes": [
+    [
+      0.0,
+      [
+        0.0,
+        0.0,
+        -16.0,
+        10.0,
+        3.0,
+        0.0,
+        0.0,
+        16.0,
+        -10.0,
+        -3.0
+      ]
+    ],
+    [
+      1.0,
+      [
+        0.0,
+        0.0,
+        -16.0,
+        10.0,
+        3.0,
+        0.0,
+        0.0,
+        16.0,
+        -10.0,
+        -3.0
+      ]
+    ]
+  ]
+}

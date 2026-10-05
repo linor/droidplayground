@@ -1,0 +1,29 @@
+{
+  "obs_dim": 28,
+  "action_dim": 10,
+  "joint_order": [
+    "left_hip_yaw",
+    "right_hip_yaw",
+    "left_hip_roll",
+    "right_hip_roll",
+    "left_hip_pitch",
+    "right_hip_pitch",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle"
+  ],
+  "obs_terms": [
+    "joint_pos",
+    "joint_vel",
+    "imu_gravity",
+    "imu_ang_vel",
+    "phase_sin",
+    "phase_cos"
+  ],
+  "action_scale": 0.5,
+  "action_smoothing": 1.0,
+  "source_checkpoint": "../../logs/rsl_rl/qmini-leg/2026-10-04_13-32-56/model_159996.pt",
+  "obs_normalization_baked_in": true,
+  "policy_sha256": "e173aa4ebb34c55bb56f0c2ca2896ff91039417960cee36070f0ab16b19a02a9"
+}

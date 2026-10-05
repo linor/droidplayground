@@ -669,6 +669,101 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     push_interval_range_s: tuple[float, float] = (1000.0, 1000.0)
     push_velocity_range_mps: tuple[float, float] = (-0.4, 0.4)
 
+    # --- startup support-then-release (rope simulation) -----------------
+    # Added 2026-09-29. Real deployment currently ALWAYS starts with the
+    # robot held up by a safety rope through the startup pose and into the
+    # first second or two of stepping, then the rope is deliberately
+    # loosened -- and per direct user testing, the robot genuinely falls
+    # backward at the startup pose whenever the rope is slack (confirmed
+    # by holding the pose with the rope loose, no policy running -- this
+    # matches the independent finding that the current anchor pose pins at
+    # the tilt-termination boundary when held statically, see
+    # check_static_pose_stability.py's 2026-09-25 results). Once the rope
+    # is let go on hardware, video + control_loop CSVs show ~2x the normal
+    # commanded step size for several seconds (mean_maxstep 3.2-3.6
+    # deg/step vs 0.8-1.9 deg/step in calmer windows) -- the policy visibly
+    # struggling with a transition it has NEVER experienced, since this is
+    # a single large step-change in effective external support, not the
+    # small periodic velocity kicks push_velocity_range_mps applies (and
+    # which have twice failed to train successfully regardless, see
+    # push_interval_range_s's own history -- a different disturbance
+    # PROFILE, not just a retry of the same one).
+    #
+    # Simulates the rope as a sustained upward external force on base_link
+    # (NOT a full unilateral rope-distance-constraint -- that would need
+    # its own physics and this is meant to be a tractable first attempt,
+    # not a literal rope model) applied from episode start, held for a
+    # per-env randomized duration, then dropped to exactly zero for the
+    # rest of the episode -- matching "rope tight through startup, then
+    # released once and not re-tightened" rather than push's repeating
+    # schedule. See _pre_physics_step's application and
+    # cfg.startup_support_force_frac below.
+    #
+    # UNTUNED starting guess: 0.5-2.0s covers both "released almost
+    # immediately" and "held through ~1 gait cycle" -- real durations
+    # varied a lot across the 2026-09-29 hardware attempts and weren't
+    # precisely timed. Resume (not fresh start) is NOT expected to work
+    # cleanly here despite being additive-only, for the SAME reason
+    # push_interval_range_s's point 1 gives: an already-converged, low-
+    # entropy policy meeting genuinely novel starting dynamics (the first
+    # ~1s of EVERY episode now begins differently than anything it was
+    # ever trained on) is closer to "new disturbance on a converged
+    # policy" than "new disturbance during exploration" -- try fresh
+    # start first; if that repeats push's OWN fresh-start failure (blocks
+    # discovering stepping at all, since standing supported doing nothing
+    # is safer when unsupported balance is suddenly also required from
+    # step 0), fall back to resume and watch closely.
+    # DISABLED (0.5,2.0 -> 0.0,0.0) on 2026-09-30, resuming from pitchstep5
+    # (which never trained with this active) to test the roll margin
+    # widening above in isolation -- support_end_step becomes 0 for every
+    # env, so still_supported (episode_length_buf < support_end_step) is
+    # never true and the applied force is always zero. Re-enable once the
+    # margin-only change is confirmed safe on hardware; don't stack this
+    # back in on the same run as an untested margin change, or a hardware
+    # result won't tell us which one mattered. See
+    # startup_support_force_frac's comment for the full mechanism history
+    # (0.9 fresh-start failed outright; 0.7 resume kept stepping but
+    # regressed hip-roll margin -- the thing just re-widened above).
+    startup_support_duration_range_s: tuple[float, float] = (0.0, 0.0)
+
+    # Fraction of the robot's own current (possibly base_mass_randomization
+    # -scaled) weight counteracted by the upward support force while
+    # active. 0.9, not 1.0 -- a real taut rope still lets the robot's own
+    # controller do essentially all the balancing work while it's holding
+    # roughly level (matching "the body was relatively flat because the
+    # rope was holding the body up" -- user, 2026-09-29), it doesn't
+    # perfectly zero gravity; leaving 10% real weight on the legs keeps
+    # ground contact/stepping meaningful throughout the supported phase
+    # rather than having the robot dangle just clear of the floor.
+    #
+    # LOWERED 0.9 -> 0.7 on 2026-09-29 (run 2026-09-29_17-03-52, fresh
+    # start, iteration 14254/40000, stopped). RESULT: this mechanism, at
+    # full strength from iteration 0, reproduced the exact fragility this
+    # field's own comment above warned about -- NOT the "never discovers
+    # stepping" failure (foot_swing_reward actually reached ~2.3-2.5,
+    # above the normal ~1.5 ceiling, and held there iterations ~1500-3500)
+    # but a LATER collapse: a visible crisis around iteration 3500-4000
+    # (episode_length dip, a second fall_rate spike, a roll_deg spike),
+    # coming out the other side onto the standing-still local optimum
+    # instead -- foot_swing_reward crashed to ~0.16 and sat there flat for
+    # the next 10000+ iterations with noise_std already down at ~0.08-0.1
+    # (left/right_foot_clearance_cm -6.7/-2.5, i.e. not lifting at all).
+    # tracking/startup_support_active_frac read 0.13 at the stop point,
+    # matching the expected steady-state fraction (mean duration ~1.25s /
+    # ~9s episode) -- the mechanism itself was working as designed, the
+    # DISTURBANCE MAGNITUDE was plausibly just too severe for a policy
+    # whose exploration had already mostly shut off by the time the
+    # crisis hit. Dropped to 0.7 as a hedge alongside switching from fresh
+    # start to RESUME (see this field's own comment on trying fresh start
+    # first, then falling back to resume) -- both prior full-strength (0.9)
+    # attempts at introducing a genuinely new disturbance in this project
+    # (this one, and push_interval_range_s's original fresh-start/resume
+    # pair) only ever tried max strength from the start; a gentler version
+    # is a real, untried lever, not just a retry. Watch foot_swing_reward
+    # and left/right_foot_clearance_cm specifically for the same collapse
+    # signature if this also fails.
+    startup_support_force_frac: float = 0.7
+
     # Weight on the action-rate penalty in _get_rewards (-weight *
     # sum((action_t - action_{t-1})**2)). 0.0 = off (previous behavior).
     # Start small (e.g. 0.01-0.05) and increase if deployed targets are
@@ -1603,9 +1698,131 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # fight genuine turning later if a nonzero commanded yaw rate is ever
     # added (the margin would need to move with the command at that
     # point, not just wrap around a fixed reset heading).
+    #
+    # DISABLED (1.0 -> 0.0) on 2026-10-02 for a fresh start, as part of a
+    # broader pivot after THREE consecutive fresh-start attempts all hit
+    # the same collapse (foot_swing_reward climbs to a real peak around
+    # iteration ~3000 then crashes to ~0 and stays there) regardless of
+    # which ONE term was toggled (target_limit_margin_deg roll 13 vs 3,
+    # position_deviation_penalty_weight 1.0 vs 0.0). Checked what the
+    # ORIGINAL successful fresh start (2026-09-08, see the stepping-
+    # breakthrough notes) actually had: tracking_linear_penalty_weight=0.2,
+    # heading_reward_weight=2.5, push/position disabled -- NO
+    # target_limit_penalty, step_limit_penalty, heading_deviation_penalty,
+    # or position_deviation_penalty at all. Every one of those was added
+    # LATER and has only ever been validated via resume onto an
+    # already-stepping policy, never through fresh-start discovery --
+    # disabling one at a time didn't find a single culprit, so trying all
+    # four at once (this field, target_limit_penalty_weight,
+    # step_limit_penalty_weight, and position_deviation_penalty_weight
+    # already at 0) to see if that reproduces reliable, HELD stepping like
+    # the original recipe did. If it does, reintroduce each one at a time
+    # via resume exactly as already validated individually in the past.
+    # RE-ENABLED (0.0 -> 1.0) on 2026-10-03, resuming from the
+    # 2026-10-02_22-08-07 fresh start (model_39999, foot_swing_reward held
+    # ~1.2-1.3 through all 40000 iterations with all four post-breakthrough
+    # terms off -- see position_deviation_penalty_weight/target_limit_
+    # penalty_weight/step_limit_penalty_weight for the matching re-enables
+    # and the full fresh-start saga). Back to its original validated
+    # value, same as every prior successful reintroduction of this term.
     heading_deviation_penalty_weight: float = 1.0
     heading_deviation_margin_deg: float = 15.0
     heading_deviation_penalty_max_deg: float = 60.0
+
+    # --- stay in place, part 2: ABSOLUTE position (same fix as heading's
+    # part 2, applied to translation) -----------------------------------
+    # Added 2026-09-29. position_reward above only ever tracked base
+    # VELOCITY -- same rate-only gap heading_deviation_penalty was built
+    # to close for yaw (see that field's comment: "heading_reward above
+    # only ever tracks yaw RATE -- nothing anywhere tracks or restores
+    # absolute heading"). Identical problem existed for position and was
+    # never fixed: position_reward_weight raised 0.0->1.0 on 2026-09-25
+    # (hardware showed 2026-09-25 rate-limited runs now ending almost only
+    # because the robot walks off the mat/into the support frame, not from
+    # faults) had NO effect after ~40000 iterations -- position/reward
+    # plateaued at 0.55-0.59 within the first 7000 and never moved.
+    # compare_policies_isaaclab.py's --dump-heights was extended with
+    # root_lin_vel_b to find out why: base x-velocity averages +23cm/s
+    # while the left foot swings and -20cm/s while the right foot swings
+    # (vs -0.3cm/s in double support) -- a large, mostly self-cancelling
+    # swing-phase surge the reference motion itself requires, not a
+    # mistake. Per-cycle net x displacement across all envs/cycles: mean
+    # +1.33cm (~0.6cm/s of REAL residual drift), std 4.21cm of cycle-to-
+    # cycle noise -- a per-step VELOCITY reward pays for the full +-20cm/s
+    # surge every step even though ~95% of it cancels, so it can't resolve
+    # the much smaller residual that's the actual problem. See
+    # position_reward_weight's own comment for the full writeup (reverted
+    # back to 0.0 there).
+    #
+    # This term is the position equivalent of heading_deviation_penalty:
+    # tracks ACCUMULATED xy displacement from this env's own reset-time
+    # position (self._reset_pos_xy, captured in _reset_idx), not velocity
+    # -- structurally blind to a within-cycle oscillation that returns
+    # close to its start point every ~1.1s, and only sees genuine
+    # sustained drift. Margined/linear/capped, same shape and same
+    # reasoning as heading_deviation_penalty (non-vanishing gradient from
+    # the first cm over the margin; capped so a bad early-training
+    # episode's random-walk drift can't blow up the value function the
+    # same way an uncapped target overshoot once did -- this is exactly
+    # the failure mode position_reward's OWN original anchor-based version
+    # hit before it was changed to velocity in the first place, i.e. the
+    # mechanism this field's history warns about; the cap is what's
+    # supposed to prevent a repeat).
+    #
+    # UNTUNED starting guess: margin=8cm is roughly one cycle's typical
+    # residual (mean 1.33cm, but real per-cycle spread std=4.21cm, so 8cm
+    # leaves room for ordinary cycle-to-cycle sway without penalizing it);
+    # max=40cm (5x margin) bounds the penalty well before it could
+    # dominate; weight=1.0 matches heading_deviation_penalty_weight's
+    # starting point. Resume, not fresh start -- new additive term, same
+    # category of change as heading_deviation_penalty's own introduction.
+    # Watch position/deviation_cm in tensorboard (population value) and,
+    # more importantly, actual hardware run duration/how far it walks
+    # before hitting the mat edge or a wall -- that's what this term is
+    # ultimately trying to fix and the sim metric is a proxy for it.
+    #
+    # DISABLED (1.0 -> 0.0) on 2026-10-02 for a fresh start specifically.
+    # Like this run was originally validated only via resume (see comment
+    # above), never through fresh-start discovery. Two consecutive fresh
+    # starts (target_limit_margin_deg roll=13, then roll=3 with this term
+    # still at weight=1.0) BOTH showed the same signature: foot_swing_
+    # reward climbs to a genuinely good peak (0.47, then 1.5 -- actually
+    # above the normal ~0.7-1.3 healthy-fresh-start benchmark the SECOND
+    # time) around iteration ~3000, then collapses to ~0 within a few
+    # hundred iterations and stays there for 4000+ iterations after.
+    # fall_rate does NOT spike back up at the collapse point (it's already
+    # near 0 and stays there right through it) -- ruling out "it kept
+    # falling while trying to step", and pointing at "standing still
+    # became relatively safer" instead. Since reverting the roll margin
+    # (13->3, matching the ORIGINAL successful fresh-start recipe exactly)
+    # did NOT fix this -- if anything the peak got higher before still
+    # collapsing -- the margin was likely not the (sole) cause, which
+    # reopens the question of what else differs from that original
+    # recipe. This term is the one other always-on, per-step, margined
+    # penalty added since (2026-09-29) that has never been tested through
+    # fresh-start discovery either, and it has a plausible mechanism here:
+    # real stepping causes genuine transient base displacement (measured
+    # ~20cm/s swing-phase surges elsewhere in this project), so as the
+    # policy was first discovering real lift around iteration 3000, it may
+    # have started crossing the 8cm margin often enough that retreating to
+    # minimal motion looked like the better trade -- timing matches.
+    # UNCONFIRMED, same caveat as the margin hypothesis before it. If
+    # disabling this ALSO doesn't fix it, the next suspects are
+    # heading_deviation_penalty (same category, never fresh-start-tested
+    # either) or something not yet identified. Re-enable via resume once
+    # this fresh start finds genuine, HELD stepping -- same pattern as
+    # every other tightening in this project's history.
+    # RE-ENABLED (0.0 -> 1.0) on 2026-10-03, resuming from the
+    # 2026-10-02_22-08-07 fresh start together with heading_deviation_
+    # penalty_weight/target_limit_penalty_weight/step_limit_penalty_weight
+    # -- all four reintroduced in one resume rather than one at a time,
+    # since each was already individually validated via resume before and
+    # this checkpoint's noise_std never collapsed (still ~0.48-0.5 after
+    # 40000 iterations, unlike the low-entropy pitchstep5 lineage), so it
+    # should have real room left to adapt rather than being brittle.
+    position_deviation_penalty_weight: float = 1.0
+    position_deviation_margin_m: float = 0.08
+    position_deviation_penalty_max_m: float = 0.40
 
     # Terminate the episode once the base has tipped this far from
     # upright, measured as projected_gravity_b's z component (-1.0 =
@@ -1756,6 +1973,25 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # Escalate in the same stages that worked before (weight 15 + linear
     # 0.5, then linear 1.0), checking target_violation_rate AND
     # foot_swing_reward after each; do NOT jump straight to 15 + 1.0.
+    #
+    # DISABLED (15.0 -> 0.0) on 2026-10-02 for a fresh start -- see
+    # heading_deviation_penalty_weight's comment for the full reasoning
+    # (one of four post-breakthrough penalty terms disabled together,
+    # none of which existed in the original 2026-09-08 successful fresh
+    # start, after toggling them one at a time across three attempts
+    # failed to find a single culprit for the same foot_swing_reward
+    # spike-then-collapse pattern). Re-enable via resume, same
+    # weight=15/linear_coef=0.5 staged escalation this comment already
+    # describes, once this fresh start finds genuine held stepping.
+    # RE-ENABLED (0.0 -> 15.0) on 2026-10-03, resuming from the
+    # 2026-10-02_22-08-07 fresh start, same batch of four re-enables as
+    # heading_deviation_penalty_weight's comment describes. Back to the
+    # ORIGINAL weight=15/linear_coef=0.5 combo (not the later roll-margin
+    # widening saga's 8/11/13 -- target_limit_margin_deg is back at a
+    # uniform 3.0 for every joint, see that field's own comment) --
+    # deliberately not re-litigating the roll-margin question in the same
+    # resume as everything else; revisit that separately once this new
+    # lineage has a genuinely good baseline to diagnose from.
     target_limit_penalty_weight: float = 15.0
 
     # Degrees of buffer inside each hard limit before target_limit_penalty
@@ -1803,9 +2039,68 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # (yaw3: -14.8..-15.6), i.e. 2-3deg from the +-15 limit and well inside
     # the 7deg zone this margin opened -- helped, not solved. 11deg starts
     # the penalty at +-4deg, still above the ~2.7deg reference amplitude.
+    # At 11deg this held up well: pitchstep5 (the checkpoint built on this
+    # margin) went 0/10+ on roll-limit aborts across every 2026-09-25 and
+    # 2026-09-28/29 hardware batch, target consistently -8..-13deg.
+    #
+    # 2026-09-30: widened again 11.0 -> 13.0, NOT because pitchstep5 itself
+    # showed a roll problem, but as a hedge/backstop before resuming
+    # further work on it. deploy_bundle_2026-09-30_support_resume (the
+    # startup_support-trained checkpoint built on TOP of this same 11deg
+    # margin) failed 4/4 real hardware attempts with left/right_hip_roll
+    # violations up to -20.87deg -- a genuine policy regression, confirmed
+    # by replaying those same real observations through pitchstep5 (stayed
+    # inside +-15deg in 3/4 cases on the identical inputs), invisible to
+    # every sim metric checked beforehand (target_violation_rate was
+    # IDENTICAL between the two checkpoints, roll tracking error looked
+    # BETTER on the checkpoint that then failed on hardware). That result
+    # means margin=11 is not necessarily enough buffer once a future
+    # change (retrying startup_support, or anything else) puts renewed
+    # pressure on this specific joint -- widening now, on the known-good
+    # pitchstep5 baseline, is insurance against a repeat, not a fix for a
+    # currently-observed failure. 13deg starts the penalty at +-2deg,
+    # getting close to the reference's own ~2.7deg roll amplitude -- this
+    # is deliberately NOT pushed further than that in this step (e.g. to
+    # 14-15deg) specifically to avoid the over-constraining mistake this
+    # field's own history warns about elsewhere (broad tracking tightening
+    # suppressing genuine stepping). Resume, not fresh start, from
+    # pitchstep5 (NOT support_resume) -- same category of change as every
+    # prior margin widening.
+    #
+    # REVERTED roll 13.0 -> 3.0 on 2026-10-02 for a fresh start specifically
+    # (matching every other joint -- the value the ORIGINAL successful
+    # fresh start in this project used, before this dict's per-joint
+    # overrides existed at all). Two consecutive fresh-start attempts at
+    # step_limit_penalty_weight=20 (margin=13 active both times) failed --
+    # first catastrophically (couldn't balance at all, see that field's
+    # own comment), then after reverting the weight to 10, a SECOND,
+    # more familiar failure: real balance was found (episode_length ->
+    # ~450, fall_rate -> 0 by iteration ~3000) but foot_swing_reward
+    # spiked then crashed to ~0 and stayed there 5000+ iterations
+    # (iteration 8178 check: still 0.0092) -- the classic standing-still
+    # local optimum. step_limit_penalty_weight was already back at its
+    # only-ever-validated value, leaving margin=13 as the one remaining
+    # variable different from every PRIOR successful fresh start in this
+    # project's history. At margin=13 the penalty starts at +-2deg,
+    # INSIDE the reference's own ~2.7deg normal roll swing -- i.e.
+    # ordinary, necessary roll motion was incurring some penalty from
+    # iteration 0, before the policy had any chance to learn useful roll
+    # control. Every margin value above 3.0 (8, 11, 13) has, without
+    # exception, only ever been introduced via RESUME onto an
+    # already-stepping policy -- never through a fresh start -- matching
+    # this project's own repeated lesson (tracking_linear_penalty_weight's
+    # history, push_interval_range_s's history, startup_support's
+    # history): a broad-enough constraint active from iteration 0 can
+    # make "don't move much" look safer than ever discovering the real
+    # skill, regardless of how large the reward for that skill is. Fresh
+    # start again with roll=3.0 (all joints equal, matching the original
+    # recipe); once this one finds genuine stepping, reintroduce roll=13
+    # the same way every other tightening in this project has actually
+    # worked -- as a resume on top of a confirmed-stepping checkpoint, not
+    # from iteration 0 again.
     target_limit_margin_deg: dict = {
         "yaw": 3.0,
-        "roll": 11.0,
+        "roll": 13.0,
         "pitch": 3.0,
         "knee": 3.0,
         "ankle": 3.0,
@@ -1920,6 +2215,75 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # satisfy by smoothing the snap, not by giving up stepping. UNTUNED:
     # watch foot_swing_reward, and tracking/step_over_rate /
     # mean_max_step_deg (should fall). If they barely move, raise to ~20.
+    #
+    # RAISED 10.0 -> 20.0 on 2026-10-01, following exactly that pre-
+    # committed plan -- p99_step_deg didn't barely move, it nearly doubled
+    # across essentially every resume since this field was introduced
+    # (resume_roll6_ankle3 6.18 -> yaw3 6.77 -> roll_margin8 7.60 ->
+    # roll11_pitchstep2 8.61 -> pitchstep5 9.42 -> position_deviation
+    # 10.01 -> support_resume 9.89 -> target_limit_margin_deg roll 13
+    # 11.46), regardless of what the specific change was. User's own
+    # observation, 2026-10-01: every change so far has made hardware
+    # behavior worse alongside this number climbing -- matches
+    # support_resume's real 4/4 hardware failure and the roll-margin-13
+    # checkpoint's own worse-than-pitchstep5 replay result, both at the
+    # high end of this trend. Resume from pitchstep5 (not rollmargin13 or
+    # support_resume -- avoid stacking on an already-once-resumed,
+    # not-yet-hardware-validated checkpoint), with target_limit_margin_deg
+    # roll=13 (see that field's own 2026-09-30 comment) ALSO still active
+    # -- not a clean single-variable test against the margin change, but
+    # training runs are ~10-13h each and both changes are independently
+    # well-motivated, so testing them together here is a deliberate
+    # tradeoff, not an oversight. Watch p99_step_deg specifically (should
+    # fall back toward ~9 or lower) and re-run the same 4-attempt
+    # open-loop replay this whole investigation has been using before
+    # trusting any dashboard recovery.
+    #
+    # REVERTED 20.0 -> 10.0 on 2026-10-02. The steplimit20 resume (above)
+    # did bring p99_step_deg down to 6.14 -- the best in this whole
+    # lineage -- but check_roll_regression.py showed it was the WORST of
+    # three checkpoints on real hardware-replay roll safety despite that,
+    # so a FRESH START was tried next with weight=20 kept, specifically to
+    # test whether training it in from scratch (rather than as a late
+    # perturbation on an already-converged policy) would avoid that
+    # regression. RESULT: much worse failure than expected, stopped at
+    # iteration 9579/40000. mean_episode_length pinned near 11 steps the
+    # entire time (every healthy fresh start in this project reaches
+    # ~450-500 within 1500-2500 iterations), fall_rate still ~8%/step,
+    # orientation/reward only 0.58, gravity_y 0.26 (matches the real
+    # hardware-measured ~12deg backward tip at the unsupported startup
+    # pose), knee tracking error 33-35deg (actual knees sitting near flat
+    # regardless of what the reference wanted) -- not "hasn't discovered
+    # stepping yet", genuinely failing to balance at all. target_limit_
+    # penalty (0.81) and step_limit_penalty (1.83) were both far above any
+    # steady-state value seen elsewhere in this project -- plausible
+    # mechanism: early random exploration produces large, erratic
+    # corrective actions by nature, and weight=20 (stacked with the also-
+    # widened target_limit_margin_deg roll=13, which starts penalizing
+    # sooner too) may punish the correction needed to catch a stumble
+    # almost as hard as the stumble itself, a trap distinct from (worse
+    # than) the "safe standing" local optimum this project has hit before.
+    # Reverted to the only value ever actually validated (10.0, resume-
+    # only history above) rather than splitting the difference -- the
+    # failure was severe enough not to guess at a middle ground.
+    # target_limit_margin_deg roll=13 left UNCHANGED for the retry (see
+    # that field's own comment) -- narrower constraint, only bites near
+    # the hard limit specifically, less likely to be what blocked basic
+    # balance across the board. If this fresh start ALSO fails the same
+    # way, margin=13 becomes the next suspect.
+    # DISABLED (10.0 -> 0.0) on 2026-10-02 for a fresh start -- see
+    # heading_deviation_penalty_weight's comment for the full reasoning
+    # (one of four post-breakthrough penalty terms disabled together,
+    # none present in the original successful fresh start). Re-enable via
+    # resume at 10.0 once this fresh start finds genuine held stepping --
+    # that value has a real, if resume-only, track record; don't jump
+    # back to 20.0 (see this field's own comment above for why that
+    # failed even harder).
+    # RE-ENABLED (0.0 -> 10.0) on 2026-10-03, resuming from the
+    # 2026-10-02_22-08-07 fresh start, same batch of four re-enables as
+    # heading_deviation_penalty_weight's comment describes. Back to 10.0,
+    # not the 20.0 that caused the catastrophic fresh-start failure above
+    # -- 10.0 is the only value with an actual resume track record.
     step_limit_penalty_weight: float = 10.0
     step_limit_threshold_deg: float = 4.0
     step_limit_penalty_max_excess_deg: float = 30.0
@@ -2772,6 +3136,16 @@ class QminiLegEnv(DirectRLEnv):
             dtype=torch.float32,
         )
 
+        # Per-env world-frame xy position captured at each env's last
+        # reset -- see cfg.position_deviation_penalty_weight's comment.
+        # Same placeholder-until-first-reset pattern as self._reset_yaw
+        # just above.
+        self._reset_pos_xy = torch.zeros(
+            self.num_envs, 2,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
         # NOTE on ordering: like self.motion_time above, these are created
         # AFTER super().__init__() returns, but _reset_idx() (which uses
         # them) is written assuming they already exist. This only works if
@@ -2874,6 +3248,18 @@ class QminiLegEnv(DirectRLEnv):
         # shared global on/off window.
         self._steps_since_push = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # --- startup support-then-release (rope simulation) ------------------
+        # See cfg.startup_support_duration_range_s/startup_support_force_frac.
+        # Per-env step count at which support drops to zero this episode --
+        # resampled for real in _reset_idx (unlike push's countdown above,
+        # this MUST resample every reset, not carry over, since every
+        # episode needs its own fresh "supported for the first bit" start).
+        # Zero here is just a safe placeholder before the first reset.
+        self._support_end_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # Set for real every _pre_physics_step; this is just a safe
+        # placeholder in case _get_rewards' logging ever runs first.
+        self._support_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         # --- default (unrandomized) actuator gains, captured once so
         # per-episode randomization always scales from the same baseline
         # instead of compounding across resets. Verify these tensor shapes
@@ -2956,6 +3342,33 @@ class QminiLegEnv(DirectRLEnv):
             self._apply_random_push(due)
             self._resample_push_countdown(due)
             self._steps_since_push[due] = 0
+
+        # --- startup support-then-release (rope simulation) ------------------
+        # See cfg.startup_support_duration_range_s/startup_support_force_frac.
+        # Called every step (not just at the on/off transition) because
+        # set_external_force_and_torque's buffer holds whatever was last
+        # written until overwritten -- the zero-force call once support
+        # ends is what actually disables it, not a one-time "turn it off"
+        # event. Applied at base_link's own origin as a pure vertical
+        # force (no torque, no offset toward the real handle's mount
+        # point) -- a deliberate simplification, not a claim this is where
+        # the real rope attaches.
+        # Stored on self (not just a local) so _get_rewards' logging can
+        # read it too, for tracking/startup_support_active_frac below.
+        self._support_active = self.episode_length_buf < self._support_end_step
+        still_supported = self._support_active
+        total_mass_kg = self.robot.root_physx_view.get_masses().sum(dim=1).to(self.device)
+        support_newtons = torch.where(
+            still_supported,
+            self.cfg.startup_support_force_frac * total_mass_kg * 9.81,
+            torch.zeros_like(total_mass_kg),
+        )
+        support_forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        support_forces[:, 0, 2] = support_newtons
+        support_torques = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.robot.set_external_force_and_torque(
+            support_forces, support_torques, body_ids=[self._base_body_idx], is_global=True,
+        )
 
     def _apply_random_push(self, env_ids: torch.Tensor):
         push_vel = sample_uniform(
@@ -3458,6 +3871,20 @@ class QminiLegEnv(DirectRLEnv):
         heading_deviation_over = torch.clamp(heading_deviation_over, max=heading_deviation_max_rad)
         heading_deviation_penalty = self.cfg.heading_deviation_penalty_weight * heading_deviation_over
 
+        # ABSOLUTE position tracking -- see cfg.position_deviation_penalty_weight's
+        # comment. Same margin/linear/capped pattern as heading_deviation_penalty
+        # just above, applied to xy displacement instead of yaw.
+        position_deviation_m = torch.norm(
+            self.robot.data.root_pos_w[:, :2] - self._reset_pos_xy, dim=1,
+        )
+        position_deviation_over = torch.clamp(
+            position_deviation_m - self.cfg.position_deviation_margin_m, min=0.0
+        )
+        position_deviation_over = torch.clamp(
+            position_deviation_over, max=self.cfg.position_deviation_penalty_max_m
+        )
+        position_deviation_penalty = self.cfg.position_deviation_penalty_weight * position_deviation_over
+
         # Same push-recovery cooldown as foot_swing_reward above, and for
         # the same underlying reason: a push forces real base velocity/yaw
         # rate that the policy didn't choose and can't avoid, so scoring it
@@ -3471,6 +3898,9 @@ class QminiLegEnv(DirectRLEnv):
         # behavior change.
         position_reward = torch.where(in_push_cooldown, torch.zeros_like(position_reward), position_reward)
         heading_reward = torch.where(in_push_cooldown, torch.zeros_like(heading_reward), heading_reward)
+        position_deviation_penalty = torch.where(
+            in_push_cooldown, torch.zeros_like(position_deviation_penalty), position_deviation_penalty
+        )
         heading_deviation_penalty = torch.where(
             in_push_cooldown, torch.zeros_like(heading_deviation_penalty), heading_deviation_penalty
         )
@@ -3498,6 +3928,7 @@ class QminiLegEnv(DirectRLEnv):
             - joint_limit_penalty
             - target_limit_penalty
             - heading_deviation_penalty
+            - position_deviation_penalty
             - foot_overswing_penalty
             - step_limit_penalty
         )
@@ -3540,6 +3971,17 @@ class QminiLegEnv(DirectRLEnv):
             "orientation/gravity_z": projected_gravity[0, 2],
             "position/reward": position_reward.mean(),
             "position/base_speed_cmps": torch.sqrt(base_vel_error[0]) * 100.0,
+            "position/deviation_penalty": position_deviation_penalty.mean(),
+            "position/deviation_cm": position_deviation_m.mean() * 100.0,
+            # Fraction of envs still under startup support THIS step -- see
+            # cfg.startup_support_duration_range_s's comment. Should track
+            # roughly (mean duration / episode_length_s) at steady state;
+            # watch this alongside foot_swing_reward/fall_rate right after
+            # each env's own support ends (not directly loggable per-env
+            # here, but a sudden foot_swing_reward dip population-wide
+            # around when most envs' support has just ended would be the
+            # signature of the same "struggles right after release" hardware showed).
+            "tracking/startup_support_active_frac": self._support_active.float().mean(),
             "heading/reward": heading_reward.mean(),
             "heading/yaw_rate_dps": torch.rad2deg(torch.sqrt(yaw_rate_error[0])),
             "heading/deviation_penalty": heading_deviation_penalty.mean(),
@@ -3626,6 +4068,15 @@ class QminiLegEnv(DirectRLEnv):
         # orientation ever changes.
         _, _, reset_yaw = euler_xyz_from_quat(default_root_state[:, 3:7])
         self._reset_yaw[env_ids] = reset_yaw
+        self._reset_pos_xy[env_ids] = default_root_state[:, :2]
+
+        # Fresh per-env support duration for this new episode -- see
+        # cfg.startup_support_duration_range_s's comment for why this
+        # resamples every reset (unlike push's countdown).
+        support_duration_s = sample_uniform(
+            *self.cfg.startup_support_duration_range_s, (env_ids.numel(),), device=self.device,
+        )
+        self._support_end_step[env_ids] = (support_duration_s / self.step_dt).round().long()
 
         default_joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         default_joint_vel = self.robot.data.default_joint_vel[env_ids].clone()

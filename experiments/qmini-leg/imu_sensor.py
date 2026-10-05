@@ -209,6 +209,29 @@ def remap_to_robot_frame(chip_xyz: Sequence[float], axis_remap=AXIS_REMAP) -> li
     return [sign * chip_xyz[idx] for idx, sign in axis_remap]
 
 
+def mount_correction_matrix(pitch_deg: float = 0.0, roll_deg: float = 0.0) -> list[list[float]]:
+    """Small fixed rotation (robot frame) that removes an IMU mounting tilt.
+
+    Added 2026-10-04: on the level stand the IMU read pitch -0.9 / roll +1.0
+    while a phone on the robot's top read ~2-3 deg BACKWARD; separately the
+    log viewer's foot-in-world pitch read -2.5 deg with feet flat. The chip
+    is not mounted parallel to base_link.
+
+    Applied to accel and gyro after axis remap, so the reported pitch
+    (asin(gravity_dir y), + = leaning back) increases by pitch_deg and roll
+    (asin(gravity_dir x), + = leaning left) by roll_deg, to first order.
+    I.e. pitch_deg = true pitch - IMU pitch, measured with the robot at a
+    known attitude."""
+    p, r = math.radians(pitch_deg), math.radians(-roll_deg)
+    rx = [[1.0, 0.0, 0.0], [0.0, math.cos(p), -math.sin(p)], [0.0, math.sin(p), math.cos(p)]]
+    ry = [[math.cos(r), 0.0, math.sin(r)], [0.0, 1.0, 0.0], [-math.sin(r), 0.0, math.cos(r)]]
+    return [[sum(ry[i][k] * rx[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def _apply(m, v):
+    return [m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2] for i in range(3)]
+
+
 class ImuTelemetryFault(RuntimeError):
     """Raised when the accelerometer disagrees with the gyroscope about how
     much the robot has rotated, PERSISTENTLY across several consecutive
@@ -248,7 +271,17 @@ GRAVITY_JUMP_MARGIN = 5.0
 # reducing the disturbance itself (hip-roll/ankle excursion at this gait
 # phase), not this -- REVERT to 15.0 once that lands; this value is
 # calibrated to today's specific bad gait, not a general safety margin.
-GRAVITY_JUMP_SLACK_DEG = 20.0
+#
+# RAISED 20.0 -> 35.0 on 2026-10-05 (user-approved). With the rope loose
+# (margin13 bundle, hard feet) the robot sways sideways at ~0.45 g: the
+# accel-only "tilt" swings +-25..35 deg while the gyro-filtered roll stays
+# within +-6 deg, |a| ~10.8 m/s^2, zero I2C retries -- real linear
+# acceleration, not a broken sensor, yet 4 of 9 runs that day ended in
+# ImuTelemetryFault. Replayed against all 117 logged runs: at 35 the
+# longest run of consecutive mismatches is 4 (needs 8). A gross sensor
+# failure still trips it, and robot_deploy.py now has a real fall guard
+# (TiltExceeded, robot_config max_tilt_deg on the filtered estimate).
+GRAVITY_JUMP_SLACK_DEG = 35.0
 
 # How many CONSECUTIVE per-step mismatches (see above) before
 # read_robot_frame() gives up and raises ImuTelemetryFault instead of
@@ -346,7 +379,8 @@ class ImuDiagnostics:
 class ImuSensor:
     """Wraps an Adafruit LSM6DSOX (product 4517) over I2C."""
 
-    def __init__(self, address: Optional[int] = None, axis_remap=AXIS_REMAP):
+    def __init__(self, address: Optional[int] = None, axis_remap=AXIS_REMAP,
+                 mount_pitch_deg: float = 0.0, mount_roll_deg: float = 0.0):
         if not _IMU_LIB_AVAILABLE:
             raise RuntimeError(
                 f"Adafruit CircuitPython IMU libraries could not be imported "
@@ -356,6 +390,9 @@ class ImuSensor:
                 f"Options -> I2C)."
             )
         self.axis_remap = axis_remap
+        self.mount_pitch_deg = mount_pitch_deg
+        self.mount_roll_deg = mount_roll_deg
+        self._mount = mount_correction_matrix(mount_pitch_deg, mount_roll_deg)
         i2c = busio.I2C(board.SCL, board.SDA)
         self.sensor = LSM6DSOX(i2c, address=address or DEFAULT_LSM6DSOX_ADDRESS)
 
@@ -423,8 +460,8 @@ class ImuSensor:
         gyro_chip, gyro_ms, gyro_retries = self._read_with_retry("gyro")
 
         return ImuReading(
-            accel_robot_mps2=remap_to_robot_frame(accel_chip, self.axis_remap),
-            gyro_robot_rads=remap_to_robot_frame(gyro_chip, self.axis_remap),
+            accel_robot_mps2=_apply(self._mount, remap_to_robot_frame(accel_chip, self.axis_remap)),
+            gyro_robot_rads=_apply(self._mount, remap_to_robot_frame(gyro_chip, self.axis_remap)),
             accel_chip_mps2=accel_chip,
             gyro_chip_rads=gyro_chip,
             accel_read_ms=accel_ms,
