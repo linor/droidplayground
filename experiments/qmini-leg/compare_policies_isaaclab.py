@@ -607,6 +607,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="env seed, held identical across every checkpoint compared -- see module docstring's WHY A FIXED SEED MATTERS")
     parser.add_argument("--out", type=Path, default=None, help="CSV path to append results to (created with header if new); the printed table is built from the FULL accumulated file, not just this run's checkpoints")
     parser.add_argument("--print-only", type=Path, default=None, help="skip Isaac Sim entirely, just load and print an existing --out csv")
+    parser.add_argument("--zero-offsets", type=float, default=1.0, help="scale on cfg.joint_zero_offset_range_deg (0 = no random joint zero offsets, as in evals before 2026-10-05)")
+    parser.add_argument("--friction", type=float, default=None, help="fixed foot/ground friction (default: the env's per-episode randomization; 0.5 = evals before 2026-10-06; real floor ~0.3)")
     parser.add_argument("--dump-heights", type=str, default=None, help="optional .npy path: save raw per-step per-env foot heights [steps, envs, 11] for offline distribution analysis")
     args_cli, extra = parser.parse_known_args()
     global DUMP_HEIGHTS_PATH
@@ -714,6 +716,18 @@ def main():
             cfg_i = copy.deepcopy(env_cfg)
             cfg_i.scene.num_envs = args_cli.num_envs
             cfg_i.seed = args_cli.seed
+            # --zero-offsets: scale the env's per-episode joint zero-calibration
+            # randomization (cfg.joint_zero_offset_range_deg, added 2026-10-05);
+            # 0 = off, i.e. the conditions every eval before that date ran in.
+            if hasattr(cfg_i, "joint_zero_offset_range_deg"):
+                cfg_i.joint_zero_offset_range_deg = {
+                    k: v * args_cli.zero_offsets for k, v in cfg_i.joint_zero_offset_range_deg.items()}
+            # --friction: fixed foot/ground friction instead of the env's
+            # per-episode randomization (cfg.friction_randomization_range,
+            # added 2026-10-06). 0.5 = conditions of every eval before then.
+            if args_cli.friction is not None and hasattr(cfg_i, "friction_randomization_range"):
+                cfg_i.friction_randomization_range = (args_cli.friction, args_cli.friction)
+                cfg_i.dynamic_friction_ratio_range = (1.0, 1.0)
 
             env = gym.make(args_cli.task, cfg=cfg_i, render_mode=None)
             env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)

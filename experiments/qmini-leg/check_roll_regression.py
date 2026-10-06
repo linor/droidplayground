@@ -59,6 +59,13 @@ CSV_REGISTRY = [
     ("rollmargin13_a2",   "control_loop_20261001_132350.csv", "FAILED: left_hip_roll -15.73deg"),
     ("rollmargin13_a3",   "control_loop_20261001_132551.csv", "FAILED: left_hip_roll -19.00deg"),
     ("rollmargin13_a4",   "control_loop_20261001_132717.csv", "IMU fault (roll not the cause here, kept as a roll-safety control case)"),
+    # 2026-10-05, margin13 bundle, hard feet, rope loose -- all during a
+    # backward-lean episode. a12/a18 ran with the ankle forward offset
+    # (robot_config_qmini_stepinplace_ankle_fwd2/fwd3.json).
+    ("margin13_hw_a5",    "control_loop_20261005_124820.csv", "FAILED: left_hip_roll -15.31deg"),
+    ("margin13_hw_a8",    "control_loop_20261005_125504.csv", "FAILED: left_hip_roll -18.84deg"),
+    ("margin13_fwd2_a12", "control_loop_20261005_135958.csv", "FAILED: left_hip_roll -15.55deg"),
+    ("margin13_fwd3_a18", "control_loop_20261005_143656.csv", "FAILED: left_hip_roll -17.21deg"),
 ]
 
 ROLL_LIMIT_DEG = 15.0

@@ -158,51 +158,58 @@ def axis_vector(axis_token):
 def compute_foot_transform(joints, alias, units_to_meters, revolute_names, foot_path, angles_deg):
     """angles_deg: dict {yaw,roll,pitch,knee,ankle} -> degrees, for ONE leg's
     OWN joints (read directly from the joint_order columns already matching
-    that leg -- never mirrored/negated from the other leg's numbers)."""
-    T = Gf.Matrix4d(1.0)
+    that leg -- never mirrored/negated from the other leg's numbers).
+
+    Returns a Gf.Matrix4d T (row-vector convention) such that
+    T.Transform(p) maps a point given in base_link coordinates AT THE ZERO
+    POSE (e.g. LEFT_HEEL) to its base_link position at `angles_deg`.
+
+    REWRITTEN 2026-10-06. The previous version composed Gf row-vector
+    matrices in column-vector order and did NOT match Isaac Sim at
+    non-zero poses (standing pose: foot rotation off by 14 deg, position by
+    1-3 cm), which made reference_foot_heights_m wrong -- smeared across
+    the cycle, each foot ">1 cm up" ~80% of the time instead of ~30%. It
+    only passed the heel-height assertion below because that checks one
+    coordinate at one pose. This version uses the pivot-axis model from
+    export_fk_geometry.py, validated against Isaac Sim body poses at three
+    poses (<0.01 mm, <0.1 deg): every body frame in this asset coincides
+    with base_link at the zero pose, so each revolute joint is a rotation
+    about its pivot (localPos0) and axis (localRot0 applied to the axis
+    token), sign +1 when body0 is the parent side of the chain, -1 when
+    it's the child side. `foot_path` is kept for interface compatibility;
+    with coincident frames no fixed-joint tail is needed."""
+    R = np.eye(3)
+    t = np.zeros(3)
     current_body = alias(BASE_LINK_PATH)
 
     for key in CHAIN_ORDER:
         entry = joints[revolute_names[key]]
         b0, b1 = alias(entry["body0"]), alias(entry["body1"])
         if b0 == current_body:
-            parent_side, child_side = "0", "1"
+            sign, current_body = 1.0, b1
         elif b1 == current_body:
-            parent_side, child_side = "1", "0"
+            sign, current_body = -1.0, b0
         else:
             raise RuntimeError(f"Chain broken at {key}: current_body={current_body}, joint bodies=({b0},{b1})")
 
-        parent_frame = joint_frame(entry, parent_side, units_to_meters)
-        child_frame = joint_frame(entry, child_side, units_to_meters)
+        axis = np.array(Gf.Rotation(entry["localRot0"]).TransformDir(axis_vector(entry["axis"])))
+        axis = axis / np.linalg.norm(axis)
+        pivot = np.array(Gf.Vec3d(entry["localPos0"])) * units_to_meters
+        theta = math.radians(sign * angles_deg[key])
+        k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+        rk = np.eye(3) + math.sin(theta) * k + (1 - math.cos(theta)) * k @ k
+        # child = parent * (rotation about pivot): p -> rk (p - pivot) + pivot
+        t = t + R @ (pivot - rk @ pivot)
+        R = R @ rk
 
-        # Sign flip when body0 is the child side -- localRot0/localRot1 are
-        # NOT simple inverses of each other for revolute joints in this
-        # asset (unlike the zero-offset fixed joints), so which side plays
-        # child changes the physical rotation direction for a given signed
-        # angle. Empirically validated, not derived from first principles:
-        # without this, the standing-pose heel height comes out ~-0.27m
-        # instead of the known-good ~-0.42m (see the assertion below).
-        angle_deg = angles_deg[key] * (-1.0 if child_side == "0" else 1.0)
-        axis = axis_vector(entry["axis"])
-        rot = Gf.Matrix4d().SetRotate(Gf.Rotation(axis, angle_deg))
-
-        T = T * parent_frame * rot * child_frame.GetInverse()
-        current_body = alias(entry["body0"] if child_side == "0" else entry["body1"])
-
-    target = alias(foot_path)
-    if current_body != target:
-        for entry in joints.values():
-            if entry["is_revolute"]:
-                continue
-            b0, b1 = alias(entry["body0"]), alias(entry["body1"])
-            if current_body in (b0, b1) and target in (b0, b1):
-                if b0 == current_body:
-                    T = T * joint_frame(entry, "0", units_to_meters) * joint_frame(entry, "1", units_to_meters).GetInverse()
-                else:
-                    T = T * joint_frame(entry, "1", units_to_meters) * joint_frame(entry, "0", units_to_meters).GetInverse()
-                current_body = target
-                break
-    return T
+    # Row-vector Gf matrix: T.Transform(p) = p * T = R p + t
+    # (Built in one go: Gf.Matrix4d's T[i][j] = x writes to a temporary row copy.)
+    return Gf.Matrix4d(
+        float(R[0][0]), float(R[1][0]), float(R[2][0]), 0.0,
+        float(R[0][1]), float(R[1][1]), float(R[2][1]), 0.0,
+        float(R[0][2]), float(R[1][2]), float(R[2][2]), 0.0,
+        float(t[0]), float(t[1]), float(t[2]), 1.0,
+    )
 
 
 def build_chain(joints, leg):
@@ -238,11 +245,14 @@ def main():
         ("right", right_chain, RIGHT_FOOT_PATH, RIGHT_HEEL, right_stance),
     ]:
         h = transform(chain, foot, stance).Transform(heel)
-        print(f"{name} stance heel_z = {h[2]*100:.2f}cm (want close to -42cm)")
-        if not (-0.50 < h[2] < -0.35):
+        # ~-38 cm, matching Isaac Sim (2026-10-06). The old "known-good"
+        # -42 cm is the straight-leg ZERO pose heel height -- the old,
+        # wrong FK happened to reproduce it at this bent-knee pose.
+        print(f"{name} stance heel_z = {h[2]*100:.2f}cm (want close to -38cm)")
+        if not (-0.40 < h[2] < -0.36):
             raise AssertionError(
                 f"{name} leg's stance heel height {h[2]:.3f}m is not close to the "
-                f"known-good ~-0.42m -- FK chain or sign is likely wrong, do not "
+                f"Isaac Sim-validated ~-0.38m -- FK chain or sign is likely wrong, do not "
                 f"trust the generated heights. Fix before writing the JSON."
             )
 

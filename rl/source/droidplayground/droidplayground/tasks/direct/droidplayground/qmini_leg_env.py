@@ -11,6 +11,7 @@ from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.envs.common import ViewerCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.sim.spawners.materials import RigidBodyMaterialCfg
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, sample_uniform, wrap_to_pi
 from isaaclab.utils import configclass
 from isaaclab.scene import InteractiveSceneCfg
@@ -492,6 +493,35 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # rotation, magnitude sampled in [0, this], see _apply_imu_mount_bias.
     imu_mount_bias_range_deg: float = 2.0
 
+    # Per-episode joint ZERO-CALIBRATION error, per joint, uniform in
+    # [-range, +range] (deg, matched by joint-name suffix), held constant
+    # for the whole episode. Added 2026-10-05. Models robot_deploy.py's
+    # power-on calibration landing slightly off the true zero:
+    #   true angle = believed angle + offset
+    # so the policy OBSERVES joint_pos - offset, the applied PD target is
+    # default + action_scale*action + offset, the episode starts at
+    # default + offset (the believed default pose), and target_limit_penalty
+    # is measured on the believed target (what robot_deploy.py validates).
+    # Distinct from startup_joint_pos_noise_deg, which only perturbs the
+    # initial joint STATE and is then corrected away by the PD loop.
+    #
+    # Why: margin13 (2026-10-04_13-32-56/model_159996) on hardware leaned
+    # back and hung in the rope with the rope loose until the ankles were
+    # hand-calibrated 3 deg forward (robot_config_qmini_stepinplace_ankle_fwd3.json);
+    # with that it stepped 7 minutes rope-free. check_calibration_offset.py
+    # showed the policy is very sensitive here (ankle +4 deg -> 42% falls,
+    # ankle +2 -> mean pitch +3.6 deg back), so it should learn to read
+    # the resulting lean from the IMU and compensate, instead of relying
+    # on a hand-tuned deploy offset. Ankle widest since that is where the
+    # real error showed up; roll/yaw small (roll target limits are tight).
+    joint_zero_offset_range_deg: dict = {
+        "yaw": 1.0,
+        "roll": 1.0,
+        "pitch": 2.0,
+        "knee": 2.0,
+        "ankle": 3.0,
+    }
+
     # Per-episode mass SCALE randomization applied to base_link only.
     # Directly motivated by this project's own history: the real
     # battery/Pi-mount/decoration mass (qmini_urdf-2legs.usda's
@@ -500,6 +530,20 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # measurement -- there's no reason to assume they're exact. (0.9, 1.1)
     # = base mass scaled by a random factor in that range each episode.
     base_mass_randomization_range: tuple[float, float] = (0.9, 1.1)
+
+    # Per-episode foot/ground FRICTION, added 2026-10-06. Before this the
+    # sim always used Isaac Lab's default ground material (0.5/0.5,
+    # combine "average", robot USD has no material of its own -> effective
+    # 0.5, never varied). Measured on the real test floor (hard feet +
+    # sticky layer): 11.7 kg robot needs 3.5-4.0 kg of sideways pull to
+    # slide -> mu ~0.30-0.34, i.e. 2/3 of what every policy so far trained
+    # on; the real feet visibly slip and the robot turns 8-13 deg/s.
+    # The ground plane is shared by all envs, so it is spawned with 1.0 and
+    # combine mode "multiply" (wins over the robot's "average") and the
+    # per-env value is set on the robot's own shapes in _randomize_friction:
+    # effective static friction = U(range), dynamic = static * U(ratio).
+    friction_randomization_range: tuple[float, float] = (0.25, 0.8)
+    dynamic_friction_ratio_range: tuple[float, float] = (0.8, 1.0)
 
     # Push disturbances: every push_interval_range_s (independently
     # randomized and re-randomized per env, see that cfg's comment for why
@@ -2961,6 +3005,22 @@ class QminiLegEnv(DirectRLEnv):
                     f"entry to cfg.startup_joint_pos_noise_deg covering it."
                 )
 
+        # Per-joint zero-calibration error range (rad) and the per-env
+        # offsets themselves -- see cfg.joint_zero_offset_range_deg.
+        self._joint_zero_offset_range_rad = torch.zeros(self.num_joints, device=self.device)
+        for i, name in enumerate(self.robot.joint_names[:self.num_joints]):
+            for suffix, deg in self.cfg.joint_zero_offset_range_deg.items():
+                if name.endswith(suffix):
+                    self._joint_zero_offset_range_rad[i] = math.radians(deg)
+                    break
+            else:
+                raise ValueError(
+                    f"Robot joint '{name}' doesn't end with any of "
+                    f"{list(self.cfg.joint_zero_offset_range_deg)} -- add an "
+                    f"entry to cfg.joint_zero_offset_range_deg covering it."
+                )
+        self._joint_zero_offset_rad = torch.zeros(self.num_envs, self.num_joints, device=self.device)
+
         # Per-joint-TYPE tracking weight -- see cfg.joint_tracking_weight's
         # comment. Same name-suffix matching convention as the noise range
         # just above.
@@ -3288,7 +3348,14 @@ class QminiLegEnv(DirectRLEnv):
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         # add ground plane
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # friction 1.0 + "multiply": the effective friction is the robot
+        # shapes' own per-env value, see cfg.friction_randomization_range.
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(
+            physics_material=RigidBodyMaterialCfg(
+                static_friction=1.0, dynamic_friction=1.0, restitution=0.0,
+                friction_combine_mode="multiply",
+            )
+        ))
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
         # we need to explicitly filter collisions for CPU simulation
@@ -3422,7 +3489,9 @@ class QminiLegEnv(DirectRLEnv):
         # to self.robot.data.joint_pos/joint_vel as read directly by
         # _get_rewards/_get_dones/_apply_action, which should keep
         # reflecting true simulated state.
-        joint_pos = self.robot.data.joint_pos[:, :self.num_joints]
+        # Believed angle = true - zero-calibration offset, see
+        # cfg.joint_zero_offset_range_deg.
+        joint_pos = self.robot.data.joint_pos[:, :self.num_joints] - self._joint_zero_offset_rad
         joint_vel = self.robot.data.joint_vel[:, :self.num_joints]
         joint_pos = joint_pos + torch.randn_like(joint_pos) * math.radians(self.cfg.joint_pos_noise_std_deg)
         joint_vel = joint_vel + torch.randn_like(joint_vel) * math.radians(self.cfg.joint_vel_noise_std_deg_s)
@@ -3503,9 +3572,13 @@ class QminiLegEnv(DirectRLEnv):
         # _pre_physics_step, so the policy has to be robust to the same lag
         # analyze_delay.py measures on the real robot instead of assuming
         # instantaneous actuation.
+        # + zero-calibration offset: the policy commands a BELIEVED angle,
+        # the joint physically goes to believed + offset (see
+        # cfg.joint_zero_offset_range_deg).
         position_targets = (
             self.robot.data.default_joint_pos[:, joint_ids]
             + self.cfg.action_scale * self._delayed_actions[:, :num_actions]
+            + self._joint_zero_offset_rad[:, :num_actions]
         )
 
         # EMA low-pass on the final decoded target -- see cfg.action_smoothing.
@@ -3645,9 +3718,12 @@ class QminiLegEnv(DirectRLEnv):
         # matched to self._target_limit_margin_rad in __init__) -- roll
         # gets a wider buffer than the rest, see that field's comment.
         margin_rad = self._target_limit_margin_rad
+        # robot_deploy.py checks the BELIEVED target against its limits,
+        # so remove the zero-calibration offset (cfg.joint_zero_offset_range_deg).
+        believed_targets = self._last_position_targets - self._joint_zero_offset_rad[:, :self._last_position_targets.shape[1]]
         target_over_limit = (
-            torch.clamp(self._last_position_targets - (upper - margin_rad), min=0.0)
-            + torch.clamp((lower + margin_rad) - self._last_position_targets, min=0.0)
+            torch.clamp(believed_targets - (upper - margin_rad), min=0.0)
+            + torch.clamp((lower + margin_rad) - believed_targets, min=0.0)
         )
         # Capped before squaring -- see cfg.target_limit_penalty_max_overshoot_deg's
         # comment. A single uncapped outlier here is what blew up the value
@@ -4092,7 +4168,10 @@ class QminiLegEnv(DirectRLEnv):
         # randomization above uses, not per-element bounds.
         unit_noise = sample_uniform(-1.0, 1.0, default_joint_pos.shape, device=self.device)
         joint_pos_noise = unit_noise * self._startup_joint_pos_noise_range_rad
-        randomized_joint_pos = default_joint_pos + joint_pos_noise
+        # Sample this episode's zero-calibration offsets first: the robot
+        # starts at its BELIEVED default pose = true default + offset.
+        self._randomize_joint_zero_offset(env_ids)
+        randomized_joint_pos = default_joint_pos + joint_pos_noise + self._joint_zero_offset_rad[env_ids]
         self.robot.write_joint_state_to_sim(randomized_joint_pos, default_joint_vel, env_ids=env_ids)
 
         # self.phase_modulator.reset(
@@ -4140,18 +4219,27 @@ class QminiLegEnv(DirectRLEnv):
         # cfg.action_smoothing) so a fresh episode's first smoothed target
         # isn't pulled toward whatever a DIFFERENT episode's rollout last
         # commanded.
-        self._smoothed_position_targets[env_ids_t] = self.robot.data.default_joint_pos[env_ids_t, :self.cfg.action_space]
+        self._smoothed_position_targets[env_ids_t] = (
+            self.robot.data.default_joint_pos[env_ids_t, :self.cfg.action_space]
+            + self._joint_zero_offset_rad[env_ids_t, :self.cfg.action_space]
+        )
 
         self._randomize_action_delay(env_ids)
         self._randomize_actuator_gains(env_ids)
         self._randomize_gyro_bias(env_ids)
         self._randomize_imu_mount_bias(env_ids)
         self._randomize_base_mass(env_ids)
+        self._randomize_friction(env_ids)
         # Fresh, independent push countdown for these envs -- see
         # cfg.push_interval_range_s's comment for why this must be
         # per-env, not a shared global schedule.
         self._resample_push_countdown(env_ids_t)
         self._steps_since_push[env_ids_t] = 0
+
+    def _randomize_joint_zero_offset(self, env_ids: Sequence[int]):
+        """Per-episode zero-calibration error, see cfg.joint_zero_offset_range_deg."""
+        unit = sample_uniform(-1.0, 1.0, (len(env_ids), self.num_joints), device=self.device)
+        self._joint_zero_offset_rad[env_ids] = unit * self._joint_zero_offset_range_rad
 
     def _randomize_gyro_bias(self, env_ids: Sequence[int]):
         bias_range_rad = math.radians(self.cfg.imu_gyro_bias_range_deg_s)
@@ -4178,6 +4266,19 @@ class QminiLegEnv(DirectRLEnv):
             self._default_base_mass[env_ids_mass.to(mass_device)] * scale
         )
         self.robot.root_physx_view.set_masses(masses, env_ids_mass.to(masses.device))
+
+    def _randomize_friction(self, env_ids: Sequence[int]):
+        """Per-episode friction on all of this env's robot shapes, see
+        cfg.friction_randomization_range (ground is 1.0 with "multiply", so
+        these are the effective values)."""
+        materials = self.robot.root_physx_view.get_material_properties()  # (N, shapes, 3) on CPU
+        ids = (env_ids if torch.is_tensor(env_ids) else torch.as_tensor(list(env_ids))).to(materials.device)
+        n = ids.numel()
+        static = sample_uniform(*self.cfg.friction_randomization_range, (n, 1), device=materials.device)
+        dynamic = static * sample_uniform(*self.cfg.dynamic_friction_ratio_range, (n, 1), device=materials.device)
+        materials[ids, :, 0] = static
+        materials[ids, :, 1] = dynamic
+        self.robot.root_physx_view.set_material_properties(materials, ids)
 
     def _randomize_action_delay(self, env_ids: Sequence[int]):
         # Per-joint now (see cfg.action_delay_range_steps' comment) --
