@@ -69,6 +69,11 @@ CSV_REGISTRY = [
 ]
 
 ROLL_LIMIT_DEG = 15.0
+# robot_deploy.py joint-limit clamp (2026-10-07): targets up to
+# ABORT_EXCESS_DEG past the limit are clamped to CLAMP_MARGIN_DEG inside it
+# instead of aborting; only beyond that is it still a safety abort.
+CLAMP_MARGIN_DEG = 1.0
+ABORT_EXCESS_DEG = 5.0
 ACTION_SCALE = 0.5
 
 
@@ -115,11 +120,18 @@ def main():
         for lbl in labels:
             with torch.no_grad():
                 a = policies[lbl](obs).numpy() * ACTION_SCALE * 57.29577951308232
-            left_min = a[:, LEFT_ROLL_COL].min()
-            right_max = a[:, RIGHT_ROLL_COL].max()
-            worst = left_min if abs(left_min) >= abs(right_max) else right_max
+            # both hips, both directions (was: left min / right max only)
+            roll = a[:, [LEFT_ROLL_COL, RIGHT_ROLL_COL]]
+            worst = roll.flat[np.abs(roll).argmax()]
             over = abs(worst) - ROLL_LIMIT_DEG
-            flag = "FAIL" if over > 0 else ("close" if over > -2 else "ok")
+            if over > ABORT_EXCESS_DEG:
+                flag = "ABORT"
+            elif over > -CLAMP_MARGIN_DEG:
+                flag = "clamp"
+            elif over > -CLAMP_MARGIN_DEG - 1.0:
+                flag = "close"
+            else:
+                flag = "ok"
             results[lbl].append(over)
             row_strs.append(f"{worst:7.2f}deg[{flag:>5s}]      ")
         print(f"{case_label:<22s} {outcome:<55s} " + "  ".join(row_strs))
@@ -127,12 +139,15 @@ def main():
     print("\n=== SUMMARY (worst-case margin to +-15deg limit, negative = violation) ===")
     for lbl in labels:
         overs = np.array(results[lbl])
-        n_fail = int((overs > 0).sum())
-        n_close = int(((overs <= 0) & (overs > -2)).sum())
+        n_abort = int((overs > ABORT_EXCESS_DEG).sum())
+        n_clamp = int(((overs <= ABORT_EXCESS_DEG) & (overs > -CLAMP_MARGIN_DEG)).sum())
+        n_over15 = int((overs > 0).sum())
         print(f"{lbl:<22s} worst_over={overs.max():+6.2f}deg  mean_over={overs.mean():+6.2f}deg  "
-              f"FAIL={n_fail}/{len(overs)}  close={n_close}/{len(overs)}")
+              f"ABORT={n_abort}/{len(overs)}  clamp={n_clamp}/{len(overs)}  (past +-15: {n_over15})")
     print(
-        "\nFAIL = this policy's replayed target exceeded +-15deg on this real log.\n"
+        f"\nABORT = replayed target more than {ABORT_EXCESS_DEG:g}deg past +-15 (robot_deploy.py still aborts).\n"
+        f"clamp = past +-{ROLL_LIMIT_DEG - CLAMP_MARGIN_DEG:g}: robot_deploy.py clamps it to +-{ROLL_LIMIT_DEG - CLAMP_MARGIN_DEG:g} -- runs, but the policy\n"
+        "doesn't get the hip roll it asked for, so fewer clamps is still better.\n"
         "A policy with MORE fails/closer margins than pitchstep5 (or whichever\n"
         "baseline you're comparing against) should NOT go to hardware, regardless\n"
         "of how its compare_policies_isaaclab.py aggregate metrics look -- see\n"

@@ -260,6 +260,16 @@ class RobotConfig:
     imu_mount_roll_deg: float = 0.0
     # Abort when the filtered body tilt (from vertical) exceeds this.
     max_tilt_deg: float = 40.0
+    # Joint-limit CLAMP (2026-10-07): a policy target slightly past a
+    # joint's [min_deg, max_deg] (the hardware limits) is clamped to
+    # joint_limit_clamp_margin_deg INSIDE the limit instead of aborting --
+    # the margin keeps the PD from pushing the joint into its end stop. A
+    # target more than joint_limit_abort_excess_deg past the limit is left
+    # as is, so check_joint_limits still aborts (that's a misbehaving
+    # policy, not one grazing the edge). joint_limit_clamp_margin_deg null
+    # in the JSON = old behaviour (abort on any violation).
+    joint_limit_clamp_margin_deg: Optional[float] = 1.0
+    joint_limit_abort_excess_deg: float = 5.0
 
     @staticmethod
     def load(path: Path) -> "RobotConfig":
@@ -287,6 +297,8 @@ class RobotConfig:
             imu_mount_pitch_deg=raw.get("imu_mount_pitch_deg", 0.0),
             imu_mount_roll_deg=raw.get("imu_mount_roll_deg", 0.0),
             max_tilt_deg=raw.get("max_tilt_deg", 40.0),
+            joint_limit_clamp_margin_deg=raw.get("joint_limit_clamp_margin_deg", 1.0),
+            joint_limit_abort_excess_deg=raw.get("joint_limit_abort_excess_deg", 5.0),
         )
 
     @property
@@ -1013,6 +1025,7 @@ class Deployment:
         self.max_target_step_deg = max_target_step_deg
         self._prev_commanded_targets: dict = {}
         self.rate_limit_clamp_count = 0
+        self.limit_clamp_count = 0  # see RobotConfig.joint_limit_clamp_margin_deg
 
         # One MotorBus per unique port in robot_config.json -- joints that
         # share a port share a bus, joints with different ports get their
@@ -1371,6 +1384,30 @@ class Deployment:
                             targets[name] = t
                         self._prev_commanded_targets[name] = t
 
+                # Joint-limit clamp, see RobotConfig.joint_limit_clamp_margin_deg.
+                margin = self.robot_cfg.joint_limit_clamp_margin_deg
+                if margin is not None:
+                    excess_ok = self.robot_cfg.joint_limit_abort_excess_deg
+                    for joint in self.robot_cfg.joints:
+                        t_deg = math.degrees(targets[joint.name])
+                        lo, hi = joint.min_deg, joint.max_deg
+                        if (hi is not None and t_deg > hi + excess_ok) or (lo is not None and t_deg < lo - excess_ok):
+                            continue  # far out of range: leave it, check_joint_limits aborts
+                        clamped_deg = t_deg
+                        if hi is not None and t_deg > hi - margin:
+                            clamped_deg = hi - margin
+                        elif lo is not None and t_deg < lo + margin:
+                            clamped_deg = lo + margin
+                        if clamped_deg != t_deg:
+                            self.limit_clamp_count += 1
+                            self.logger.warning(
+                                "LIMIT CLAMP: %s target %+.2f deg clamped to %+.2f deg (limits [%s, %s], clamp #%d)",
+                                joint.name, t_deg, clamped_deg, lo, hi, self.limit_clamp_count,
+                            )
+                            targets[joint.name] = math.radians(clamped_deg)
+                            if self.max_target_step_deg is not None:
+                                self._prev_commanded_targets[joint.name] = targets[joint.name]
+
                 print(f"TARGETS  LEFT HIP YAW: {math.degrees(targets['left_hip_yaw']):10.5f}  HIP ROLL: {math.degrees(targets['left_hip_roll']):10.5f}  HIP PITCH: {math.degrees(targets['left_hip_pitch']):10.5f}  KNEE: {math.degrees(targets['left_knee']):10.5f}  ANKLE: {math.degrees(targets['left_ankle']):10.5f}")
                 print(f"TARGETS RIGHT HIP YAW: {math.degrees(targets['right_hip_yaw']):10.5f}  HIP ROLL: {math.degrees(targets['right_hip_roll']):10.5f}  HIP PITCH: {math.degrees(targets['right_hip_pitch']):10.5f}  KNEE: {math.degrees(targets['right_knee']):10.5f}  ANKLE: {math.degrees(targets['right_ankle']):10.5f}")
 
@@ -1426,7 +1463,9 @@ class Deployment:
         finally:
             self._release_all()
             self.csv_file.close()
-            self.logger.info("Deployment stopped, motors released, log file closed.")
+            self.logger.info("Deployment stopped, motors released, log file closed. "
+                             "Joint-limit clamps: %d, rate-limit clamps: %d.",
+                             self.limit_clamp_count, self.rate_limit_clamp_count)
 
     def _imu_diagnostic_row(self):
         """Row tail matching write_csv_header's IMU diagnostic columns --
