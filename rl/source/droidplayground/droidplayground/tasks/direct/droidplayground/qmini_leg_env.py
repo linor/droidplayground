@@ -2166,6 +2166,19 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # correctly-behaving policy should ever produce.
     target_limit_penalty_max_overshoot_deg: float = 30.0
 
+    # Clamp the APPLIED joint targets to this many degrees inside the joint
+    # limits, like robot_deploy.py does on hardware since 2026-10-07
+    # (RobotConfig.joint_limit_clamp_margin_deg). Added 2026-10-07: PhysX
+    # stops the joint at the USD limit (= hardware limit, e.g. hip roll
+    # +-15) however far past it the target is, but the PD still pushes
+    # toward the target -- so in sim a 25-30 deg hip-roll target bought
+    # extra lateral torque against the limit, and the feetfix resume
+    # (2026-10-07_11-20-00) learned to use exactly that: roll-replay aborts
+    # 0 -> 3 -> 7 of 12 at 230k/233k/236.6k, sim target violations 1.1%.
+    # Hardware gives no such torque (it clamps to 14 or aborts past 20).
+    # target_limit_penalty still sees the raw target. None = off.
+    target_clamp_margin_deg: float | None = 1.0
+
     # Coefficient on a LINEAR overshoot term added alongside the quadratic
     # one (final penalty per joint = weight * (over**2 + linear_coef *
     # over), over in radians, both margined and capped as above). Added
@@ -3609,6 +3622,18 @@ class QminiLegEnv(DirectRLEnv):
         # robot_deploy.py actually validates/sends -- a real safety abort
         # would see the smoothed target, not the pre-filter one.
         self._last_position_targets = position_targets
+
+        # Mirror robot_deploy.py's joint-limit CLAMP (cfg.target_clamp_margin_deg):
+        # the APPLIED target is the believed target clamped to the margin
+        # inside the joint limits (the USD limits equal the hardware
+        # min/max for all 10 joints). The penalty above keeps seeing the
+        # raw target.
+        if self.cfg.target_clamp_margin_deg is not None:
+            limits = self.robot.data.joint_pos_limits[:, :num_actions, :]
+            margin = math.radians(self.cfg.target_clamp_margin_deg)
+            offset = self._joint_zero_offset_rad[:, :num_actions]
+            believed = position_targets - offset
+            position_targets = torch.clamp(believed, limits[..., 0] + margin, limits[..., 1] - margin) + offset
 
         self.robot.set_joint_position_target(
             position_targets,
