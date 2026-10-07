@@ -2417,8 +2417,16 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # (pxr, no simulation) against qmini_urdf-2legs.usda directly -- see
     # left/right_foot_body_name's comment above for the story. Re-derive
     # these if the foot mesh geometry ever changes.
-    left_heel_local_m: tuple[float, float, float] = (0.16286, 0.16930, -0.42102)
-    right_heel_local_m: tuple[float, float, float] = (-0.12667, 0.17208, -0.41420)
+    #
+    # RE-DERIVED 2026-10-07 for qmini_urdf-2legs-feetfix.usda (see qmini.py):
+    # the old points were the lowest vertices of the old, asymmetric
+    # decimated collision hulls (right heel 32 mm inboard of the ankle,
+    # 7 mm higher than the left). Now the REAR end of each foot's flat
+    # contact patch, on the sole centreline, at sole height -- exact
+    # mirror images. Printed by fusion2usd.py's load_stl_hull (old values:
+    # left (0.16286, 0.16930, -0.42102), right (-0.12667, 0.17208, -0.41420)).
+    left_heel_local_m: tuple[float, float, float] = (0.14632, 0.15325, -0.42274)
+    right_heel_local_m: tuple[float, float, float] = (-0.14632, 0.15325, -0.42274)
 
     # Toe point, same idea and same geometry query as the heel above (front
     # 15% of the mesh by local Y, lowest-Z point within that region).
@@ -2436,8 +2444,11 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # point (e.g. rolling onto the outer/inner edge of the foot) ever
     # turns up as a new exploit, the same "pick two points, take the
     # minimum" pattern applies.
-    left_toe_local_m: tuple[float, float, float] = (0.14439, 0.04049, -0.42415)
-    right_toe_local_m: tuple[float, float, float] = (-0.16138, 0.03790, -0.41897)
+    # RE-DERIVED 2026-10-07 like the heel above: FRONT end of the flat
+    # contact patch (old values: left (0.14439, 0.04049, -0.42415), right
+    # (-0.16138, 0.03790, -0.41897)).
+    left_toe_local_m: tuple[float, float, float] = (0.14632, 0.05731, -0.42274)
+    right_toe_local_m: tuple[float, float, float] = (-0.14632, 0.05731, -0.42274)
 
     # Foot height (meters, above the flat ground plane) at which the swing
     # reward saturates to its max weight -- doesn't need to match any real

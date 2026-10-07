@@ -67,7 +67,7 @@ from pxr import Usd, UsdPhysics, Gf, UsdGeom
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-USD_PATH = REPO_ROOT / "rl/source/droidplayground/data/usd/qmini_urdf-2legs.usda"
+USD_PATH = REPO_ROOT / "rl/source/droidplayground/data/usd/qmini_urdf-2legs-feetfix.usda"  # same joints as the old file, see qmini.py
 DEFAULT_KEYFRAMES_PATH = (
     REPO_ROOT
     / "rl/source/droidplayground/droidplayground/tasks/direct/droidplayground"
@@ -79,10 +79,11 @@ LEFT_FOOT_PATH = "/qmini_urdf_2legs/Left_Foot_1"
 RIGHT_FOOT_PATH = "/qmini_urdf_2legs/Riggt_Foot_1"  # typo in the asset itself, not ours
 
 # cfg.left/right_heel_local_m and left/right_toe_local_m in qmini_leg_env.py
-LEFT_HEEL = Gf.Vec3d(0.16286, 0.16930, -0.42102)
-LEFT_TOE = Gf.Vec3d(0.14439, 0.04049, -0.42415)
-RIGHT_HEEL = Gf.Vec3d(-0.12667, 0.17208, -0.41420)
-RIGHT_TOE = Gf.Vec3d(-0.16138, 0.03790, -0.41897)
+# (2026-10-07: rear/front ends of the feetfix contact patch, mirror images)
+LEFT_HEEL = Gf.Vec3d(0.14632, 0.15325, -0.42274)
+LEFT_TOE = Gf.Vec3d(0.14632, 0.05731, -0.42274)
+RIGHT_HEEL = Gf.Vec3d(-0.14632, 0.15325, -0.42274)
+RIGHT_TOE = Gf.Vec3d(-0.14632, 0.05731, -0.42274)
 
 CHAIN_ORDER = ["yaw", "roll", "pitch", "knee", "ankle"]
 

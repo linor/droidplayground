@@ -51,6 +51,8 @@ def main():
                              "per-reset gain randomization still applies on top")
     parser.add_argument("--friction", type=float, default=0.5,
                         help="fixed foot/ground friction (0.5 = sim value before 2026-10-06; real floor ~0.3)")
+    parser.add_argument("--usd", type=str, default=None,
+                        help="override the robot USD (e.g. .../qmini_urdf-2legs-flatfeet.usda, see fix_foot_collisions.py)")
     parser.add_argument("--kd-scale", type=float, default=1.0, help="same for damping")
     parser.add_argument("--task", type=str, default="DroidPlayground-QMini-Leg")
     parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point")
@@ -83,6 +85,9 @@ def main():
         cfg_i = copy.deepcopy(env_cfg)
         cfg_i.scene.num_envs = args_cli.num_envs
         cfg_i.seed = args_cli.seed
+        if args_cli.usd:
+            cfg_i.robot_cfg.spawn.usd_path = args_cli.usd
+            print(f"[DIAG] robot USD override: {args_cli.usd}", flush=True)
         # The env's own per-episode random zero offsets (added 2026-10-05)
         # are switched off so this script's fixed offsets stay deterministic
         # and comparable with results from before that change.

@@ -18,9 +18,12 @@ from isaaclab_rl.rsl_rl import (
 # rsl_rl_cfg_entry_point before training starts.
 import rsl_rl.runners.on_policy_runner as _rsl_rl_on_policy_runner
 
+from .capped_lr_ppo import CappedLrPPO
 from .clamped_actor_critic import ClampedActorCritic
 
 _rsl_rl_on_policy_runner.ClampedActorCritic = ClampedActorCritic
+# Same mechanism for the algorithm class (runner does eval(alg_cfg.pop("class_name"))).
+_rsl_rl_on_policy_runner.CappedLrPPO = CappedLrPPO
 
 
 @configclass
@@ -72,7 +75,12 @@ class QMiniLegPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
     )
 
+    # class_name "CappedLrPPO" (2026-10-07): rsl_rl's PPO with the adaptive
+    # learning rate capped at 1e-3 instead of rsl_rl's 1e-2 -- see
+    # capped_lr_ppo.py for the one-update collapse at iteration 228519 of
+    # run 2026-10-06_12-09-36 that this prevents.
     algorithm = RslRlPpoAlgorithmCfg(
+        class_name="CappedLrPPO",
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,

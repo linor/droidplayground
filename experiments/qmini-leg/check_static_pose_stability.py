@@ -74,6 +74,7 @@ def main():
     parser.add_argument("--num_envs", type=int, default=64)
     parser.add_argument("--seconds", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--usd", type=str, default=None, help="override the robot USD (see fix_foot_collisions.py)")
     parser.add_argument("--spawn-in-pose", action="store_true",
                         help="reset directly into the held pose instead of ramping from the (unstable) anchor")
     args_cli, extra = parser.parse_known_args()
@@ -122,6 +123,15 @@ def main():
         cfg_i = copy.deepcopy(env_cfg)
         cfg_i.scene.num_envs = args_cli.num_envs
         cfg_i.seed = args_cli.seed
+        if args_cli.usd:
+            cfg_i.robot_cfg.spawn.usd_path = args_cli.usd
+            print(f"[DIAG] robot USD override: {args_cli.usd}", flush=True)
+        # deterministic: no random joint zero offsets / friction (2026-10-05/06 additions)
+        if hasattr(cfg_i, "joint_zero_offset_range_deg"):
+            cfg_i.joint_zero_offset_range_deg = {k: 0.0 for k in cfg_i.joint_zero_offset_range_deg}
+        if hasattr(cfg_i, "friction_randomization_range"):
+            cfg_i.friction_randomization_range = (0.5, 0.5)
+            cfg_i.dynamic_friction_ratio_range = (1.0, 1.0)
 
         print("[DIAG] about to gym.make()", flush=True)
         env = gym.make(args_cli.task, cfg=cfg_i, render_mode=None)
