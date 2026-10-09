@@ -135,6 +135,7 @@ import hashlib
 import json
 import logging
 import math
+import select
 import signal
 import sys
 import time
@@ -238,6 +239,12 @@ class JointConfig:
     # Multiplier on the bus's base gear ratio for joints with a non-standard
     # reduction (e.g. an extra belt stage): effective ratio = extra_gear_ratio
     # * base_gear_ratio. Leave at 1.0 for joints on the standard reduction.
+    startup_offset_deg: float = 0.0
+    # Added to default_pos_deg for the REST pose only: the --startup-pose
+    # 'default' move and the soft-stop ramp (see Deployment.run()). The
+    # policy's action anchor stays default_pos_deg -- that one must match
+    # training. 2026-10-09: ankles 3 deg forward so the robot stands on its
+    # own before the policy starts / after a soft stop.
 
 
 @dataclass
@@ -938,8 +945,26 @@ class Deployment:
         startup_move_duration: float = 2.0,
         action_smoothing: float = 1.0,  # keep in sync with --action-smoothing's default
         max_target_step_deg: Optional[float] = None,
+        stop_move_duration: float = 2.0,
+        soft_stop_phases: tuple = (0.8, 1.9),
+        verbose: bool = False,
     ):
         self.robot_cfg = robot_cfg
+        # verbose: print the old per-step CURRENT/TARGETS/IMU/STEP lines.
+        # Otherwise one status line per second (see run()). The CSV and the
+        # events log are the same either way.
+        self.verbose = verbose
+        self.stop_move_duration = stop_move_duration
+        # motion_time points where a soft stop may begin its ramp to the rest
+        # pose. From the feetfix_clamp_276599 hardware logs (2026-10-09):
+        # both feet down, body roll at its turning point (roll speed ~0) and
+        # every target within ~4-5 deg of default_pos_deg at ~0.8 and ~1.9 s.
+        # NOT the reference's own weight-centred points (0 and 1.1 s): the
+        # policy already starts the next swing there (right knee target
+        # -20 -> +4, left hip roll -12.7 at 1.0-1.08 s), and the first two
+        # soft-stop tests ramped from that and fell to the left. Re-check
+        # for a new policy (per-phase target distance in the CSV).
+        self.soft_stop_phases = tuple(soft_stop_phases)
         self.policy = policy
         self.open_loop_ref = open_loop_ref
         self.logger = logger
@@ -1092,6 +1117,11 @@ class Deployment:
         self.default_pose_rad = {
             j.name: math.radians(j.default_pos_deg) for j in robot_cfg.joints
         }
+        # Where the robot stands while the policy is NOT running (startup
+        # move, soft stop): default_pos_deg + startup_offset_deg.
+        self.rest_pose_rad = {
+            j.name: math.radians(j.default_pos_deg + j.startup_offset_deg) for j in robot_cfg.joints
+        }
 
         # "auto" resolves to "keyframe" only for --open-loop-ref (which
         # needs to start on the reference trajectory it's about to command
@@ -1143,7 +1173,7 @@ class Deployment:
         if self.startup_pose_mode == "zero":
             return {j.name: 0.0 for j in self.robot_cfg.joints}
         elif self.startup_pose_mode == "default":
-            return dict(self.default_pose_rad)
+            return dict(self.rest_pose_rad)
         elif self.startup_pose_mode == "keyframe":
             # Zipped positionally against robot_cfg.joints (NOT
             # policy_joint_order) -- this is a property of the shared
@@ -1156,7 +1186,8 @@ class Deployment:
         else:
             raise ValueError(f"_startup_pose_targets() called with mode='none'")
 
-    def move_to_pose(self, target_output_rad: dict, duration: float):
+    def move_to_pose(self, target_output_rad: dict, duration: float, start: Optional[dict] = None,
+                     label: Optional[str] = None, tilt_guard: bool = False) -> dict:
         """
         Smoothly ramps every joint from its CURRENT position (freshly read,
         not assumed) to target_output_rad over `duration` seconds, at
@@ -1166,11 +1197,21 @@ class Deployment:
         requested duration would require bigger steps than that -- slower
         and safe beats fast and tripping the StepLimitExceeded abort
         partway through a startup move.
+
+        `start` (the soft stop): ramp from these targets (the last commanded
+        ones) instead of a fresh read -- read_motor() is a kp=kd=0 command,
+        i.e. it would drop the standing robot for a moment. `tilt_guard`
+        reads the IMU every step and aborts past robot_cfg.max_tilt_deg.
+        Returns the last step's readings.
         """
         dt = self.robot_cfg.control_dt
-        readings = self._read_all_motors()
-        check_motor_safety(readings, self.robot_cfg.motor_temp_limit_c)
-        current = {name: r.output_pos_rad for name, r in readings.items()}
+        if start is None:
+            readings = self._read_all_motors()
+            check_motor_safety(readings, self.robot_cfg.motor_temp_limit_c)
+            current = {name: r.output_pos_rad for name, r in readings.items()}
+        else:
+            readings = {}
+            current = dict(start)
 
         max_step_rad = math.radians(self.robot_cfg.max_step_deg)
         max_delta = max(abs(target_output_rad[name] - current[name]) for name in current)
@@ -1178,9 +1219,10 @@ class Deployment:
         n_steps = max(min_steps_for_safety, max(1, int(round(duration / dt))))
         actual_duration = n_steps * dt
 
+        label = label or f"'{self.startup_pose_mode}' startup"
         self.logger.info(
-            "Moving to '%s' startup pose over %.2fs (%d steps @ %.0fms, largest joint delta %.1f deg)...",
-            self.startup_pose_mode, actual_duration, n_steps, dt * 1000, math.degrees(max_delta),
+            "Moving to %s pose over %.2fs (%d steps @ %.0fms, largest joint delta %.1f deg)...",
+            label, actual_duration, n_steps, dt * 1000, math.degrees(max_delta),
         )
 
         try:
@@ -1191,18 +1233,86 @@ class Deployment:
                     name: current[name] + alpha * (target_output_rad[name] - current[name])
                     for name in current
                 }
+                if tilt_guard:
+                    gravity_dir, _ = self.imu.read_robot_frame()
+                    tilt_deg = math.degrees(math.acos(max(-1.0, min(1.0, -gravity_dir[2]))))
+                    if step == 1 or step % 10 == 0:
+                        self.logger.info(
+                            "  %s ramp %3.0f%%: body roll %+5.1f pitch %+5.1f deg (IMU)", label, 100.0 * alpha,
+                            math.degrees(math.asin(max(-1.0, min(1.0, gravity_dir[0])))),
+                            math.degrees(math.asin(max(-1.0, min(1.0, gravity_dir[1])))),
+                        )
+                    if tilt_deg > self.robot_cfg.max_tilt_deg:
+                        raise TiltExceeded(tilt_deg, self.robot_cfg.max_tilt_deg)
                 self._validate_targets_all(targets, self.robot_cfg.max_step_deg)
-                step_readings = self._send_targets_all(targets)
-                check_motor_safety(step_readings, self.robot_cfg.motor_temp_limit_c)
+                readings = self._send_targets_all(targets)
+                check_motor_safety(readings, self.robot_cfg.motor_temp_limit_c)
                 elapsed = time.perf_counter() - step_start
                 if elapsed < dt:
                     time.sleep(dt - elapsed)
         except SafetyAbort as e:
-            self.logger.error("SAFETY ABORT during startup move: %s", e)
+            self.logger.error("SAFETY ABORT during the move to the %s pose: %s", label, e)
             self._release_all()
             raise
 
-        self.logger.info("Startup pose reached.")
+        self.logger.info("%s pose reached.", label[0].upper() + label[1:])
+        return readings
+
+    def _last_commanded_targets(self) -> dict:
+        """What every motor was last told to hold (MotorBus.send_targets keeps it)."""
+        targets = {}
+        for bus in self.buses:
+            targets.update(bus.last_commanded_output_rad)
+        return targets
+
+    def _enter_pressed(self) -> bool:
+        """Non-blocking check for a line typed on the terminal (Enter = soft stop)."""
+        if not sys.stdin.isatty():
+            return False
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+        if not ready:
+            return False
+        sys.stdin.readline()
+        return True
+
+    def _hold_and_ask(self, targets: dict, question: str):
+        """Keeps commanding `targets` every control step (with the usual limit
+        and motor checks) while waiting for an answer on the terminal, instead
+        of a blocking input(): Ctrl+C still works here (the SIGINT handler only
+        sets self._stop, which a blocking input() would never look at).
+        Returns (answer or None on Ctrl+C/SIGTERM, last readings)."""
+        dt = self.robot_cfg.control_dt
+        print(question, end="", flush=True)
+        readings = {}
+        while not self._stop:
+            step_start = time.perf_counter()
+            self._validate_targets_all(targets, self.robot_cfg.max_step_deg)
+            readings = self._send_targets_all(targets)
+            check_motor_safety(readings, self.robot_cfg.motor_temp_limit_c)
+            ready, _, _ = select.select([sys.stdin], [], [], 0)
+            if ready:
+                return sys.stdin.readline().strip().lower(), readings
+            elapsed = time.perf_counter() - step_start
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
+        print()
+        return None, readings
+
+    def _soft_stop(self, last_targets: dict):
+        """Ramps from the last commanded targets to the rest pose (tilt-guarded),
+        then holds it and asks whether to release the motors. Returns
+        (release, readings)."""
+        self.move_to_pose(self.rest_pose_rad, self.stop_move_duration, start=last_targets,
+                          label="rest", tilt_guard=True)
+        answer, readings = self._hold_and_ask(
+            self.rest_pose_rad,
+            "Soft stop: holding the rest pose. Release motors? [Y/n] (n = start the policy again) ",
+        )
+        if answer is None or answer in ("", "y", "yes"):
+            self.logger.info("Soft stop finished, releasing motors.")
+            return True, readings
+        self.logger.info("Restarting the policy from the rest pose (motion_time 0).")
+        return False, readings
 
     def startup_sequence(self):
         self.logger.info("Calibrating from current motor positions...")
@@ -1220,13 +1330,14 @@ class Deployment:
             sys.exit(0)
 
         if self.startup_pose_mode != "none":
-            self.move_to_pose(self._startup_pose_targets(), self.startup_move_duration)
-
-        answer = input(
-            "Start pose reached: Continue and start policy? [y/N] "
-        )
-        if answer.strip().lower() != "y":
-            self.logger.info("User declined startup confirmation. Exiting without enabling motors.")
+            pose = self._startup_pose_targets()
+            self.move_to_pose(pose, self.startup_move_duration)
+            # held (re-commanded every step) while waiting, so Ctrl+C works
+            answer, _ = self._hold_and_ask(pose, "Start pose reached: Continue and start policy? [y/N] ")
+        else:
+            answer = input("Continue and start policy? [y/N] ")
+        if answer is None or answer.strip().lower() != "y":
+            self.logger.info("User declined startup confirmation. Releasing motors and exiting.")
             self._release_all()
             sys.exit(0)
 
@@ -1266,7 +1377,12 @@ class Deployment:
         step = 0
         run_start = time.perf_counter()
         try:
-            new_readings = self._read_all_motors()
+            # Re-command what the motors were last told rather than
+            # _read_all_motors(): a read is a kp=kd=0 command, which dropped
+            # the robot for a moment right before the first policy step.
+            hold = self._last_commanded_targets()
+            self._validate_targets_all(hold, self.robot_cfg.max_step_deg)
+            new_readings = self._send_targets_all(hold)
             check_motor_safety(new_readings, self.robot_cfg.motor_temp_limit_c)
 
             # Re-warm the policy right before the timed loop starts, not
@@ -1292,13 +1408,23 @@ class Deployment:
                     for _ in range(5):
                         self.policy(warm_obs)
 
+            # Soft stop (Enter): keep running the policy until motion_time
+            # reaches the next of self.soft_stop_phases, then ramp to the rest
+            # pose and ask whether to release. Ctrl+C stays the immediate stop.
+            soft_stop_requested = False
+            print("Policy running.  Enter = soft stop (finish the step, back to the rest pose)   "
+                  "Ctrl+C = immediate stop (motors off)", flush=True)
+            status_due = run_start + 1.0
+            max_tilt_win = 0.0
+            max_loop_ms_win = 0.0
+
             while not self._stop:
                 loop_start = time.perf_counter()
 
                 readings = new_readings
 
-                print(f"CURRENT  LEFT HIP YAW: {math.degrees(readings['left_hip_yaw'].output_pos_rad):10.5f}  HIP ROLL: {math.degrees(readings['left_hip_roll'].output_pos_rad):10.5f}  HIP PITCH: {math.degrees(readings['left_hip_pitch'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['left_knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['left_ankle'].output_pos_rad):10.5f}")
-                print(f"CURRENT RIGHT HIP YAW: {math.degrees(readings['right_hip_yaw'].output_pos_rad):10.5f}  HIP ROLL: {math.degrees(readings['right_hip_roll'].output_pos_rad):10.5f}  HIP PITCH: {math.degrees(readings['right_hip_pitch'].output_pos_rad):10.5f}  KNEE: {math.degrees(readings['right_knee'].output_pos_rad):10.5f}  ANKLE: {math.degrees(readings['right_ankle'].output_pos_rad):10.5f}")
+                if self.verbose:
+                    self._print_joint_row("CURRENT", {n: r.output_pos_rad for n, r in readings.items()})
                 try:
                     obs = self.build_obs(readings)
                 except imu_sensor.ImuTelemetryFault:
@@ -1315,13 +1441,14 @@ class Deployment:
                     raise
                 imu_ms = self._last_imu_ms
                 gravity_dir, ang_vel_rad_s = self._last_imu_reading
-                print(
-                    f"IMU  gravity(x,y,z)=({gravity_dir[0]:+.3f}, {gravity_dir[1]:+.3f}, {gravity_dir[2]:+.3f})"
-                    f"  [expect ~(0,0,-1) when level]"
-                    f"  ang_vel_deg_s=({math.degrees(ang_vel_rad_s[0]):+7.2f}, "
-                    f"{math.degrees(ang_vel_rad_s[1]):+7.2f}, {math.degrees(ang_vel_rad_s[2]):+7.2f})"
-                    f"  imu_ms={imu_ms:.1f}"
-                )
+                if self.verbose:
+                    print(
+                        f"IMU  gravity(x,y,z)=({gravity_dir[0]:+.3f}, {gravity_dir[1]:+.3f}, {gravity_dir[2]:+.3f})"
+                        f"  [expect ~(0,0,-1) when level]"
+                        f"  ang_vel_deg_s=({math.degrees(ang_vel_rad_s[0]):+7.2f}, "
+                        f"{math.degrees(ang_vel_rad_s[1]):+7.2f}, {math.degrees(ang_vel_rad_s[2]):+7.2f})"
+                        f"  imu_ms={imu_ms:.1f}"
+                    )
 
                 ref = self.motion.sample(self.motion_time)
 
@@ -1408,8 +1535,8 @@ class Deployment:
                             if self.max_target_step_deg is not None:
                                 self._prev_commanded_targets[joint.name] = targets[joint.name]
 
-                print(f"TARGETS  LEFT HIP YAW: {math.degrees(targets['left_hip_yaw']):10.5f}  HIP ROLL: {math.degrees(targets['left_hip_roll']):10.5f}  HIP PITCH: {math.degrees(targets['left_hip_pitch']):10.5f}  KNEE: {math.degrees(targets['left_knee']):10.5f}  ANKLE: {math.degrees(targets['left_ankle']):10.5f}")
-                print(f"TARGETS RIGHT HIP YAW: {math.degrees(targets['right_hip_yaw']):10.5f}  HIP ROLL: {math.degrees(targets['right_hip_roll']):10.5f}  HIP PITCH: {math.degrees(targets['right_hip_pitch']):10.5f}  KNEE: {math.degrees(targets['right_knee']):10.5f}  ANKLE: {math.degrees(targets['right_ankle']):10.5f}")
+                if self.verbose:
+                    self._print_joint_row("TARGETS", targets)
 
                 bus_start = time.perf_counter()
                 try:
@@ -1447,11 +1574,52 @@ class Deployment:
                 t_wall = loop_start - run_start
                 self._log_step(step, t_wall, readings, obs, action, targets, new_readings, imu_ms, policy_ms, bus_ms)
 
+                prev_motion_time = self.motion_time
                 self.motion_time = (self.motion_time + dt) % self.motion.length
                 step += 1
-                print(f"STEP: {step}  MOTION_TIME: {self.motion_time}")
+                if self.verbose:
+                    print(f"STEP: {step}  MOTION_TIME: {self.motion_time}")
+
+                if not soft_stop_requested and self._enter_pressed():
+                    soft_stop_requested = True
+                    stop_at = min(self.soft_stop_phases,
+                                  key=lambda p: (p - self.motion_time) % self.motion.length)
+                    self.logger.info("Soft stop requested at motion_time %.2f s -- finishing the step, "
+                                     "stopping at motion_time %.2f s.", self.motion_time, stop_at)
+                wrapped = self.motion_time < prev_motion_time
+                if soft_stop_requested and (
+                    (prev_motion_time < stop_at <= self.motion_time)
+                    or (wrapped and (stop_at > prev_motion_time or stop_at <= self.motion_time))
+                ):
+                    self.csv_file.flush()
+                    release, new_readings = self._soft_stop(targets)
+                    if release:
+                        break
+                    # start again, as after startup: from motion_time 0
+                    soft_stop_requested = False
+                    self.motion_time = 0.0
+                    self._smoothed_targets.clear()
+                    self._prev_commanded_targets = dict(self.rest_pose_rad)
+                    status_due = time.perf_counter() + 1.0
+                    print("Policy running.  Enter = soft stop   Ctrl+C = immediate stop", flush=True)
+                    continue
 
                 elapsed = time.perf_counter() - loop_start
+                max_tilt_win = max(max_tilt_win, tilt_deg)
+                max_loop_ms_win = max(max_loop_ms_win, elapsed * 1000.0)
+                if not self.verbose and loop_start >= status_due:
+                    temps = [r.temperature for r in new_readings.values() if r.temperature is not None]
+                    print(
+                        f"t {loop_start - run_start:6.1f}s  step {step:6d}  motion_time {self.motion_time:4.2f}"
+                        f"  |  tilt {tilt_deg:4.1f} (max {max_tilt_win:4.1f}) deg"
+                        f"  |  motor temp max {max(temps) if temps else float('nan'):.0f} C"
+                        f"  |  loop max {max_loop_ms_win:4.1f} ms"
+                        f"  |  clamps: limit {self.limit_clamp_count}, rate {self.rate_limit_clamp_count}",
+                        flush=True,
+                    )
+                    status_due = loop_start + 1.0
+                    max_tilt_win = 0.0
+                    max_loop_ms_win = 0.0
                 sleep_time = dt - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
@@ -1466,6 +1634,14 @@ class Deployment:
             self.logger.info("Deployment stopped, motors released, log file closed. "
                              "Joint-limit clamps: %d, rate-limit clamps: %d.",
                              self.limit_clamp_count, self.rate_limit_clamp_count)
+
+    @staticmethod
+    def _print_joint_row(tag: str, values_rad: dict):
+        for side in ("left", "right"):
+            print(f"{tag} {side.upper():>5} " + "  ".join(
+                f"{j.upper().replace('_', ' ')}: {math.degrees(values_rad[f'{side}_{j}']):10.5f}"
+                for j in ("hip_yaw", "hip_roll", "hip_pitch", "knee", "ankle")
+            ))
 
     def _imu_diagnostic_row(self):
         """Row tail matching write_csv_header's IMU diagnostic columns --
@@ -1586,11 +1762,30 @@ def main():
              "(keyframes[0]) for --open-loop-ref, else 'default' (each "
              "joint's default_pos_deg from robot_config.json -- the same "
              "anchor pose the policy's actions are decoded relative to, "
-             "and what QminiLegEnv resets each training episode to). "
+             "and what QminiLegEnv resets each training episode to -- plus "
+             "the joint's optional startup_offset_deg, the rest pose). "
              "'zero' moves to the raw calibration pose instead. 'none' "
              "skips the move (old behavior -- the first policy/reference "
              "action jumps straight from calibration pose, subject to "
              "--max-step-deg).",
+    )
+    parser.add_argument(
+        "--stop-move-duration", type=float, default=2.0,
+        help="Soft stop (press Enter while the policy runs): seconds to ramp "
+             "from the last policy targets to the rest pose (default_pos_deg + "
+             "startup_offset_deg), after the policy has finished the step.",
+    )
+    parser.add_argument(
+        "--soft-stop-phases", type=str, default="0.8,1.9",
+        help="Comma-separated motion_time values (s) at which a soft stop may "
+             "start ramping to the rest pose: both feet down and the body roll "
+             "turning around (see Deployment.soft_stop_phases).",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Print the per-step CURRENT/TARGETS/IMU/STEP lines (the old "
+             "default). Without it: one status line per second plus the "
+             "warnings. The CSV and events log are the same either way.",
     )
     parser.add_argument(
         "--startup-move-duration", type=float, default=2.0,
@@ -1633,6 +1828,9 @@ def main():
             startup_pose=args.startup_pose, startup_move_duration=args.startup_move_duration,
             action_smoothing=args.action_smoothing,
             max_target_step_deg=args.max_target_step_deg,
+            stop_move_duration=args.stop_move_duration,
+            soft_stop_phases=tuple(float(v) for v in args.soft_stop_phases.split(",")),
+            verbose=args.verbose,
         )
         deployment.startup_sequence()
         deployment.run()

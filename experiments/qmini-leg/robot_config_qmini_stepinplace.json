@@ -10,17 +10,18 @@
   "_imu_mount_comment": "2026-10-04: correction available but set to 0. A first estimate of +3.0/-1.0 assumed the robot top is parallel to base_link; it is NOT (top is 2.841 deg tilted back vs base, IMU mount is parallel to base). On the level stand: raw IMU pitch -0.89 / roll +1.04, phone on top 2-3 deg back -> base ~-0.3 +- 0.5 deg, i.e. IMU agrees within ~0.5 deg. Values are degrees ADDED to reported pitch (+ = back) / roll (+ = left).",
   "imu_mount_pitch_deg": 0.0,
   "imu_mount_roll_deg": 0.0,
+  "_startup_offset_comment": "2026-10-09: startup_offset_deg is added to default_pos_deg ONLY for the rest pose (the --startup-pose default move and the soft-stop ramp), not for the policy's action anchor. Ankles 3 deg forward (left -3 / right +3, same direction as robot_config_qmini_stepinplace_ankle_fwd3.json) so the robot stands on its own before the policy starts and after a soft stop. Training starts episodes with up to +-5 deg ankle noise, so starting the policy from here is in-distribution.",
   "joints": [
     {"name": "left_hip_yaw",    "motor_id": 1, "port": "/dev/ttyUSB3", "invert": false, "kp": 55.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":   0.0,    "min_deg": -45, "max_deg": 30},
     {"name": "left_hip_roll",   "motor_id": 1, "port": "/dev/ttyUSB2", "invert": false, "kp": 360.0, "kd": 18.0, "offset_deg": 0.0, "default_pos_deg":   0.0,    "min_deg": -15, "max_deg": 15, "extra_gear_ratio": 3.0},
     {"name": "left_hip_pitch",  "motor_id": 0, "port": "/dev/ttyUSB1", "invert": true,  "kp": 75.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg": -16.5656, "min_deg": -50, "max_deg": 50},
     {"name": "left_knee",       "motor_id": 1, "port": "/dev/ttyUSB1", "invert": false, "kp": 45.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":  22.5569, "min_deg": -60, "max_deg": 50},
-    {"name": "left_ankle",      "motor_id": 2, "port": "/dev/ttyUSB1", "invert": false, "kp": 30.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":  12.9913, "min_deg": -60, "max_deg": 40},
+    {"name": "left_ankle",      "motor_id": 2, "port": "/dev/ttyUSB1", "invert": false, "kp": 30.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":  12.9913, "startup_offset_deg": -3.0, "min_deg": -60, "max_deg": 40},
 
     {"name": "right_hip_yaw",   "motor_id": 0, "port": "/dev/ttyUSB3", "invert": false, "kp": 55.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":   0.0,    "min_deg": -30, "max_deg": 45},
     {"name": "right_hip_roll",  "motor_id": 0, "port": "/dev/ttyUSB2", "invert": false, "kp": 360.0, "kd": 18.0, "offset_deg": 0.0, "default_pos_deg":   0.0,    "min_deg": -15, "max_deg": 15, "extra_gear_ratio": 3.0},
     {"name": "right_hip_pitch", "motor_id": 0, "port": "/dev/ttyUSB0", "invert": true,  "kp": 75.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":  16.5656, "min_deg": -50, "max_deg": 50},
     {"name": "right_knee",      "motor_id": 1, "port": "/dev/ttyUSB0", "invert": false, "kp": 45.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg": -22.5569, "min_deg": -50, "max_deg": 60},
-    {"name": "right_ankle",     "motor_id": 2, "port": "/dev/ttyUSB0", "invert": false, "kp": 30.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg": -12.9913, "min_deg": -40, "max_deg": 60}
+    {"name": "right_ankle",     "motor_id": 2, "port": "/dev/ttyUSB0", "invert": false, "kp": 30.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg": -12.9913, "startup_offset_deg":  3.0, "min_deg": -40, "max_deg": 60}
   ]
 }
