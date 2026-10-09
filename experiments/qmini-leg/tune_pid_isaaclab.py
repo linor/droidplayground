@@ -121,8 +121,8 @@ def run_sim_trace(args, gains: dict) -> Path:
 
     from droidplayground.assets.qmini import build_qmini_cfg
 
-    physics_dt = 1.0 / 200.0  # matches QminiLegEnvCfg.sim.dt
-    decimation = 4  # matches QminiLegEnvCfg.decimation -> control dt = 0.02
+    physics_dt = 1.0 / 400.0  # matches QminiLegEnvCfg.sim.dt
+    decimation = 8  # matches QminiLegEnvCfg.decimation -> control dt = 0.02
     control_dt = physics_dt * decimation
     if abs(control_dt - args.control_dt) > 1e-6:
         print(

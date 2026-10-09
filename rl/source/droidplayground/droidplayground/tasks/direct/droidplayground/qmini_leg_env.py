@@ -104,7 +104,14 @@ def _load_reference_foot_heights(json_path: Path):
 @configclass
 class QminiLegEnvCfg(DirectRLEnvCfg):
     # env
-    decimation = 4
+    # decimation 4 -> 8 with sim.dt 1/200 -> 1/400 on 2026-10-09: same 20 ms
+    # (50 Hz) policy step, physics twice as fine. The explicit DCMotor PD is
+    # computed once per physics step, and hip_roll's kd=18 is numerically
+    # marginal at 5 ms: it added artificial damping (rigid sim, final
+    # 276599 policy, check_lateral_sway.py: mean|body roll| 3.9 at 5 ms vs
+    # 4.3 at 2.5 ms and 1 ms -- 2.5 ms is converged; real is 6.5), and with
+    # any extra low-inertia DOF in the leg it chatters at 100 Hz.
+    decimation = 8
     episode_length_s = 10.0
     # - spaces definition
     # 10 actuated joints (yaw/roll/pitch/knee/ankle x left/right), see
@@ -162,7 +169,7 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     action_scale = 0.5
 
     # simulation
-    sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=1 / 400, render_interval=decimation)
 
     # Viewport steps:
     # Launch non-headless (drop --headless from train.py/play.py).
@@ -250,12 +257,22 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # floor and just samples longer tails more often. yaw left alone --
     # it never showed up in either sweep. Revisit widening further if this
     # trains cleanly and the sweep still shows either zone.
+    #
+    # NARROWED to (1, 2) for every joint on 2026-10-09: the real
+    # command->actual lag in the recent robot_deploy logs (2026-10-08/09)
+    # is ~60 ms for ALL joints (yaw 40-60). The ranges above gave sim lags
+    # of roll ~100, knee ~105, ankle ~108, pitch ~80, yaw ~65 ms
+    # (check_lateral_sway.py); a fixed 1-step delay gives 58-70 ms. The
+    # 2026-09-03 phase-discontinuity runaway that motivated the widening
+    # predates the deploy target clamp/rate limiter and the newer
+    # policies -- watch for it again (fast transitions, mt~1.0-1.3 /
+    # 2.1-2.2) if hardware runs get worse after this change.
     action_delay_range_steps: dict = {
-        "yaw": (1, 3),
-        "roll": (1, 5),
-        "pitch": (1, 4),
-        "knee": (1, 5),
-        "ankle": (1, 4),
+        "yaw": (1, 2),
+        "roll": (1, 2),
+        "pitch": (1, 2),
+        "knee": (1, 2),
+        "ankle": (1, 2),
     }
 
     # EMA low-pass filter on the FINAL decoded position target (after
@@ -544,6 +561,27 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # effective static friction = U(range), dynamic = static * U(ratio).
     friction_randomization_range: tuple[float, float] = (0.25, 0.8)
     dynamic_friction_ratio_range: tuple[float, float] = (0.8, 1.0)
+
+    # Compliant (implicit spring) contact on the two FOOT collision meshes,
+    # N/m per contact, damping = ratio * 2*sqrt(k * 6 kg). Added 2026-10-09
+    # as the stand-in for the real robot's hidden sideways compliance: in a
+    # standing sideways push test the real robot rocks almost as one block
+    # (per degree of body roll: feet 1.2-1.27 deg via IMU+encoder FK, hip
+    # roll encoders only -0.19..-0.27, ~220 Nm/rad, ~30% of the roll
+    # visible in the encoders), while the rigid sim takes it in the hips
+    # (-0.95, 684 Nm/rad, 95% visible). Soft soles reproduce that (k 3000:
+    # 1.25 / -0.23 / 184 Nm/rad / 25%; k 4000: 1.30 / -0.22 / 194 / 27%;
+    # k 6000: 1.48 / -0.42 / 308 / 43%), and with the 276599 policy they
+    # raise the walking sway toward the real one (mean|body roll| 4.3 rigid
+    # -> 4.9 at k 4000, real 6.5; no falls). A passive ankle roll spring
+    # could NOT reproduce it (gravity-unstable before getting soft enough).
+    # Side effect: ~5 mm static sink at k 4000. Foot heights are measured
+    # against the per-episode captured stance height, so this mostly
+    # cancels, but unloading a foot raises it a few mm before it leaves
+    # the ground. One value for all envs (replicate_physics copies env_0's
+    # materials); None = rigid contact.
+    foot_contact_stiffness: float | None = 4000.0
+    foot_contact_damping_ratio: float = 0.5
 
     # Push disturbances: every push_interval_range_s (independently
     # randomized and re-randomized per env, see that cfg's comment for why
@@ -2904,8 +2942,15 @@ class QminiLegEnv(DirectRLEnv):
         #     device=self.device,
         # )
         self.num_joints = self.cfg.action_space
-        assert len(self.robot.joint_names) == self.num_joints, (
-            f"Expected {self.num_joints} actuated joints (action_space), "
+        # Extra PASSIVE joints (spring-loaded "*_flex" joints modelling
+        # structural compliance, 2026-10-08) are allowed, but only AFTER the
+        # actuated ones -- everything here indexes the actuated joints as
+        # joint_pos[:, :num_joints].
+        extra = self.robot.joint_names[self.num_joints:]
+        assert len(self.robot.joint_names) >= self.num_joints and all(n.endswith("_flex") for n in extra) and not any(
+            n.endswith("_flex") for n in self.robot.joint_names[: self.num_joints]
+        ), (
+            f"Expected {self.num_joints} actuated joints (action_space) first, then only passive *_flex joints, "
             f"but the articulation has {len(self.robot.joint_names)}: "
             f"{self.robot.joint_names}"
         )
@@ -3127,7 +3172,7 @@ class QminiLegEnv(DirectRLEnv):
                     f"entry to cfg.action_delay_range_steps covering it."
                 )
 
-        keyframes, degrees = _load_reference_keyframes(KEYFRAMES_PATH, self.robot.joint_names)
+        keyframes, degrees = _load_reference_keyframes(KEYFRAMES_PATH, self.robot.joint_names[: self.num_joints])
         self.motion = MotionPlayer(
             keyframes=keyframes,
             device=self.device,
@@ -3380,6 +3425,17 @@ class QminiLegEnv(DirectRLEnv):
                 friction_combine_mode="multiply",
             )
         ))
+        # soft soles (cfg.foot_contact_stiffness), bound on env_0 before cloning
+        if self.cfg.foot_contact_stiffness is not None:
+            k = float(self.cfg.foot_contact_stiffness)
+            sole_cfg = RigidBodyMaterialCfg(
+                static_friction=0.5, dynamic_friction=0.5, restitution=0.0,
+                compliant_contact_stiffness=k,
+                compliant_contact_damping=self.cfg.foot_contact_damping_ratio * 2.0 * math.sqrt(k * 6.0),
+            )
+            sole_cfg.func("/World/Materials/foot_sole", sole_cfg)
+            for name in (self.cfg.left_foot_body_name, self.cfg.right_foot_body_name):
+                sim_utils.bind_physics_material(f"/World/envs/env_0/Robot/{name}", "/World/Materials/foot_sole")
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
         # we need to explicitly filter collisions for CPU simulation
@@ -4202,12 +4258,14 @@ class QminiLegEnv(DirectRLEnv):
         # straight to sample_uniform, since that helper's low/high are
         # documented for the same scalar-range-per-call usage the gain
         # randomization above uses, not per-element bounds.
-        unit_noise = sample_uniform(-1.0, 1.0, default_joint_pos.shape, device=self.device)
+        nj = self.num_joints  # actuated joints only; passive *_flex joints (if any) start at their default
+        unit_noise = sample_uniform(-1.0, 1.0, (default_joint_pos.shape[0], nj), device=self.device)
         joint_pos_noise = unit_noise * self._startup_joint_pos_noise_range_rad
         # Sample this episode's zero-calibration offsets first: the robot
         # starts at its BELIEVED default pose = true default + offset.
         self._randomize_joint_zero_offset(env_ids)
-        randomized_joint_pos = default_joint_pos + joint_pos_noise + self._joint_zero_offset_rad[env_ids]
+        randomized_joint_pos = default_joint_pos.clone()
+        randomized_joint_pos[:, :nj] += joint_pos_noise + self._joint_zero_offset_rad[env_ids]
         self.robot.write_joint_state_to_sim(randomized_joint_pos, default_joint_vel, env_ids=env_ids)
 
         # self.phase_modulator.reset(

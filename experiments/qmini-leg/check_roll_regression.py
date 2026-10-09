@@ -66,6 +66,13 @@ CSV_REGISTRY = [
     ("margin13_hw_a8",    "control_loop_20261005_125504.csv", "FAILED: left_hip_roll -18.84deg"),
     ("margin13_fwd2_a12", "control_loop_20261005_135958.csv", "FAILED: left_hip_roll -15.55deg"),
     ("margin13_fwd3_a18", "control_loop_20261005_143656.csv", "FAILED: left_hip_roll -17.21deg"),
+    # 2026-10-07, clamp_241600 bundle (feetfix + sim clamp), the first
+    # real logs from the new symmetric gait: no aborts, all stopped at the
+    # wall; robot_deploy.py clamped right_hip_roll ~1% of steps (max 16.1).
+    ("clamp241600_tight_a1", "control_loop_20261007_172209.csv", "OK (wall); 35 clamps, max +15.01deg"),
+    ("clamp241600_tight_a2", "control_loop_20261007_172649.csv", "OK (wall); 39 clamps, max +16.08deg"),
+    ("clamp241600_loose_a3", "control_loop_20261007_172954.csv", "OK (wall); 26 clamps, max +15.03deg"),
+    ("clamp241600_loose_a4", "control_loop_20261007_173258.csv", "OK (wall); 24 clamps, max +15.05deg"),
 ]
 
 ROLL_LIMIT_DEG = 15.0

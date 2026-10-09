@@ -109,8 +109,8 @@ def run_sweep(args):
 
     from droidplayground.assets.qmini import QMINI_CFG
 
-    physics_dt = 1.0 / 200.0  # matches QminiLegEnvCfg.sim.dt
-    decimation = 4  # matches QminiLegEnvCfg.decimation -> control dt = 0.02
+    physics_dt = 1.0 / 400.0  # matches QminiLegEnvCfg.sim.dt
+    decimation = 8  # matches QminiLegEnvCfg.decimation -> control dt = 0.02
     control_dt = physics_dt * decimation
 
     sim = SimulationContext(SimulationCfg(dt=physics_dt))
