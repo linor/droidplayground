@@ -2954,6 +2954,21 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # sideways sway (~0.55 Hz at the 2x time scale), which an EMA with a
     # ~1 s time constant attenuates ~3.6x.
     velocity_ema_tau_s: float = 1.0
+    # RESIDUAL actions (walking, 2026-10-13): joint target = reference(phase,
+    # command) + action_scale * action instead of default_joint_pos +
+    # action_scale * action. With absolute actions the network had to
+    # reproduce all 225 library gait cycles from (phase, command) internally:
+    # after ~15k iterations of warm-started training it walked forward /
+    # backward at ~0.12-0.15 of 0.175 m/s but turned only ~0.2 of 0.3 rad/s,
+    # coupled yaw into forward walking and never picked up strafing, with
+    # 12-18 deg joint tracking errors. Residual: the generator's gait does
+    # the walking, the policy learns the balance corrections. The reference
+    # is added BEFORE the action-delay buffer (the whole target is delayed,
+    # as on hardware); action_rate / step_limit penalties still see only the
+    # policy's own action changes. Needs a fresh start (the meaning of the
+    # action changes), and robot_deploy.py needs the library too (bundled by
+    # export_policy_for_deployment.py --gait-library).
+    residual_actions: bool = False
 
 
 @configclass
@@ -2963,6 +2978,10 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     policies were trained at: vx +-0.175 m/s, vy +-0.08 m/s, wz +-0.3 rad/s."""
     gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x.npz")
     observation_space = 31
+    residual_actions: bool = True
+    # half the step-in-place scale: the reference carries the motion, the
+    # policy only corrects (also halves the target jitter from exploration noise)
+    action_scale = 0.25
     # Velocity tracking ON (it was 0 for stepping in place, where any base
     # velocity was only drift): the main signal that makes the robot move.
     position_reward_weight: float = 3.0
@@ -3597,7 +3616,15 @@ class QminiLegEnv(DirectRLEnv):
         # read_idx is (num_envs, action_space), a different delay per
         # joint, so a plain env-indexed gather isn't enough; use
         # torch.gather along the buffer-length dimension instead.
-        self._action_buffer[:, self._buffer_ptr, :] = self.actions
+        if self.cfg.residual_actions:
+            # residual: express reference(phase) + scale*action as the
+            # equivalent offset from default_joint_pos, so the delay buffer
+            # and _apply_action stay unchanged (see cfg.residual_actions)
+            ref = self.motion.sample(self.motion_time)
+            buffered = self.actions + (ref - self.robot.data.default_joint_pos[:, : self.cfg.action_space]) / self.cfg.action_scale
+        else:
+            buffered = self.actions
+        self._action_buffer[:, self._buffer_ptr, :] = buffered
         read_idx = (self._buffer_ptr - self._action_delay_steps) % self._action_buffer_len
         self._delayed_actions = self._action_buffer.gather(1, read_idx.unsqueeze(1)).squeeze(1)
         self._buffer_ptr = (self._buffer_ptr + 1) % self._action_buffer_len

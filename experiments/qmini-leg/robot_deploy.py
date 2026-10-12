@@ -147,7 +147,7 @@ import torch
 
 import imu_sensor
 import gamepad as gp
-from walk_command import CommandTable, CommandInput
+from walk_command import CommandTable, CommandInput, ReferenceGait
 
 # ---------------------------------------------------------------------------
 # unitree_actuator_sdk import
@@ -424,11 +424,15 @@ def load_and_verify_policy(
             f"(order may differ, but every joint name must appear in both)."
         )
     if abs(meta.get("action_scale", robot_cfg.action_scale) - robot_cfg.action_scale) > 1e-9:
+        # The policy's own metadata wins (2026-10-13): the walking policies
+        # use 0.25 (residual actions) while robot configs carry the
+        # step-in-place 0.5 -- the config value would double every correction.
         logger.warning(
             "Policy metadata action_scale (%.4f) differs from robot config "
-            "action_scale (%.4f) -- using robot config value. Confirm this is intentional.",
+            "action_scale (%.4f) -- using the POLICY's value.",
             meta.get("action_scale"), robot_cfg.action_scale,
         )
+        robot_cfg.action_scale = float(meta["action_scale"])
 
     # action_smoothing (the EMA low-pass on decoded targets -- see
     # qmini_leg_env.py's cfg.action_smoothing) now trains as a permanent
@@ -1011,6 +1015,7 @@ class Deployment:
         verbose: bool = False,
         command_meta: Optional[dict] = None,
         gamepad_device: Optional[str] = None,
+        reference_library: Optional[Path] = None,
     ):
         self.robot_cfg = robot_cfg
         # verbose: print the old per-step CURRENT/TARGETS/IMU/STEP lines.
@@ -1071,6 +1076,16 @@ class Deployment:
                 self.cmd_table.lo[2], self.cmd_table.hi[2], self.cmd_table.time_scale,
                 pad.path if pad.connected else "NOT FOUND (command stays 0 until it connects)",
             )
+        # RESIDUAL-action policies (meta action_mode "residual"): the joint
+        # target is the library reference at (command, phase) + action_scale *
+        # action, exactly as in QminiLegEnv (cfg.residual_actions).
+        self.ref_gait = None
+        if reference_library is not None:
+            if not self.walking:
+                raise ValueError("a residual-action policy needs the walking command block in its meta")
+            self.ref_gait = ReferenceGait(reference_library)
+            self.logger.info("RESIDUAL actions: targets = reference gait (%s) + %.2f * action",
+                             reference_library, robot_cfg.action_scale)
         write_csv_header(self.csv_writer, self.policy_joint_order, robot_cfg.joint_names, walking=self.walking)
 
         for joint in robot_cfg.joints:
@@ -1630,11 +1645,22 @@ class Deployment:
                     # robot_cfg.joints -- action[i] means whatever joint
                     # policy_joint_order[i] names, which may not be
                     # robot_cfg.joints[i].
-                    targets = {
-                        name: self.default_pose_rad[name]
-                        + self.robot_cfg.action_scale * float(action[i])
-                        for i, name in enumerate(self.policy_joint_order)
-                    }
+                    if self.ref_gait is not None:
+                        # the target the sim applies after this step's phase
+                        # advance: reference at the NEXT phase (see
+                        # QminiLegEnv._pre_physics_step, residual branch)
+                        ref = self.ref_gait.joint_ref(self.cmd_input.cmd,
+                                                      (self.motion_time + self.phase_step(dt)) % 1.0)
+                        targets = {
+                            name: ref[name] + self.robot_cfg.action_scale * float(action[i])
+                            for i, name in enumerate(self.policy_joint_order)
+                        }
+                    else:
+                        targets = {
+                            name: self.default_pose_rad[name]
+                            + self.robot_cfg.action_scale * float(action[i])
+                            for i, name in enumerate(self.policy_joint_order)
+                        }
                 policy_ms = (time.perf_counter() - policy_start) * 1000.0
 
                 # See FROZEN_JOINTS' module-level comment -- temporary,
@@ -2044,6 +2070,7 @@ def main():
     deployment = None
     try:
         policy_joint_order = None
+        residual_library = None
         if args.open_loop_ref:
             if args.policy or args.policy_meta:
                 logger.info("--open-loop-ref set: ignoring --policy/--policy-meta, the policy will not be called.")
@@ -2056,6 +2083,15 @@ def main():
                 action_smoothing=args.action_smoothing,
             )
             policy_joint_order = meta["joint_order"]
+            if meta.get("action_mode") == "residual":
+                lib_file = (meta.get("command") or {}).get("library_file")
+                if not lib_file:
+                    parser.error("residual-action policy meta has no command.library_file")
+                residual_library = args.policy.parent / lib_file
+                want = meta["command"].get("library_sha256")
+                got = hashlib.sha256(residual_library.read_bytes()).hexdigest()
+                if want and got != want:
+                    raise PolicyMismatchError(f"{residual_library} sha256 {got} != meta {want} -- copy the whole bundle")
 
         deployment = Deployment(
             robot_cfg, policy, logger, csv_writer, csv_file,
@@ -2068,6 +2104,7 @@ def main():
             soft_stop_phases=tuple(float(v) for v in args.soft_stop_phases.split(",")),
             command_meta=(meta.get("command") if not args.open_loop_ref else None),
             gamepad_device=args.gamepad,
+            reference_library=residual_library,
             verbose=args.verbose,
         )
         deployment.startup_sequence()

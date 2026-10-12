@@ -204,6 +204,12 @@ def main():
              "ranges + gait-period table in policy.meta.json -- robot_deploy.py advances the phase "
              "by control_dt / period(command) and clamps the gamepad command to these ranges.",
     )
+    parser.add_argument(
+        "--residual-actions", action="store_true",
+        help="Policy trained with QminiLegEnvCfg.residual_actions (joint target = library reference + "
+             "action_scale * action). Requires --gait-library; the library is copied into the bundle "
+             "(gait_library.npz) because robot_deploy.py needs the reference too.",
+    )
     parser.add_argument("--actor-hidden-dims", nargs="+", type=int, default=[128, 128, 128])
     parser.add_argument("--activation", default="elu", choices=["elu", "relu", "tanh"])
     args = parser.parse_args()
@@ -220,13 +226,19 @@ def main():
     obs_dim = n_joints * 2 + 6 + 2
     action_dim = n_joints
     command_meta = None
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.gait_library is not None:
         import numpy as np
         lib = np.load(args.gait_library)
         obs_dim += 3
         args.obs_terms = list(args.obs_terms) + ["command_vx", "command_vy", "command_wz"]
+        if args.residual_actions:
+            import shutil
+            shutil.copyfile(args.gait_library, args.output_dir / "gait_library.npz")
         command_meta = {
             "gait_library": str(args.gait_library),
+            "library_file": "gait_library.npz" if args.residual_actions else None,
+            "library_sha256": hashlib.sha256(Path(args.gait_library).read_bytes()).hexdigest(),
             "units": "vx forward m/s, vy left m/s, wz CCW rad/s (robot units, time scale applied)",
             "time_scale": float(lib["time_scale"]),
             "vx": [float(v) for v in lib["vx"]], "vy": [float(v) for v in lib["vy"]], "wz": [float(v) for v in lib["wz"]],
@@ -288,6 +300,10 @@ def main():
     }
     if command_meta is not None:
         meta["command"] = command_meta
+    if args.residual_actions:
+        if command_meta is None:
+            raise SystemExit("--residual-actions needs --gait-library")
+        meta["action_mode"] = "residual"   # target = reference(phase, command) + action_scale * action
     meta_out_path = args.output_dir / "policy.meta.json"
     meta_out_path.write_text(json.dumps(meta, indent=2))
 

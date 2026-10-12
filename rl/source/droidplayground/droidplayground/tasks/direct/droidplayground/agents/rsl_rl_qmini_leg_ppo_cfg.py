@@ -260,6 +260,7 @@ class QMiniLegPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 @configclass
 class QMiniWalkPPORunnerCfg(QMiniLegPPORunnerCfg):
     """Walking task (DroidPlayground-QMini-Walk): same PPO setup, own log dir.
-    Warm start from a step-in-place checkpoint widened to the 31-dim
-    observation with experiments/qmini-leg/widen_checkpoint_obs.py."""
-    experiment_name = "qmini-walk"
+    Residual actions since 2026-10-13 (QminiWalkEnvCfg.residual_actions):
+    FRESH START -- checkpoints from logs/rsl_rl/qmini-walk (absolute actions,
+    warm-started via widen_checkpoint_obs.py) are not compatible."""
+    experiment_name = "qmini-walk-residual"

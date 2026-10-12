@@ -105,3 +105,48 @@ class CommandInput:
 
     def is_zero(self, eps: float = 1e-4) -> bool:
         return all(abs(v) < eps for v in self.cmd)
+
+
+# Library joint names (gen_gait_library.JOINT_ORDER) -> robot_config joint names.
+_LIB_TO_ROBOT = {"yaw": "hip_yaw", "roll": "hip_roll", "pitch": "hip_pitch", "knee": "knee", "ankle": "ankle"}
+
+
+class ReferenceGait:
+    """Residual-action policies (policy meta action_mode == "residual"): the
+    joint reference the policy's action is added to, interpolated exactly like
+    QminiLegEnv's GaitLibrary -- trilinear in the command, linear in the 0..1
+    phase -- from the gait_library.npz copied into the bundle. Angles in
+    radians, the policy's own (PhysX / calibrated) sign convention."""
+
+    def __init__(self, path):
+        import numpy as np
+        z = np.load(path)
+        self.np = np
+        self.axes = [np.asarray(z[k], float) for k in ("vx", "vy", "wz")]
+        self.joints = np.radians(np.asarray(z["joint_pos_deg"], float))     # (nx, ny, nz, nph, 10)
+        self.nph = self.joints.shape[3]
+        names = []
+        for n in z["joint_order"]:
+            side, j = str(n).split("_", 1)
+            names.append(f"{side}_{_LIB_TO_ROBOT[j]}")
+        self.names = names
+
+    def joint_ref(self, cmd, phase) -> dict:
+        np = self.np
+        idx, frac = [], []
+        for v, ax in zip(cmd, self.axes):
+            v = min(max(float(v), ax[0]), ax[-1])
+            i = int(np.clip(np.searchsorted(ax, v) - 1, 0, len(ax) - 2))
+            idx.append(i); frac.append((v - ax[i]) / (ax[i + 1] - ax[i]))
+        x = (phase % 1.0) * self.nph
+        i0 = int(math.floor(x)) % self.nph; i1 = (i0 + 1) % self.nph; a = x - math.floor(x)
+        out = np.zeros(self.joints.shape[-1])
+        for dx in (0, 1):
+            for dy in (0, 1):
+                for dz in (0, 1):
+                    w = (frac[0] if dx else 1 - frac[0]) * (frac[1] if dy else 1 - frac[1]) * (frac[2] if dz else 1 - frac[2])
+                    if w == 0.0:
+                        continue
+                    c = self.joints[idx[0] + dx, idx[1] + dy, idx[2] + dz]
+                    out += w * (c[i0] + a * (c[i1] - c[i0]))
+        return dict(zip(self.names, out.tolist()))
