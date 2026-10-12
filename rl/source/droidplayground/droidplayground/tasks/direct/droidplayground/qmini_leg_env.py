@@ -2971,6 +2971,16 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     # behind a ramping command is fine.
     position_deviation_margin_m: float = 0.15
     heading_deviation_margin_deg: float = 20.0
+    # Sharper tracking, 2026-10-12 (resume from 2026-10-12_14-47-29 at
+    # ~325.7k): with the step-in-place scales (velocity 25, yaw rate 5) the
+    # policy learned forward/backward speed (+0.165 of 0.175 m/s) but traded
+    # heading for it -- walking forward turned it right at -0.19 rad/s,
+    # backward left at +0.22, turn-left reached only 0.11 of 0.3 rad/s, and
+    # strafing (0.08 m/s) wasn't picked up at all (walk_eval, fixed commands).
+    # A 0.2 rad/s yaw-rate error cost ~0.4 reward vs ~0.7 for 0.1 m/s of
+    # speed; a missed strafe ~0.45. Scale 20 / 50 makes those ~1.4 / ~0.8.
+    heading_reward_scale: float = 20.0
+    position_reward_scale: float = 50.0
 
 
 class QminiLegEnv(DirectRLEnv):
