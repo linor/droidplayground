@@ -256,3 +256,10 @@ class QMiniLegPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+@configclass
+class QMiniWalkPPORunnerCfg(QMiniLegPPORunnerCfg):
+    """Walking task (DroidPlayground-QMini-Walk): same PPO setup, own log dir.
+    Warm start from a step-in-place checkpoint widened to the 31-dim
+    observation with experiments/qmini-leg/widen_checkpoint_obs.py."""
+    experiment_name = "qmini-walk"

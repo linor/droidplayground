@@ -129,7 +129,10 @@ def main():
             g = r.data.projected_gravity_b
             rec["roll"].append(torch.rad2deg(torch.asin(g[:, 0].clamp(-1, 1))).cpu())
             rec["grav"].append(g.cpu())
-            rec["mt"].append((u.motion_time % u.motion.length).cpu())
+            # walking task: motion_time is the 0..1 gait phase; express it in the
+            # 2.2 s step-in-place cycle the phase windows below are written in
+            mt_scale = 2.2 if getattr(u, "_gait_lib", None) is not None else 1.0
+            rec["mt"].append(((u.motion_time % u.motion.length) * mt_scale).cpu())
             for s, key in (("left", "lfoot"), ("right", "rfoot")):
                 q = r.data.body_link_quat_w[:, feet[s]]
                 gf = quat_apply_inverse(q, down.expand(q.shape[0], 3))

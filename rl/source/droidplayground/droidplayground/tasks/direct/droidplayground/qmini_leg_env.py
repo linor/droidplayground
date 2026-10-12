@@ -19,6 +19,7 @@ from isaaclab.sim import SimulationCfg
 from droidplayground.assets.qmini import QMINI_CFG
 # from .phase_modulator import PhaseModulator
 from .motion_player import MotionPlayer
+from .gait_library import GaitLibrary, LibraryMotion
 
 # Reference clip: time (s) -> 10 joint angles, in the clip's own
 # `joint_order` (see the file's "joint_order" key) -- NOT necessarily the
@@ -2919,6 +2920,59 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # instead of only a measurement tool.
     foot_swing_stance_settle_steps: int = 25
 
+    # --- WALKING: commanded gaits from a reference library (2026-10-12) ---
+    # None = the step-in-place keyframe clip (KEYFRAMES_PATH), unchanged.
+    # A gait_library_*.npz (experiments/qmini-leg/gen_gait_library.py: the
+    # stylized_gait generator, one periodic cycle per (vx, vy, wz) grid
+    # point) switches every env to its own command: the joint and
+    # foot-height references are interpolated from the library at the env's
+    # current command, motion_time becomes the normalized gait phase
+    # (length 1.0, advancing by step_dt / period(cmd)), the command is
+    # appended to the observation (observation_space 28 -> 31), and the
+    # position/heading terms track the command instead of standing still:
+    # position_reward / heading_reward compare a velocity EMA with the
+    # commanded vx/vy/wz, and the deviation penalties measure against the
+    # commanded path (the integral of the command, like the generator's
+    # path frame) instead of the reset pose. See QminiWalkEnvCfg.
+    gait_library_path: str | None = None
+    # A new target command is drawn every this many seconds (uniform, per
+    # env); with command_zero_prob it is zero (step in place / stand-still
+    # transitions stay in the training distribution). Targets are uniform
+    # within command_range_scale x the library range, rejected where the
+    # library's own IK could not reach the gait (ik_err > command_max_ik_err:
+    # joint limits at combined extremes). The command the policy sees and
+    # the reference use ramps toward the target at command_ramp_rate
+    # (vx, vy, wz per second) -- the generator's own live ramp
+    # (param_step.js AR = 0.55, 0.35, 1.4) divided by time_scale^2.
+    command_resample_interval_s: tuple[float, float] = (3.0, 6.0)
+    command_zero_prob: float = 0.2
+    command_range_scale: float = 1.0
+    command_max_ik_err: float = 0.005
+    command_ramp_rate: tuple[float, float, float] = (0.14, 0.09, 0.35)
+    # Velocity tracking compares an EMA of the base velocity (yaw-aligned
+    # frame) with the command: per-step velocity contains the gait's own
+    # sideways sway (~0.55 Hz at the 2x time scale), which an EMA with a
+    # ~1 s time constant attenuates ~3.6x.
+    velocity_ema_tau_s: float = 1.0
+
+
+@configclass
+class QminiWalkEnvCfg(QminiLegEnvCfg):
+    """Omnidirectional walking (forward/backward, strafe, turn) from the
+    stylized_gait reference library at the 2x time scale the step-in-place
+    policies were trained at: vx +-0.175 m/s, vy +-0.08 m/s, wz +-0.3 rad/s."""
+    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x.npz")
+    observation_space = 31
+    # Velocity tracking ON (it was 0 for stepping in place, where any base
+    # velocity was only drift): the main signal that makes the robot move.
+    position_reward_weight: float = 3.0
+    # Deviation from the commanded path: looser than in place, the path is
+    # an idealisation (the generator's path frame) and a few cm of lag
+    # behind a ramping command is fine.
+    position_deviation_margin_m: float = 0.15
+    heading_deviation_margin_deg: float = 20.0
+
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 
@@ -3247,6 +3301,27 @@ class QminiLegEnv(DirectRLEnv):
         self._right_knee_stance_rad = right_knee_stance
         self._right_knee_swing_extreme_rad = _swing_extreme(clip_values[:, right_knee_idx], right_knee_stance)
 
+        # Walking mode: references from the gait library at each env's own
+        # command (cfg.gait_library_path). The knee swing extremes above stay
+        # from the step-in-place clip (only used to normalize the swing
+        # target, which is clamped).
+        self._gait_lib = None
+        if self.cfg.gait_library_path:
+            self._gait_lib = GaitLibrary(self.cfg.gait_library_path, self.robot.joint_names[: self.num_joints], self.device)
+            self._cmd = torch.zeros(self.num_envs, 3, device=self.device)
+            self._cmd_target = torch.zeros(self.num_envs, 3, device=self.device)
+            self._cmd_steps_left = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self._cmd_ramp = torch.tensor(self.cfg.command_ramp_rate, device=self.device) * self.step_dt
+            self._vel_ema = torch.zeros(self.num_envs, 3, device=self.device)        # yaw-frame v_left, v_rear, wz
+            self._path_pos_xy = torch.zeros(self.num_envs, 2, device=self.device)
+            self._path_yaw = torch.zeros(self.num_envs, device=self.device)
+            self.motion = LibraryMotion(self._gait_lib, lambda: self._cmd, "joints")
+            self.foot_height_motion = LibraryMotion(self._gait_lib, lambda: self._cmd, "feet")
+            print(f"[QminiLegEnv] WALKING: gait library {self.cfg.gait_library_path} grid {self._gait_lib.shape} "
+                  f"x {self._gait_lib.nph}, vx {float(self._gait_lib.lo[0]):+.3f}..{float(self._gait_lib.hi[0]):+.3f} m/s, "
+                  f"vy {float(self._gait_lib.lo[1]):+.3f}..{float(self._gait_lib.hi[1]):+.3f} m/s, "
+                  f"wz {float(self._gait_lib.lo[2]):+.2f}..{float(self._gait_lib.hi[2]):+.2f} rad/s", flush=True)
+
         self.motion_time = torch.zeros(
             self.num_envs,
             device=self.device,
@@ -3447,8 +3522,48 @@ class QminiLegEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+    def _phase_step(self) -> torch.Tensor | float:
+        """motion_time increment per control step: step_dt for the keyframe
+        clip, step_dt / period(cmd) in walking mode (motion_time = phase)."""
+        if self._gait_lib is None:
+            return self.step_dt
+        return self.step_dt / self._gait_lib.period_s(self._cmd)
+
+    def _sample_command_targets(self, env_ids: torch.Tensor) -> None:
+        """New target commands for env_ids, see cfg.command_resample_interval_s."""
+        lib, n = self._gait_lib, env_ids.numel()
+        lo, hi = lib.lo * self.cfg.command_range_scale, lib.hi * self.cfg.command_range_scale
+        cmd = lo + (hi - lo) * torch.rand(n, 3, device=self.device)
+        for _ in range(4):   # re-draw unreachable combinations (library IK hit joint limits)
+            bad = lib.ik_error(cmd) > self.cfg.command_max_ik_err
+            if not bad.any():
+                break
+            cmd[bad] = lo + (hi - lo) * torch.rand(int(bad.sum()), 3, device=self.device)
+        cmd[lib.ik_error(cmd) > self.cfg.command_max_ik_err] = 0.0
+        cmd[torch.rand(n, device=self.device) < self.cfg.command_zero_prob] = 0.0
+        self._cmd_target[env_ids] = cmd
+        lo_s, hi_s = self.cfg.command_resample_interval_s
+        self._cmd_steps_left[env_ids] = ((lo_s + (hi_s - lo_s) * torch.rand(n, device=self.device)) / self.step_dt).long()
+
+    def _update_commands(self) -> None:
+        """Count down / resample targets, ramp the command, advance the path."""
+        self._cmd_steps_left -= 1
+        due = (self._cmd_steps_left <= 0).nonzero(as_tuple=True)[0]
+        if due.numel() > 0:
+            self._sample_command_targets(due)
+        d = self._cmd_target - self._cmd
+        self._cmd += torch.clamp(d, -self._cmd_ramp, self._cmd_ramp)
+        # commanded path (robot base axes: +X left, +Y rear; forward = -Y)
+        c, s = torch.cos(self._path_yaw), torch.sin(self._path_yaw)
+        vl, vr = self._cmd[:, 1], -self._cmd[:, 0]            # body-frame left (+X), rear (+Y)
+        self._path_pos_xy[:, 0] += (c * vl - s * vr) * self.step_dt
+        self._path_pos_xy[:, 1] += (s * vl + c * vr) * self.step_dt
+        self._path_yaw = wrap_to_pi(self._path_yaw + self._cmd[:, 2] * self.step_dt)
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
+        if self._gait_lib is not None:
+            self._update_commands()
         # self.phase_modulator.compute()
         # self.motion_time += self.step_dt
         # self.motion_time = torch.zeros(
@@ -3456,7 +3571,7 @@ class QminiLegEnv(DirectRLEnv):
         #     device=self.device,
         # )
         self.motion_time = (
-            self.motion_time + self.step_dt
+            self.motion_time + self._phase_step()
         ) % self.motion.length
 
         # self.actions[:, 0] = 0.0
@@ -3595,17 +3710,10 @@ class QminiLegEnv(DirectRLEnv):
         phase_obs = 2.0 * math.pi * motion_time_obs / self.motion.length
         phase_sin_cos_obs = torch.cat((torch.sin(phase_obs), torch.cos(phase_obs)), dim=-1)
 
-        observations = torch.cat(
-            (
-                joint_pos,
-                joint_vel,
-                imu_gravity,
-                imu_ang_vel,
-                # reference,
-                phase_sin_cos_obs
-            ),
-            dim=-1
-        )
+        obs_terms = [joint_pos, joint_vel, imu_gravity, imu_ang_vel, phase_sin_cos_obs]
+        if self._gait_lib is not None:
+            obs_terms.append(self._cmd)          # (vx forward, vy left, wz CCW), exactly as commanded
+        observations = torch.cat(obs_terms, dim=-1)
 
         return {
             "policy": observations
@@ -3727,7 +3835,7 @@ class QminiLegEnv(DirectRLEnv):
 
 
         reference_next = self.motion.sample(
-            self.motion_time + self.step_dt
+            self.motion_time + self._phase_step()
         )
 
         reference_velocity = (
@@ -4014,44 +4122,78 @@ class QminiLegEnv(DirectRLEnv):
         # Track commanded base xy velocity (currently always zero -- stay
         # in place) -- see cfg.position_reward_weight's comment for why
         # this is velocity, not a position anchor.
-        commanded_lin_vel_xy = torch.zeros(self.num_envs, 2, device=self.device)
-        base_vel_error = torch.sum(
-            (self.robot.data.root_lin_vel_w[:, :2] - commanded_lin_vel_xy) ** 2, dim=1,
-        )
-        position_reward = torch.exp(-self.cfg.position_reward_scale * base_vel_error)
+        if self._gait_lib is None:
+            commanded_lin_vel_xy = torch.zeros(self.num_envs, 2, device=self.device)
+            base_vel_error = torch.sum(
+                (self.robot.data.root_lin_vel_w[:, :2] - commanded_lin_vel_xy) ** 2, dim=1,
+            )
+            position_reward = torch.exp(-self.cfg.position_reward_scale * base_vel_error)
 
-        # Track commanded base yaw rate (currently always zero -- stay
-        # facing the same way) -- see cfg.heading_reward_weight's comment.
-        commanded_yaw_rate = torch.zeros(self.num_envs, device=self.device)
-        yaw_rate_error = (self.robot.data.root_ang_vel_w[:, 2] - commanded_yaw_rate) ** 2
-        heading_reward = torch.exp(-self.cfg.heading_reward_scale * yaw_rate_error)
+            # Track commanded base yaw rate (currently always zero -- stay
+            # facing the same way) -- see cfg.heading_reward_weight's comment.
+            commanded_yaw_rate = torch.zeros(self.num_envs, device=self.device)
+            yaw_rate_error = (self.robot.data.root_ang_vel_w[:, 2] - commanded_yaw_rate) ** 2
+            heading_reward = torch.exp(-self.cfg.heading_reward_scale * yaw_rate_error)
 
-        # ABSOLUTE heading tracking -- see cfg.heading_deviation_penalty_weight's
-        # comment for the full story (heading_reward above only tracks
-        # yaw RATE, never corrects accumulated drift, which is exactly
-        # what real hardware showed). Margined and linear-then-capped, same
-        # pattern as target_limit_penalty.
-        _, _, current_yaw = euler_xyz_from_quat(self.robot.data.root_quat_w)
-        heading_deviation_rad = wrap_to_pi(current_yaw - self._reset_yaw).abs()
-        heading_deviation_margin_rad = math.radians(self.cfg.heading_deviation_margin_deg)
-        heading_deviation_over = torch.clamp(heading_deviation_rad - heading_deviation_margin_rad, min=0.0)
-        heading_deviation_max_rad = math.radians(self.cfg.heading_deviation_penalty_max_deg)
-        heading_deviation_over = torch.clamp(heading_deviation_over, max=heading_deviation_max_rad)
-        heading_deviation_penalty = self.cfg.heading_deviation_penalty_weight * heading_deviation_over
+            # ABSOLUTE heading tracking -- see cfg.heading_deviation_penalty_weight's
+            # comment for the full story (heading_reward above only tracks
+            # yaw RATE, never corrects accumulated drift, which is exactly
+            # what real hardware showed). Margined and linear-then-capped, same
+            # pattern as target_limit_penalty.
+            _, _, current_yaw = euler_xyz_from_quat(self.robot.data.root_quat_w)
+            heading_deviation_rad = wrap_to_pi(current_yaw - self._reset_yaw).abs()
+            heading_deviation_margin_rad = math.radians(self.cfg.heading_deviation_margin_deg)
+            heading_deviation_over = torch.clamp(heading_deviation_rad - heading_deviation_margin_rad, min=0.0)
+            heading_deviation_max_rad = math.radians(self.cfg.heading_deviation_penalty_max_deg)
+            heading_deviation_over = torch.clamp(heading_deviation_over, max=heading_deviation_max_rad)
+            heading_deviation_penalty = self.cfg.heading_deviation_penalty_weight * heading_deviation_over
 
-        # ABSOLUTE position tracking -- see cfg.position_deviation_penalty_weight's
-        # comment. Same margin/linear/capped pattern as heading_deviation_penalty
-        # just above, applied to xy displacement instead of yaw.
-        position_deviation_m = torch.norm(
-            self.robot.data.root_pos_w[:, :2] - self._reset_pos_xy, dim=1,
-        )
-        position_deviation_over = torch.clamp(
-            position_deviation_m - self.cfg.position_deviation_margin_m, min=0.0
-        )
-        position_deviation_over = torch.clamp(
-            position_deviation_over, max=self.cfg.position_deviation_penalty_max_m
-        )
-        position_deviation_penalty = self.cfg.position_deviation_penalty_weight * position_deviation_over
+            # ABSOLUTE position tracking -- see cfg.position_deviation_penalty_weight's
+            # comment. Same margin/linear/capped pattern as heading_deviation_penalty
+            # just above, applied to xy displacement instead of yaw.
+            position_deviation_m = torch.norm(
+                self.robot.data.root_pos_w[:, :2] - self._reset_pos_xy, dim=1,
+            )
+            position_deviation_over = torch.clamp(
+                position_deviation_m - self.cfg.position_deviation_margin_m, min=0.0
+            )
+            position_deviation_over = torch.clamp(
+                position_deviation_over, max=self.cfg.position_deviation_penalty_max_m
+            )
+            position_deviation_penalty = self.cfg.position_deviation_penalty_weight * position_deviation_over
+        else:
+            # Walking: track the command (see cfg.gait_library_path).
+            _, _, current_yaw = euler_xyz_from_quat(self.robot.data.root_quat_w)
+            cy, sy = torch.cos(current_yaw), torch.sin(current_yaw)
+            vw = self.robot.data.root_lin_vel_w[:, :2]
+            v_yaw = torch.stack((cy * vw[:, 0] + sy * vw[:, 1], -sy * vw[:, 0] + cy * vw[:, 1]), dim=1)   # base axes (+X left, +Y rear)
+            ema_a = min(1.0, self.step_dt / self.cfg.velocity_ema_tau_s)
+            cur = torch.cat((v_yaw, self.robot.data.root_ang_vel_w[:, 2:3]), dim=1)
+            self._vel_ema += ema_a * (cur - self._vel_ema)
+            commanded_lin_vel_xy = torch.stack((self._cmd[:, 1], -self._cmd[:, 0]), dim=1)
+            base_vel_error = torch.sum((self._vel_ema[:, :2] - commanded_lin_vel_xy) ** 2, dim=1)
+            position_reward = torch.exp(-self.cfg.position_reward_scale * base_vel_error)
+            commanded_yaw_rate = self._cmd[:, 2]
+            yaw_rate_error = (self._vel_ema[:, 2] - commanded_yaw_rate) ** 2
+            heading_reward = torch.exp(-self.cfg.heading_reward_scale * yaw_rate_error)
+
+            # deviation from the commanded path, with a leash: the path is
+            # pulled back to at most (margin + penalty max) from the robot so
+            # a robot that fell behind isn't punished forever
+            heading_err = wrap_to_pi(current_yaw - self._path_yaw)
+            heading_leash = math.radians(self.cfg.heading_deviation_margin_deg + self.cfg.heading_deviation_penalty_max_deg)
+            self._path_yaw = wrap_to_pi(current_yaw - torch.clamp(heading_err, -heading_leash, heading_leash))
+            heading_deviation_rad = torch.clamp(heading_err.abs(), max=heading_leash)
+            heading_deviation_over = torch.clamp(heading_deviation_rad - math.radians(self.cfg.heading_deviation_margin_deg), min=0.0)
+            heading_deviation_penalty = self.cfg.heading_deviation_penalty_weight * heading_deviation_over
+
+            pos_err = self.robot.data.root_pos_w[:, :2] - self._path_pos_xy
+            pos_leash = self.cfg.position_deviation_margin_m + self.cfg.position_deviation_penalty_max_m
+            dist = torch.norm(pos_err, dim=1, keepdim=True)
+            self._path_pos_xy = self.robot.data.root_pos_w[:, :2] - pos_err * torch.clamp(pos_leash / dist.clamp_min(1e-9), max=1.0)
+            position_deviation_m = torch.clamp(dist.squeeze(1), max=pos_leash)
+            position_deviation_over = torch.clamp(position_deviation_m - self.cfg.position_deviation_margin_m, min=0.0)
+            position_deviation_penalty = self.cfg.position_deviation_penalty_weight * position_deviation_over
 
         # Same push-recovery cooldown as foot_swing_reward above, and for
         # the same underlying reason: a push forces real base velocity/yaw
@@ -4160,6 +4302,13 @@ class QminiLegEnv(DirectRLEnv):
             # Reference vs actual joint positions
             log[f"motion/ref_{label}"] = torch.rad2deg(reference[0, i])
             log[f"motion/actual_{label}"] = torch.rad2deg(self.robot.data.joint_pos[0, i])
+        if self._gait_lib is not None:
+            log["command/abs_vx"] = self._cmd[:, 0].abs().mean()
+            log["command/abs_vy"] = self._cmd[:, 1].abs().mean()
+            log["command/abs_wz"] = self._cmd[:, 2].abs().mean()
+            log["command/vel_err_cmps"] = torch.sqrt(base_vel_error).mean() * 100.0
+            log["command/yaw_rate_err_dps"] = torch.rad2deg(torch.sqrt(yaw_rate_error)).mean()
+            log["command/gait_period_s"] = self._gait_lib.period_s(self._cmd).mean()
         self.extras["log"] = log
 
         # Print every 500 simulation steps
@@ -4290,6 +4439,15 @@ class QminiLegEnv(DirectRLEnv):
         # put the reference anywhere in the gait, arbitrarily far from
         # wherever joint_pos actually is.
         self.motion_time[env_ids] = 0.0
+
+        if self._gait_lib is not None:
+            # every episode starts standing still at zero command and ramps
+            # toward its first target, like the robot after startup
+            self._cmd[env_ids] = 0.0
+            self._sample_command_targets(env_ids)
+            self._vel_ema[env_ids] = 0.0
+            self._path_pos_xy[env_ids] = default_root_state[:, :2]
+            self._path_yaw[env_ids] = reset_yaw
 
         # Avoid penalizing the first post-reset action against whatever
         # action happened to be in _prev_actions from a different episode

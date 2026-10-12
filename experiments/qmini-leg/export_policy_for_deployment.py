@@ -197,6 +197,13 @@ def main():
         "here so robot_deploy.py can warn on a mismatch the same way it already "
         "does for --action-scale.",
     )
+    parser.add_argument(
+        "--gait-library", type=Path, default=None,
+        help="Walking policies (DroidPlayground-QMini-Walk): the gait_library_*.npz the policy was "
+             "trained with. Adds the 3 command inputs (vx, vy, wz) to the obs and embeds the command "
+             "ranges + gait-period table in policy.meta.json -- robot_deploy.py advances the phase "
+             "by control_dt / period(command) and clamps the gamepad command to these ranges.",
+    )
     parser.add_argument("--actor-hidden-dims", nargs="+", type=int, default=[128, 128, 128])
     parser.add_argument("--activation", default="elu", choices=["elu", "relu", "tanh"])
     args = parser.parse_args()
@@ -212,6 +219,20 @@ def main():
     # qmini_leg_env.py for the full story.
     obs_dim = n_joints * 2 + 6 + 2
     action_dim = n_joints
+    command_meta = None
+    if args.gait_library is not None:
+        import numpy as np
+        lib = np.load(args.gait_library)
+        obs_dim += 3
+        args.obs_terms = list(args.obs_terms) + ["command_vx", "command_vy", "command_wz"]
+        command_meta = {
+            "gait_library": str(args.gait_library),
+            "units": "vx forward m/s, vy left m/s, wz CCW rad/s (robot units, time scale applied)",
+            "time_scale": float(lib["time_scale"]),
+            "vx": [float(v) for v in lib["vx"]], "vy": [float(v) for v in lib["vy"]], "wz": [float(v) for v in lib["wz"]],
+            "period_s": np.asarray(lib["period_s"], float).round(5).tolist(),   # [vx][vy][wz], trilinear
+            "ik_err": np.asarray(lib["ik_err"], float).round(6).tolist() if "ik_err" in lib.files else None,
+        }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -265,6 +286,8 @@ def main():
         "obs_normalization_baked_in": source_kind == "traced_from_state_dict",
         "policy_sha256": sha256,
     }
+    if command_meta is not None:
+        meta["command"] = command_meta
     meta_out_path = args.output_dir / "policy.meta.json"
     meta_out_path.write_text(json.dumps(meta, indent=2))
 
