@@ -219,6 +219,15 @@ def main():
             print(f"[{args_cli.label}] {kind:7s} FK foot lift (cm above the other foot, per-cycle peak): "
                   f"left {np.median(peaks['left']):4.1f}, right {np.median(peaks['right']):4.1f} ({len(peaks['left'])} cycles)")
 
+        # target spikes: a >8 deg command step immediately reversed (>8 deg back)
+        d = np.diff(D["cmd"], axis=0)
+        flip = (np.abs(d[:-1]) > 8) & (np.abs(d[1:]) > 8) & (np.sign(d[:-1]) != np.sign(d[1:]))
+        okf = ok[2:]
+        n_cyc = max(1, int(((np.diff(D["mt"], axis=0) < -1.0) & ok[1:]).sum()))
+        print(f"[{args_cli.label}] command spikes (>8 deg step reversed next step) per gait cycle: " + "  ".join(
+            f"{n}: {flip[..., j][okf].sum() / n_cyc:.2f} (p99|step| {np.percentile(np.abs(d[..., j][ok[1:]]), 99):.1f})"
+            for j, n in enumerate(names) if any(k in n for k in ("ankle", "knee"))))
+
         dflt = np.rad2deg(r.data.default_joint_pos[0, : u.num_joints].cpu().numpy())
         dist = np.abs(D["cmd"] - dflt).max(axis=2)[ok]
         roll_rate = np.gradient(D["roll"], u.step_dt, axis=0)[ok]

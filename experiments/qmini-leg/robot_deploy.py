@@ -277,6 +277,23 @@ class RobotConfig:
     # in the JSON = old behaviour (abort on any violation).
     joint_limit_clamp_margin_deg: Optional[float] = 1.0
     joint_limit_abort_excess_deg: float = 5.0
+    # ABSOLUTE CALIBRATION (2026-10-12). The GO-M8010 reports an absolute
+    # rotor angle at power-on (single turn: the output-side reading is only
+    # known modulo 360/gear_ratio deg = 56.9 deg, 19.0 deg for hip_roll with
+    # its extra 3x stage). Across 118 startups on the stand the raw readings
+    # repeat to ~0.3-0.8 deg std (outliers 3-5 deg) -- that spread is the
+    # feet sitting differently in the stand, and the old calibration ("the
+    # pose at power-on IS the zero pose") passed it straight into every
+    # joint angle. stand_pose_reference names a JSON file (relative to the
+    # robot config) with each joint's raw reading in a carefully placed
+    # reference stand pose (--record-stand-pose writes it). With it, every
+    # power-on measures the real joint angles: the turn ambiguity is
+    # resolved by assuming the startup pose is within half a window of the
+    # reference (+-28 deg, hip_roll +-9.5 deg). Re-record after any
+    # reassembly that changes how a motor sits on its part.
+    stand_pose_reference: Optional[str] = None
+    stand_pose_reference_data: Optional[dict] = None
+    stand_pose_warn_deg: float = 1.0
 
     @staticmethod
     def load(path: Path) -> "RobotConfig":
@@ -306,6 +323,16 @@ class RobotConfig:
             max_tilt_deg=raw.get("max_tilt_deg", 40.0),
             joint_limit_clamp_margin_deg=raw.get("joint_limit_clamp_margin_deg", 1.0),
             joint_limit_abort_excess_deg=raw.get("joint_limit_abort_excess_deg", 5.0),
+            stand_pose_reference=(
+                str((path.parent / raw["stand_pose_reference"]).resolve())
+                if raw.get("stand_pose_reference") else None
+            ),
+            stand_pose_reference_data=(
+                json.loads((path.parent / raw["stand_pose_reference"]).read_text())
+                if raw.get("stand_pose_reference") and (path.parent / raw["stand_pose_reference"]).exists()
+                else None
+            ),
+            stand_pose_warn_deg=raw.get("stand_pose_warn_deg", 1.0),
         )
 
     @property
@@ -585,6 +612,9 @@ class MotorBus:
         # calibration offsets, filled in by calibrate_from_startup_position()
         self.zero_offset_rotor_rad = {j.name: 0.0 for j in self.joints}
         self.last_commanded_output_rad = {j.name: None for j in self.joints}
+        # absolute calibration only: how far each joint was from the recorded
+        # reference stand pose at power-on (deg), None in relative mode
+        self.stand_deviation_deg = {j.name: None for j in self.joints}
 
         # last known-GOOD reading per joint (distinct from
         # last_commanded_output_rad, which tracks what we asked for, not
@@ -642,12 +672,32 @@ class MotorBus:
             error_flag=getattr(data, "merror", None),
         )
 
-    def calibrate_from_startup_position(self):
+    def wrap_window_deg(self, joint: JointConfig) -> float:
+        """Output-side degrees per rotor turn: the power-on reading is only
+        known modulo this (see RobotConfig.stand_pose_reference)."""
+        return 360.0 / self.gear_ratio[joint.name]
+
+    def read_raw_output_deg(self, joint: JointConfig, samples: int = 1) -> float:
+        """Uncalibrated output-side reading (direction-corrected, gear-divided)
+        in degrees, averaged over `samples` pure reads (kp=kd=0: the motor
+        stays limp -- only call this before torque is enabled)."""
+        vals = []
+        for _ in range(samples):
+            r = self.read_motor(joint)
+            vals.append(math.degrees((r.raw_rotor_pos_rad / self.gear_ratio[joint.name]) * self._direction(joint)))
+        # average as offsets from the first sample so a reading exactly on the
+        # rotor wrap can't average to the middle of the window
+        w = self.wrap_window_deg(joint)
+        return vals[0] + sum(((v - vals[0] + w / 2) % w) - w / 2 for v in vals) / len(vals)
+
+    def calibrate_from_startup_position(self, reference: Optional[dict] = None):
         """
-        Reads each motor's current raw position and stores it (converted to
-        output-side, direction-corrected radians, plus any manual
-        offset_deg) as the "policy zero" for that joint. Call this once at
-        startup with the robot held/resting in its intended zero pose.
+        Sets each joint's "policy zero" (plus any manual offset_deg). Relative
+        (no reference): the current reading IS the zero -- the robot must be
+        resting exactly in its intended zero pose. Absolute (`reference` =
+        raw_deg dict from the stand_pose_reference file): the zero is the
+        recorded reference reading, so the current pose is measured, not
+        assumed (see RobotConfig.stand_pose_reference). Call once at startup.
         """
         for joint in self.joints:
             cmd = MotorCmd()
@@ -664,33 +714,35 @@ class MotorBus:
             self.serial.sendRecv(cmd, data)
 
             raw_output_pos = (data.q / self.gear_ratio[joint.name]) * self._direction(joint)
-            offset = raw_output_pos + math.radians(joint.offset_deg)
+            ref = reference.get(joint.name) if reference else None
+            if ref is None:
+                # relative: the pose at power-on IS the zero pose
+                zero_raw = raw_output_pos
+                self.stand_deviation_deg[joint.name] = None
+            else:
+                # absolute: zero = the recorded reference reading, moved by
+                # whole rotor turns into the same turn as this power-on's
+                # reading (the motor's q is continuous from here on)
+                w = math.radians(self.wrap_window_deg(joint))
+                dev = ((raw_output_pos - math.radians(ref)) + w / 2) % w - w / 2
+                zero_raw = raw_output_pos - dev
+                self.stand_deviation_deg[joint.name] = math.degrees(dev)
+            offset = zero_raw + math.radians(joint.offset_deg)
             self.zero_offset_rotor_rad[joint.name] = offset
 
             output_pos_calibrated = raw_output_pos - self.zero_offset_rotor_rad[joint.name]
             self.last_commanded_output_rad[joint.name] = output_pos_calibrated
 
-    def print_startup_table(self):
-        print(f"\n=== Startup motor check for bus '{self.port}' (verify direction & zero before enabling) ===")
-        print(f"{'joint':<8} {'id':>3} {'raw_deg':>10} {'calib_deg':>10} {'invert':>7}")
+    def startup_rows(self) -> list:
+        """(joint, measured_deg, vs_reference_deg or None, raw_deg, invert) per
+        joint, for Deployment.print_startup_table()."""
+        rows = []
         for joint in self.joints:
             r = self.read_motor(joint)
-            # True raw pose: direction-corrected, gear-divided, but NOT
-            # zero-offset-corrected. Previously this used r.output_pos_rad
-            # (already calibrated) for BOTH columns, so raw_deg and
-            # calib_deg were always identical and neither showed the
-            # robot's actual physical pose -- see r.raw_rotor_pos_rad,
-            # which read_motor() keeps around as the true rotor-side value.
-            raw_output_pos = (r.raw_rotor_pos_rad / self.gear_ratio[joint.name]) * self._direction(joint)
-            raw_deg = raw_output_pos * RAD2DEG
-            # Calibrated (zero-offset applied). Right after
-            # calibrate_from_startup_position() this reads ~ -offset_deg
-            # (not ~0, unless offset_deg is ~0) -- see that method's
-            # derivation: the calibrated reading at calibration time is
-            # defined to equal -offset_deg by construction.
-            calib_deg = r.output_pos_rad * RAD2DEG
-            print(f"{joint.name:<8} {joint.motor_id:>3} {raw_deg:>10.2f} {calib_deg:>10.2f} {str(joint.invert):>7}")
-        print("=======================================================================\n")
+            raw_deg = math.degrees((r.raw_rotor_pos_rad / self.gear_ratio[joint.name]) * self._direction(joint))
+            rows.append((joint.name, math.degrees(r.output_pos_rad), self.stand_deviation_deg[joint.name],
+                         raw_deg, joint.invert))
+        return rows
 
     def check_joint_limits(self, target_output_rad: dict):
         """Raises JointLimitExceeded if any joint's target falls outside its
@@ -1314,16 +1366,62 @@ class Deployment:
         self.logger.info("Restarting the policy from the rest pose (motion_time 0).")
         return False, readings
 
+    def print_startup_table(self):
+        """One table for all buses. Absolute calibration: how far each joint is
+        from the reference stand pose ('!' past stand_pose_warn_deg) -- the
+        number to check before enabling. Relative calibration (no reference
+        file): the old raw/calibrated readings."""
+        rows = [row for bus in self.buses for row in bus.startup_rows()]
+        absolute = any(dev is not None for _, _, dev, _, _ in rows)
+        warn = self.robot_cfg.stand_pose_warn_deg
+        print()
+        if absolute:
+            print(f"=== Startup pose vs reference stand pose (absolute calibration, warn > {warn:.1f} deg) ===")
+            print(f"{'joint':<16} {'vs ref':>8}  {'angle':>8}")
+            for name, meas, dev, _raw, _inv in rows:
+                flag = "  <-- re-seat?" if dev is not None and abs(dev) > warn else ""
+                dev_s = "relative" if dev is None else f"{dev:+.2f}"
+                print(f"{name:<16} {dev_s:>8}  {meas:>+8.2f}{flag}")
+        else:
+            print("=== Startup motor check (relative calibration: this pose IS the zero pose) ===")
+            print(f"{'joint':<16} {'raw_deg':>9} {'calib_deg':>10} {'invert':>7}")
+            for name, meas, _dev, raw, inv in rows:
+                print(f"{name:<16} {raw:>9.2f} {meas:>10.2f} {str(inv):>7}")
+        print()
+
     def startup_sequence(self):
         self.logger.info("Calibrating from current motor positions...")
+        reference = self.robot_cfg.stand_pose_reference_data
+        if self.robot_cfg.stand_pose_reference and reference is None:
+            raise SystemExit(
+                f"stand_pose_reference {self.robot_cfg.stand_pose_reference} does not exist -- "
+                f"record it first with --record-stand-pose (robot carefully placed on its stand)."
+            )
         for bus in self.buses:
-            bus.calibrate_from_startup_position()
-        for bus in self.buses:
-            bus.print_startup_table()
+            bus.calibrate_from_startup_position(reference.get("raw_deg") if reference else None)
+        self.print_startup_table()
+        if reference:
+            devs = {n: d for bus in self.buses for n, d in bus.stand_deviation_deg.items() if d is not None}
+            missing = [j.name for j in self.robot_cfg.joints if j.name not in devs]
+            self.logger.info(
+                "Absolute calibration from %s (recorded %s). Startup pose vs reference stand pose: %s",
+                self.robot_cfg.stand_pose_reference, reference.get("recorded", "?"),
+                ", ".join(f"{n} {d:+.2f}" for n, d in devs.items()),
+            )
+            if missing:
+                self.logger.warning("No reference for %s -- those joints use the old relative calibration.", missing)
+            off = {n: d for n, d in devs.items() if abs(d) > self.robot_cfg.stand_pose_warn_deg}
+            if off:
+                self.logger.warning(
+                    "Startup pose differs from the reference stand pose by more than %.1f deg: %s. "
+                    "The joint angles are still measured correctly (absolute calibration); this is only a "
+                    "problem if the stand placement itself is off -- or a motor was reassembled since the "
+                    "reference was recorded (then re-record with --record-stand-pose).",
+                    self.robot_cfg.stand_pose_warn_deg, ", ".join(f"{n} {d:+.2f}" for n, d in off.items()),
+                )
 
         answer = input(
-            "Verify the table above: raw_deg should match the robot's actual pose, "
-            "and invert flags should make sense. Enable motors and start policy? [y/N] "
+            "Check the table above. Enable motors and start policy? [y/N] "
         )
         if answer.strip().lower() != "y":
             self.logger.info("User declined startup confirmation. Exiting without enabling motors.")
@@ -1707,6 +1805,47 @@ class Deployment:
             self.csv_file.flush()
 
 
+def record_stand_pose(robot_cfg: RobotConfig, logger: logging.Logger, samples: int = 20):
+    """Writes robot_cfg.stand_pose_reference: every joint's raw (uncalibrated,
+    output-side) reading, averaged over `samples` pure reads. Motors stay limp.
+    Place the robot on its stand in the exact reference pose first -- this
+    pose becomes the zero of every later power-on (see RobotConfig)."""
+    if not robot_cfg.stand_pose_reference:
+        raise SystemExit("Set \"stand_pose_reference\" (a file name) in the robot config first.")
+    joints_by_port: dict = {}
+    for joint in robot_cfg.joints:
+        joints_by_port.setdefault(joint.port, []).append(joint)
+    buses = [MotorBus(port, joints, logger) for port, joints in joints_by_port.items()]
+    raw, window = {}, {}
+    for bus in buses:
+        for joint in bus.joints:
+            raw[joint.name] = round(bus.read_raw_output_deg(joint, samples), 3)
+            window[joint.name] = round(bus.wrap_window_deg(joint), 3)
+    old = robot_cfg.stand_pose_reference_data
+    print(f"\n{'joint':<16} {'raw_deg':>9} {'window':>7} {'vs previous ref':>16}")
+    for name, v in raw.items():
+        prev = (old or {}).get("raw_deg", {}).get(name)
+        d = "" if prev is None else f"{((v - prev + window[name] / 2) % window[name]) - window[name] / 2:+.2f}"
+        print(f"{name:<16} {v:>9.3f} {window[name]:>7.2f} {d:>16}")
+    answer = input(f"\nWrite these as the reference stand pose to {robot_cfg.stand_pose_reference}? [y/N] ")
+    if answer.strip().lower() != "y":
+        print("Not written.")
+        return
+    Path(robot_cfg.stand_pose_reference).write_text(json.dumps({
+        "_comment": "Reference stand pose for robot_deploy.py's absolute calibration (RobotConfig."
+                    "stand_pose_reference): each joint's raw output-side reading (deg, direction-corrected, "
+                    "gear-divided, NOT calibrated) with the robot carefully placed on its stand. This pose is "
+                    "the zero pose of every later power-on. Readings repeat modulo wrap_window_deg (one rotor "
+                    "turn). Re-record (--record-stand-pose) after any reassembly that changes how a motor sits "
+                    "on its part.",
+        "recorded": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "samples": samples,
+        "raw_deg": raw,
+        "wrap_window_deg": window,
+    }, indent=2) + "\n")
+    logger.info("Reference stand pose written to %s", robot_cfg.stand_pose_reference)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, required=True, help="robot_config.json")
@@ -1720,7 +1859,13 @@ def main():
     )
     parser.add_argument("--log-dir", type=Path, default=Path("./logs"))
     parser.add_argument(
-        "--keyframes", type=Path, required=True,
+        "--record-stand-pose", action="store_true",
+        help="Only record the reference stand pose for the absolute calibration "
+             "(the config's stand_pose_reference file) and exit. Motors stay limp. "
+             "Place the robot carefully on its stand first.",
+    )
+    parser.add_argument(
+        "--keyframes", type=Path, default=None,
         help="Path to the shared keyframes clip (e.g. "
              "keyframes_forward_slow_all_joints_4x.json) matching --config's "
              "joint count and order. Required -- there is no built-in "
@@ -1799,6 +1944,14 @@ def main():
     args = parser.parse_args()
 
     robot_cfg = RobotConfig.load(args.config)
+
+    if not args.record_stand_pose and args.keyframes is None:
+        parser.error("--keyframes is required (except with --record-stand-pose).")
+    if args.record_stand_pose:
+        rec_logger = logging.getLogger("robot_deploy.record")
+        rec_logger.addHandler(logging.StreamHandler(sys.stdout)); rec_logger.setLevel(logging.INFO)
+        record_stand_pose(robot_cfg, rec_logger)
+        return
 
     # Single logger for the whole run, set up once here -- Deployment no
     # longer creates its own (see setup_logging()'s propagate=False note:

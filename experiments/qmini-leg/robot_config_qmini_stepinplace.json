@@ -10,6 +10,8 @@
   "_imu_mount_comment": "2026-10-04: correction available but set to 0. A first estimate of +3.0/-1.0 assumed the robot top is parallel to base_link; it is NOT (top is 2.841 deg tilted back vs base, IMU mount is parallel to base). On the level stand: raw IMU pitch -0.89 / roll +1.04, phone on top 2-3 deg back -> base ~-0.3 +- 0.5 deg, i.e. IMU agrees within ~0.5 deg. Values are degrees ADDED to reported pitch (+ = back) / roll (+ = left).",
   "imu_mount_pitch_deg": 0.0,
   "imu_mount_roll_deg": 0.0,
+  "_stand_pose_comment": "2026-10-12: absolute calibration (see robot_deploy.py RobotConfig.stand_pose_reference). The file holds every joint's raw reading in a carefully placed reference stand pose; record it with --record-stand-pose (robot on its stand, motors limp) and re-record after reassembling any motor/part. Without the file the deploy refuses to start.",
+  "stand_pose_reference": "stand_pose_reference_qmini.json",
   "_startup_offset_comment": "2026-10-09: startup_offset_deg is added to default_pos_deg ONLY for the rest pose (the --startup-pose default move and the soft-stop ramp), not for the policy's action anchor. Ankles 3 deg forward (left -3 / right +3, same direction as robot_config_qmini_stepinplace_ankle_fwd3.json) so the robot stands on its own before the policy starts and after a soft stop. Training starts episodes with up to +-5 deg ankle noise, so starting the policy from here is in-distribution.",
   "joints": [
     {"name": "left_hip_yaw",    "motor_id": 1, "port": "/dev/ttyUSB3", "invert": false, "kp": 55.0,  "kd":  2.0, "offset_deg": 0.0, "default_pos_deg":   0.0,    "min_deg": -45, "max_deg": 30},
