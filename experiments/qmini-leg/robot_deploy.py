@@ -1600,6 +1600,9 @@ class Deployment:
                     self.motion_time = 0.0
                     self._smoothed_targets.clear()
                     self._prev_commanded_targets = dict(self.rest_pose_rad)
+                    # the IMU was not read during the hold: start its filter
+                    # fresh (see imu_sensor.MAX_PROPAGATION_DT_S)
+                    self.imu.reset_filter()
                     status_due = time.perf_counter() + 1.0
                     print("Policy running.  Enter = soft stop   Ctrl+C = immediate stop", flush=True)
                     continue

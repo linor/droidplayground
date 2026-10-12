@@ -22,6 +22,8 @@ ONE CONDITION PER INVOCATION (multi gym.make per process hangs).
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+import json
 import math
 import sys
 
@@ -114,7 +116,7 @@ def main():
 
         env.reset()
         obs = env.get_observations()
-        rec = {k: [] for k in ("roll", "mt", "lfoot", "rfoot", "lact", "ract", "ltgt", "rtgt", "done", "cmd", "act_all")}
+        rec = {k: [] for k in ("roll", "mt", "lfoot", "rfoot", "lact", "ract", "ltgt", "rtgt", "done", "cmd", "act_all", "grav")}
         steps = round(args_cli.seconds / u.step_dt)
         for k in range(steps):
             with torch.inference_mode():
@@ -126,6 +128,7 @@ def main():
                 continue
             g = r.data.projected_gravity_b
             rec["roll"].append(torch.rad2deg(torch.asin(g[:, 0].clamp(-1, 1))).cpu())
+            rec["grav"].append(g.cpu())
             rec["mt"].append((u.motion_time % u.motion.length).cpu())
             for s, key in (("left", "lfoot"), ("right", "rfoot")):
                 q = r.data.body_link_quat_w[:, feet[s]]
@@ -177,6 +180,54 @@ def main():
                 lags.append(int(np.argmax(cs)) * u.step_dt * 1000)
                 amps.append(np.std(a) / max(np.std(t), 1e-6))
             print(f"   {name:12s} lag {np.mean(lags):5.0f} ms (p10..p90 {np.percentile(lags, 10):.0f}..{np.percentile(lags, 90):.0f}), amplitude {np.mean(amps):.2f}")
+        # Per-phase table for robot_deploy.py's --soft-stop-phases: a soft stop
+        # should start where every command is close to the default pose and the
+        # body roll is at a turning point (both feet down).
+        # FK foot lift, the same metric as the real-robot logs (fk_geometry.json
+        # pivot model, joint angles + IMU gravity): per-cycle peak of how far
+        # each foot's lower sole point is above the other foot's, cm.
+        # "actual" = measured joints + body tilt, "command" = commanded joints
+        # with a level body.
+        fk = json.load(open(Path(__file__).with_name("fk_geometry.json")))
+
+        def foot_low(leg, ang_deg, up):   # ang_deg (T, E, 5) in chain order; up (T, E, 3)
+            T, E = ang_deg.shape[:2]
+            Rm = np.broadcast_to(np.eye(3), (T, E, 3, 3)).copy(); p = np.zeros((T, E, 3))
+            for k, st in enumerate(fk["legs"][leg]["chain"]):
+                ax = np.asarray(st["axis"], float); piv = np.asarray(st["pivot"])
+                a = np.radians(st["sign"] * ang_deg[..., k])[..., None, None]
+                K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+                Rk = np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * (K @ K)
+                p = p + np.einsum("teij,tej->tei", Rm, piv - np.einsum("teij,j->tei", Rk, piv))
+                Rm = Rm @ Rk
+            pts = [p + np.einsum("teij,j->tei", Rm, np.asarray(fk["legs"][leg][n])) for n in ("heel", "toe")]
+            return np.minimum(*[(q * up).sum(-1) for q in pts])
+
+        up_act = -D["grav"] / np.linalg.norm(D["grav"], axis=-1, keepdims=True)
+        up_flat = np.broadcast_to([0.0, 0.0, 1.0], up_act.shape)
+        jcol = {leg: [names.index(f"{leg}_{j}") for j in ("yaw", "roll", "pitch", "knee", "ankle")] for leg in ("left", "right")}
+        for kind, A, up in (("actual", D["act_all"], up_act), ("command", D["cmd"], up_flat)):
+            hl = foot_low("left", A[..., jcol["left"]], up); hr = foot_low("right", A[..., jcol["right"]], up)
+            peaks = {"left": [], "right": []}
+            for e in range(hl.shape[1]):
+                n = int(np.argmax(D["done"][:, e])) if D["done"][:, e].any() else hl.shape[0]
+                cyc = np.cumsum(np.concatenate([[0], np.diff(D["mt"][:n, e]) < -1.0]))
+                for c in np.unique(cyc)[1:-1]:   # complete cycles only
+                    m = cyc == c
+                    peaks["left"].append((hl[:n, e][m] - hr[:n, e][m]).max() * 100)
+                    peaks["right"].append((hr[:n, e][m] - hl[:n, e][m]).max() * 100)
+            print(f"[{args_cli.label}] {kind:7s} FK foot lift (cm above the other foot, per-cycle peak): "
+                  f"left {np.median(peaks['left']):4.1f}, right {np.median(peaks['right']):4.1f} ({len(peaks['left'])} cycles)")
+
+        dflt = np.rad2deg(r.data.default_joint_pos[0, : u.num_joints].cpu().numpy())
+        dist = np.abs(D["cmd"] - dflt).max(axis=2)[ok]
+        roll_rate = np.gradient(D["roll"], u.step_dt, axis=0)[ok]
+        print(f"[{args_cli.label}] per-phase (for --soft-stop-phases): max|command - default| deg, body roll deg, roll rate deg/s")
+        nb, length = 22, float(u.motion.length)
+        for b in range(nb):
+            m = (mt >= b * length / nb) & (mt < (b + 1) * length / nb)
+            if m.any():
+                print(f"   mt {b * length / nb:4.2f}  dist {dist[m].mean():5.1f}  roll {R[m].mean():+5.1f}  roll rate {roll_rate[m].mean():+6.1f}")
         env.close()
 
     run()

@@ -316,6 +316,16 @@ SUSTAINED_MISMATCH_STEPS = 8
 # only nudges the estimate a little instead of defining it outright.
 ACCEL_CORRECTION_WEIGHT = 0.02
 
+# Longest gap between reads the gyro propagation is trusted over. Added
+# 2026-10-12: after a 38 s soft-stop hold without IMU reads, the first read
+# integrated that instant's gyro sample over the whole 38 s and reported
+# pitch -26 deg (robot actually at +2); the 1 s accelerometer correction
+# needed ~0.8 s to undo it and the restarted policy, believing it was
+# falling forward, threw the robot over backwards. Past this gap the filter
+# re-bootstraps from the accelerometer, like the very first read. Normal
+# reads are 20 ms apart; the worst logged loop overrun is ~92 ms.
+MAX_PROPAGATION_DT_S = 0.25
+
 
 def _rotate_vector_by_gyro(v, gyro_rad_s, dt):
     """Propagates a WORLD-fixed vector `v` (expressed in the body/sensor
@@ -470,6 +480,13 @@ class ImuSensor:
             gyro_read_retries=gyro_retries,
         )
 
+    def reset_filter(self):
+        """Forget the filtered gravity estimate: the next read bootstraps from
+        the accelerometer (call before (re)starting a policy after a pause)."""
+        self._filtered_gravity_dir = None
+        self._last_read_time = None
+        self._consecutive_mismatches = 0
+
     def read_robot_frame(self):
         """Returns (gravity_dir, ang_vel_rad_s), matching
         QminiLegEnv._get_observations()'s (projected_gravity_b,
@@ -505,6 +522,10 @@ class ImuSensor:
         now = time.perf_counter()
 
         accel_norm = math.sqrt(sum(a * a for a in r.accel_robot_mps2))
+
+        if self._last_read_time is not None and now - self._last_read_time > MAX_PROPAGATION_DT_S:
+            self._filtered_gravity_dir = None   # stale: see MAX_PROPAGATION_DT_S
+            self._consecutive_mismatches = 0
 
         if self._filtered_gravity_dir is None:
             # First reading ever -- no prior estimate to propagate, and no
