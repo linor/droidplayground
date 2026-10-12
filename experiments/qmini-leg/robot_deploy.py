@@ -146,6 +146,8 @@ from typing import Optional
 import torch
 
 import imu_sensor
+import gamepad as gp
+from walk_command import CommandTable, CommandInput
 
 # ---------------------------------------------------------------------------
 # unitree_actuator_sdk import
@@ -381,6 +383,10 @@ def load_and_verify_policy(
     # once that was fixed. Now re-adopting sin/cos on top of the corrected
     # reward config.
     expected_obs_dim = n_joints * 2 + 6 + 2
+    # Walking bundles (export_policy_for_deployment.py --gait-library) also
+    # observe the command (vx, vy, wz) -- see walk_command.py.
+    if meta.get("command"):
+        expected_obs_dim += 3
 
     if meta.get("action_dim") != expected_action_dim:
         raise PolicyMismatchError(
@@ -391,7 +397,8 @@ def load_and_verify_policy(
         raise PolicyMismatchError(
             f"Policy obs_dim={meta.get('obs_dim')} does not match expected "
             f"{expected_obs_dim} (2 * {n_joints} joints [pos+vel] + 6 IMU "
-            f"[gravity xyz + ang_vel xyz] + 2 sin/cos phase terms)."
+            f"[gravity xyz + ang_vel xyz] + 2 sin/cos phase terms"
+            f"{' + 3 command terms' if meta.get('command') else ''})."
         )
     # NOTE: this is a SET comparison, not an order comparison. robot_cfg's
     # joint order is whatever's convenient to read/wire physically (e.g.
@@ -933,7 +940,7 @@ def setup_logging(log_dir: Path):
     return logger, csv_writer, csv_file, csv_path
 
 
-def write_csv_header(csv_writer, policy_joint_order, physical_joint_names):
+def write_csv_header(csv_writer, policy_joint_order, physical_joint_names, walking: bool = False):
     # NOTE: this must match build_obs()'s actual layout exactly (pos x N,
     # vel x N, 6 IMU terms, then sin(phase)/cos(phase) -- NOT an obs_ref per
     # joint, which build_obs() computes but never appends). A previous
@@ -957,6 +964,8 @@ def write_csv_header(csv_writer, policy_joint_order, physical_joint_names):
         "obs_imu_ang_vel_x", "obs_imu_ang_vel_y", "obs_imu_ang_vel_z",
     ]
     header += ["obs_phase_sin", "obs_phase_cos"]
+    if walking:
+        header += ["obs_command_vx", "obs_command_vy", "obs_command_wz"]
     for name in policy_joint_order:
         header += [f"action_{name}"]
     for name in physical_joint_names:
@@ -1000,6 +1009,8 @@ class Deployment:
         stop_move_duration: float = 2.0,
         soft_stop_phases: tuple = (0.8, 1.9),
         verbose: bool = False,
+        command_meta: Optional[dict] = None,
+        gamepad_device: Optional[str] = None,
     ):
         self.robot_cfg = robot_cfg
         # verbose: print the old per-step CURRENT/TARGETS/IMU/STEP lines.
@@ -1017,6 +1028,7 @@ class Deployment:
         # soft-stop tests ramped from that and fell to the left. Re-check
         # for a new policy (per-phase target distance in the CSV).
         self.soft_stop_phases = tuple(soft_stop_phases)
+        self.step_cycle_s = 2.2      # the step-in-place cycle soft_stop_phases are written in
         self.policy = policy
         self.open_loop_ref = open_loop_ref
         self.logger = logger
@@ -1041,7 +1053,25 @@ class Deployment:
             "this should have been caught by load_and_verify_policy()."
         )
 
-        write_csv_header(self.csv_writer, self.policy_joint_order, robot_cfg.joint_names)
+        # WALKING (policy meta has a "command" block): the policy also
+        # observes the command, motion_time is the 0..1 gait phase advancing
+        # by control_dt / period(command), and the command comes from the
+        # F710 gamepad (walk_command.py). Soft-stop phases are given in
+        # seconds of the 2.2 s step-in-place cycle and converted.
+        self.walking = command_meta is not None
+        self.cmd_input = None
+        if self.walking:
+            self.cmd_table = CommandTable(command_meta)
+            pad = gp.Gamepad(gamepad_device)
+            self.cmd_input = CommandInput(self.cmd_table, pad, robot_cfg.control_dt)
+            self.logger.info(
+                "WALKING policy: command range vx %+.3f..%+.3f m/s, vy %+.3f..%+.3f m/s, wz %+.2f..%+.2f rad/s "
+                "(time scale %.1f); gamepad %s",
+                self.cmd_table.lo[0], self.cmd_table.hi[0], self.cmd_table.lo[1], self.cmd_table.hi[1],
+                self.cmd_table.lo[2], self.cmd_table.hi[2], self.cmd_table.time_scale,
+                pad.path if pad.connected else "NOT FOUND (command stays 0 until it connects)",
+            )
+        write_csv_header(self.csv_writer, self.policy_joint_order, robot_cfg.joint_names, walking=self.walking)
 
         for joint in robot_cfg.joints:
             if joint.min_deg is None or joint.max_deg is None:
@@ -1439,6 +1469,14 @@ class Deployment:
             self._release_all()
             sys.exit(0)
 
+    @property
+    def cycle_length(self) -> float:
+        """motion_time wraps at this: the keyframe clip length, or 1.0 (phase) when walking."""
+        return 1.0 if self.walking else self.motion.length
+
+    def phase_step(self, dt: float) -> float:
+        return dt / self.cmd_table.period_s(self.cmd_input.cmd) if self.walking else dt
+
     def build_obs(self, readings: dict) -> torch.Tensor:
         ref = self.motion.sample(self.motion_time)
         obs = []
@@ -1464,9 +1502,11 @@ class Deployment:
         # RE-ADOPTED 2026-09-08, back to sin(phase)/cos(phase) -- must match
         # QminiLegEnv._get_observations exactly. See observation_space's
         # comment there for the full story.
-        phase = 2.0 * math.pi * self.motion_time / self.motion.length
+        phase = 2.0 * math.pi * self.motion_time / self.cycle_length
         obs.append(math.sin(phase))
         obs.append(math.cos(phase))
+        if self.walking:
+            obs.extend(self.cmd_input.cmd)       # (vx forward, vy left, wz CCW), as in QminiLegEnv
         # obs.extend(ref)
         return torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
 
@@ -1512,6 +1552,11 @@ class Deployment:
             soft_stop_requested = False
             print("Policy running.  Enter = soft stop (finish the step, back to the rest pose)   "
                   "Ctrl+C = immediate stop (motors off)", flush=True)
+            if self.walking:
+                print("Gamepad: left stick = forward/back + strafe, right stick = turn, B = soft stop "
+                      "(the command ramps to zero first)", flush=True)
+                self.cmd_input.pad.poll()
+                self.cmd_input.pad.pressed(gp.BTN_B)      # drop a B press from before the start
             status_due = run_start + 1.0
             max_tilt_win = 0.0
             max_loop_ms_win = 0.0
@@ -1520,6 +1565,20 @@ class Deployment:
                 loop_start = time.perf_counter()
 
                 readings = new_readings
+
+                if self.walking:
+                    self.cmd_input.update()
+                    pad = self.cmd_input.pad
+                    if pad.connected != getattr(self, "_pad_was_connected", pad.connected):
+                        self.logger.warning("Gamepad %s -- command %s.", "connected" if pad.connected else "DISCONNECTED",
+                                            "follows the sticks" if pad.connected else "ramps to zero")
+                    self._pad_was_connected = pad.connected
+                    if pad.connected and pad.pressed(gp.BTN_B) and not soft_stop_requested:
+                        soft_stop_from_pad = True
+                    else:
+                        soft_stop_from_pad = False
+                else:
+                    soft_stop_from_pad = False
 
                 if self.verbose:
                     self._print_joint_row("CURRENT", {n: r.output_pos_rad for n, r in readings.items()})
@@ -1673,19 +1732,31 @@ class Deployment:
                 self._log_step(step, t_wall, readings, obs, action, targets, new_readings, imu_ms, policy_ms, bus_ms)
 
                 prev_motion_time = self.motion_time
-                self.motion_time = (self.motion_time + dt) % self.motion.length
+                self.motion_time = (self.motion_time + self.phase_step(dt)) % self.cycle_length
                 step += 1
                 if self.verbose:
                     print(f"STEP: {step}  MOTION_TIME: {self.motion_time}")
 
-                if not soft_stop_requested and self._enter_pressed():
+                if not soft_stop_requested and (self._enter_pressed() or soft_stop_from_pad):
                     soft_stop_requested = True
-                    stop_at = min(self.soft_stop_phases,
-                                  key=lambda p: (p - self.motion_time) % self.motion.length)
-                    self.logger.info("Soft stop requested at motion_time %.2f s -- finishing the step, "
-                                     "stopping at motion_time %.2f s.", self.motion_time, stop_at)
+                    if self.walking:
+                        # stop walking first: the command ramps to zero, the
+                        # stop phase is chosen once it is zero
+                        self.cmd_input.hold_zero = True
+                        stop_at = None
+                        self.logger.info("Soft stop requested (command %s) -- ramping the command to zero first.",
+                                         [round(v, 3) for v in self.cmd_input.cmd])
+                    else:
+                        stop_at = min(self.soft_stop_phases,
+                                      key=lambda p: (p - self.motion_time) % self.cycle_length)
+                        self.logger.info("Soft stop requested at motion_time %.2f s -- finishing the step, "
+                                         "stopping at motion_time %.2f s.", self.motion_time, stop_at)
+                if soft_stop_requested and self.walking and stop_at is None and self.cmd_input.is_zero():
+                    phases = [p / self.step_cycle_s for p in self.soft_stop_phases]
+                    stop_at = min(phases, key=lambda p: (p - self.motion_time) % 1.0)
+                    self.logger.info("Command is zero -- stopping at phase %.2f (now %.2f).", stop_at, self.motion_time)
                 wrapped = self.motion_time < prev_motion_time
-                if soft_stop_requested and (
+                if soft_stop_requested and stop_at is not None and (
                     (prev_motion_time < stop_at <= self.motion_time)
                     or (wrapped and (stop_at > prev_motion_time or stop_at <= self.motion_time))
                 ):
@@ -1696,6 +1767,8 @@ class Deployment:
                     # start again, as after startup: from motion_time 0
                     soft_stop_requested = False
                     self.motion_time = 0.0
+                    if self.walking:
+                        self.cmd_input.hold_zero = False
                     self._smoothed_targets.clear()
                     self._prev_commanded_targets = dict(self.rest_pose_rad)
                     # the IMU was not read during the hold: start its filter
@@ -1715,7 +1788,9 @@ class Deployment:
                         f"  |  tilt {tilt_deg:4.1f} (max {max_tilt_win:4.1f}) deg"
                         f"  |  motor temp max {max(temps) if temps else float('nan'):.0f} C"
                         f"  |  loop max {max_loop_ms_win:4.1f} ms"
-                        f"  |  clamps: limit {self.limit_clamp_count}, rate {self.rate_limit_clamp_count}",
+                        f"  |  clamps: limit {self.limit_clamp_count}, rate {self.rate_limit_clamp_count}"
+                        + (f"  |  cmd vx {self.cmd_input.cmd[0]:+.3f} vy {self.cmd_input.cmd[1]:+.3f} wz {self.cmd_input.cmd[2]:+.2f}"
+                           f"{'' if self.cmd_input.pad.connected else ' (NO PAD)'}" if self.walking else ""),
                         flush=True,
                     )
                     status_due = loop_start + 1.0
@@ -1930,6 +2005,11 @@ def main():
              "turning around (see Deployment.soft_stop_phases).",
     )
     parser.add_argument(
+        "--gamepad", type=str, default=None,
+        help="Joystick device for walking policies (default: the first /dev/input/js*). "
+             "Logitech F710 with its back switch on X (XInput).",
+    )
+    parser.add_argument(
         "--verbose", action="store_true",
         help="Print the per-step CURRENT/TARGETS/IMU/STEP lines (the old "
              "default). Without it: one status line per second plus the "
@@ -1986,6 +2066,8 @@ def main():
             max_target_step_deg=args.max_target_step_deg,
             stop_move_duration=args.stop_move_duration,
             soft_stop_phases=tuple(float(v) for v in args.soft_stop_phases.split(",")),
+            command_meta=(meta.get("command") if not args.open_loop_ref else None),
+            gamepad_device=args.gamepad,
             verbose=args.verbose,
         )
         deployment.startup_sequence()
