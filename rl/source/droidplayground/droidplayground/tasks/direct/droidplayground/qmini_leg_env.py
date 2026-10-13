@@ -3001,6 +3001,28 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     heading_reward_scale: float = 20.0
     position_reward_scale: float = 50.0
 
+    # FRESH-START RECIPE (2026-10-13), the project's proven one (see
+    # heading_deviation_penalty_weight's comment in QminiLegEnvCfg): fresh
+    # starts only find and HOLD stepping with the four post-breakthrough
+    # penalties OFF; they are re-enabled afterwards via RESUME, each with a
+    # resume track record. The first residual fresh start
+    # (qmini-walk-residual/2026-10-13_00-06-25) had them on and at 17k
+    # iterations had found a twisted crouch instead of the gait (knees bent
+    # the wrong way, hip yaw -29/+21 deg, foot_swing_reward 0.55 vs ~1.5 by
+    # iteration 3000 on the successful fresh starts); step_limit_penalty was
+    # permanently ~1.9 because exploration noise alone (std 0.38 x 0.25)
+    # crosses its 4 deg/step threshold.
+    # RE-ENABLE via resume once walking is found: target_limit 15.0,
+    # step_limit 10.0, heading_deviation 1.0, position_deviation 1.0.
+    target_limit_penalty_weight: float = 0.0
+    step_limit_penalty_weight: float = 0.0
+    heading_deviation_penalty_weight: float = 0.0
+    position_deviation_penalty_weight: float = 0.0
+    # First stage: half the library's command range (vx +-0.0875, vy +-0.04,
+    # wz +-0.15), closer to the step-in-place task whose discovery is known
+    # to work; raise to 1.0 via resume once it walks.
+    command_range_scale: float = 0.5
+
 
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
