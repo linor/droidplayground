@@ -2981,6 +2981,15 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # room to flip a knee (reference ~20 deg). robot_deploy.py clips to the
     # same value (policy meta action_clip).
     residual_action_clip: float | None = None
+    # Penalty on the RAW policy output beyond residual_action_clip, per
+    # joint, linear: weight * sum(max(|a| - clip, 0)). Added 2026-10-13: the
+    # env clamps the action, so output beyond the bound costs nothing and the
+    # mean drifts out there -- the third residual fresh start (14-53-32) had
+    # 61% of deterministic outputs beyond +-1 at 2.8k and flipped between the
+    # bounds (target jumps ~30 deg per control step; the robot's rate limiter
+    # allows 10). 0 for the stage-1 fresh start, on in stage 2 together with
+    # the step-limit penalty (which penalizes the flipping itself).
+    residual_bound_penalty_weight: float = 0.0
 
 
 @configclass
@@ -3052,6 +3061,10 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     step_limit_penalty_weight: float = 10.0
     heading_deviation_penalty_weight: float = 1.0
     position_deviation_penalty_weight: float = 1.0
+    # pull the raw outputs back inside the +-1 residual bound (see the field's
+    # comment): ~0.6 per step at the stage-1 saturation level, small next to
+    # tracking_reward (~5)
+    residual_bound_penalty_weight: float = 0.2
 
 
 class QminiLegEnv(DirectRLEnv):
@@ -3643,6 +3656,7 @@ class QminiLegEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
+        self._actions_raw = self.actions.clone()      # for residual_bound_penalty / saturation logging
         if self.cfg.residual_action_clip is not None:
             self.actions.clamp_(-self.cfg.residual_action_clip, self.cfg.residual_action_clip)
         if self._gait_lib is not None:
@@ -3962,6 +3976,13 @@ class QminiLegEnv(DirectRLEnv):
             max=math.radians(self.cfg.step_limit_penalty_max_excess_deg),
         )
         step_limit_penalty = self.cfg.step_limit_penalty_weight * torch.sum(self._step_limit_joint_weight * step_excess_rad, dim=1)
+        if self.cfg.residual_action_clip is not None:
+            raw_over = torch.clamp(self._actions_raw.abs() - self.cfg.residual_action_clip, min=0.0)
+            residual_bound_penalty = self.cfg.residual_bound_penalty_weight * raw_over.sum(dim=1)
+            residual_saturation = (raw_over > 0).float().mean()
+        else:
+            residual_bound_penalty = torch.zeros(self.num_envs, device=self.device)
+            residual_saturation = torch.zeros((), device=self.device)
         step_over_rate = (step_delta_rad > math.radians(self.cfg.step_limit_threshold_deg)).any(dim=1).float().mean()
         mean_max_step_deg = torch.rad2deg(step_delta_rad.max(dim=1).values).mean()
         self._prev_actions = self.actions.clone()
@@ -4332,6 +4353,7 @@ class QminiLegEnv(DirectRLEnv):
             - position_deviation_penalty
             - foot_overswing_penalty
             - step_limit_penalty
+            - residual_bound_penalty
         )
 
         # ---------------------------------
@@ -4352,6 +4374,8 @@ class QminiLegEnv(DirectRLEnv):
             "tracking/foot_swing_during_push_cooldown": foot_swing_during_push_cooldown,
             "tracking/foot_overswing_penalty": foot_overswing_penalty.mean(),
             "tracking/step_limit_penalty": step_limit_penalty.mean(),
+            "tracking/residual_bound_penalty": residual_bound_penalty.mean(),
+            "tracking/residual_saturation": residual_saturation,
             "tracking/step_over_rate": step_over_rate,
             "tracking/mean_max_step_deg": mean_max_step_deg,
             # Logged as the MINIMUM of heel/toe height (the bottleneck that
