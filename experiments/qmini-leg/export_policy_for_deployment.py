@@ -210,6 +210,8 @@ def main():
              "action_scale * action). Requires --gait-library; the library is copied into the bundle "
              "(gait_library.npz) because robot_deploy.py needs the reference too.",
     )
+    parser.add_argument("--action-clip", type=float, default=1.0,
+                        help="Residual policies: the env's residual_action_clip (actions are clamped to +-this).")
     parser.add_argument("--actor-hidden-dims", nargs="+", type=int, default=[128, 128, 128])
     parser.add_argument("--activation", default="elu", choices=["elu", "relu", "tanh"])
     args = parser.parse_args()
@@ -304,6 +306,7 @@ def main():
         if command_meta is None:
             raise SystemExit("--residual-actions needs --gait-library")
         meta["action_mode"] = "residual"   # target = reference(phase, command) + action_scale * action
+        meta["action_clip"] = args.action_clip   # = QminiLegEnvCfg.residual_action_clip
     meta_out_path = args.output_dir / "policy.meta.json"
     meta_out_path.write_text(json.dumps(meta, indent=2))
 

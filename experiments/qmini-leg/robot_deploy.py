@@ -1016,6 +1016,7 @@ class Deployment:
         command_meta: Optional[dict] = None,
         gamepad_device: Optional[str] = None,
         reference_library: Optional[Path] = None,
+        action_clip: float = 1.0,
     ):
         self.robot_cfg = robot_cfg
         # verbose: print the old per-step CURRENT/TARGETS/IMU/STEP lines.
@@ -1080,6 +1081,7 @@ class Deployment:
         # target is the library reference at (command, phase) + action_scale *
         # action, exactly as in QminiLegEnv (cfg.residual_actions).
         self.ref_gait = None
+        self.action_clip = float(action_clip)
         if reference_library is not None:
             if not self.walking:
                 raise ValueError("a residual-action policy needs the walking command block in its meta")
@@ -1636,7 +1638,10 @@ class Deployment:
                 else:
                     with torch.no_grad():
                         action = self.policy(obs).squeeze(0).numpy()
-                    action = action.clip(-1.0, 1.0)
+                    # = the training clip: QminiLegEnvCfg.residual_action_clip for
+                    # residual policies (policy meta action_clip); +-1 for the
+                    # absolute step-in-place policies as before
+                    action = action.clip(-self.action_clip, self.action_clip)
                     # Must mirror QminiLegEnv._apply_action exactly: action
                     # is a small offset from the fixed default_pose_rad
                     # anchor, scaled by action_scale -- NOT an absolute
@@ -2105,6 +2110,7 @@ def main():
             command_meta=(meta.get("command") if not args.open_loop_ref else None),
             gamepad_device=args.gamepad,
             reference_library=residual_library,
+            action_clip=float(meta.get("action_clip", 1.0)) if not args.open_loop_ref else 1.0,
             verbose=args.verbose,
         )
         deployment.startup_sequence()

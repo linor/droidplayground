@@ -266,6 +266,13 @@ class QMiniWalkPPORunnerCfg(QMiniLegPPORunnerCfg):
     warm-started via widen_checkpoint_obs.py) are not compatible."""
     experiment_name = "qmini-walk-residual"
 
+    def __post_init__(self):
+        super().__post_init__()
+        # std cap 0.5 from the start (residual actions clamped to +-1 by the
+        # env, see QminiLegEnvCfg.residual_action_clip): a std near the old
+        # 1.0 cap would be mostly saturation
+        self.policy.class_name = "ClampedActorCriticWalk"
+
 
 @configclass
 class QMiniWalkStage2PPORunnerCfg(QMiniWalkPPORunnerCfg):

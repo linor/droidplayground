@@ -2969,6 +2969,18 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # action changes), and robot_deploy.py needs the library too (bundled by
     # export_policy_for_deployment.py --gait-library).
     residual_actions: bool = False
+    # Residual authority (2026-10-13): actions are clamped to +-this before
+    # anything uses them (targets, action-rate / step-limit penalties), so
+    # the target stays within action_scale * clip of the reference. The
+    # second residual fresh start (2026-10-13_10-41-51) had only rsl_rl's
+    # clip_actions 3.0 -> +-43 deg at scale 0.25, and converged onto a
+    # folded-knee posture (a knee bent opposite to the reference 100% of the
+    # time, knee errors 34-42 deg, 27% of outputs beyond +-3, forward commands
+    # falling) instead of correcting around the gait. +-1 -> +-14 deg: room
+    # for balance corrections (step-in-place policies deviated ~6-10 deg), no
+    # room to flip a knee (reference ~20 deg). robot_deploy.py clips to the
+    # same value (policy meta action_clip).
+    residual_action_clip: float | None = None
 
 
 @configclass
@@ -2979,6 +2991,7 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x.npz")
     observation_space = 31
     residual_actions: bool = True
+    residual_action_clip: float | None = 1.0
     # half the step-in-place scale: the reference carries the motion, the
     # policy only corrects (also halves the target jitter from exploration noise)
     action_scale = 0.25
@@ -3630,6 +3643,8 @@ class QminiLegEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
+        if self.cfg.residual_action_clip is not None:
+            self.actions.clamp_(-self.cfg.residual_action_clip, self.cfg.residual_action_clip)
         if self._gait_lib is not None:
             self._update_commands()
         # self.phase_modulator.compute()
