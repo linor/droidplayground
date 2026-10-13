@@ -2997,7 +2997,15 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     """Omnidirectional walking (forward/backward, strafe, turn) from the
     stylized_gait reference library at the 2x time scale the step-in-place
     policies were trained at: vx +-0.175 m/s, vy +-0.08 m/s, wz +-0.3 rad/s."""
-    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x.npz")
+    # v2 (2026-10-14): the generator's right turn / right strafe were not mirror
+    # images of the left ones -- qmini-gait samples.py signed stance_splay,
+    # foot_yaw_amp and swing_y_lead with the direction although GaitSample
+    # already mirrors them per side, so the right turn walked toe-in where the
+    # left turn walked toe-out (14 deg hip-yaw mismatch, 3.3 deg roll for the
+    # strafe). Fixed in samples.py; v2's full-grid mirror mismatch is 0.10 deg
+    # (v1 13.7). Policies trained on v1 (runs up to 2026-10-13_21-44-20) must
+    # be exported / evaluated with gait_library_2x.npz.
+    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x_v2.npz")
     observation_space = 31
     residual_actions: bool = True
     residual_action_clip: float | None = 1.0
