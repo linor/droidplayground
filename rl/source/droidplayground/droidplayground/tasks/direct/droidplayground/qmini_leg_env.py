@@ -3058,7 +3058,14 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     stage 3. Use with task DroidPlayground-QMini-Walk-Stage2 (also caps the
     exploration std at 0.5)."""
     target_limit_penalty_weight: float = 15.0
-    step_limit_penalty_weight: float = 10.0
+    # 2.0, not the resume-validated 10.0 (2026-10-13): that value was
+    # calibrated on absolute policies whose exploration noise stayed under the
+    # 4 deg/step threshold (std 0.06-0.11 at scale 0.5); here std 0.5 at scale
+    # 0.25 is ~10 deg per step, so 10.0 would cost ~8-9 reward per step from
+    # noise alone (~2x the whole per-step reward) -- the kind of shock that
+    # has collapsed stepping on resume before. Raise to 10.0 in a later
+    # resume once the std / flipping have come down.
+    step_limit_penalty_weight: float = 2.0
     heading_deviation_penalty_weight: float = 1.0
     position_deviation_penalty_weight: float = 1.0
     # pull the raw outputs back inside the +-1 residual bound (see the field's
