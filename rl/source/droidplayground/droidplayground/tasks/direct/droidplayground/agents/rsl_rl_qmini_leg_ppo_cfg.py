@@ -27,6 +27,30 @@ _rsl_rl_on_policy_runner.ClampedActorCriticWalk = ClampedActorCriticWalk
 _rsl_rl_on_policy_runner.CappedLrPPO = CappedLrPPO
 
 
+# rsl_rl prints "Time elapsed" / "ETA" as time.strftime("%H:%M:%S",
+# time.gmtime(seconds)), which silently drops whole days (a 24.8 h ETA showed
+# as "00:48"). Give the runner module a `time` whose strftime prefixes the day
+# count gmtime already carries (tm_yday / tm_year); everything else is the real
+# time module.
+import time as _time
+
+
+class _TimeWithDays:
+    def __getattr__(self, name):
+        return getattr(_time, name)
+
+    @staticmethod
+    def strftime(fmt, t=None):
+        if t is None:
+            return _time.strftime(fmt)
+        out = _time.strftime(fmt, t)
+        days = (t.tm_year - 1970) * 365 + t.tm_yday - 1   # gmtime(seconds) of a duration
+        return f"{days}d {out}" if fmt.startswith("%H") and 0 < days < 10_000 else out
+
+
+_rsl_rl_on_policy_runner.time = _TimeWithDays()
+
+
 @configclass
 class QMiniLegPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
