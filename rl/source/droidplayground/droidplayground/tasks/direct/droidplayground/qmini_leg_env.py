@@ -3072,6 +3072,17 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # comment): ~0.6 per step at the stage-1 saturation level, small next to
     # tracking_reward (~5)
     residual_bound_penalty_weight: float = 0.2
+    # Command-tracking sharpness sized to the command range (2026-10-13,
+    # applied from 2026-10-13_19-18-29 at 10.5k): the usual rule
+    # sigma ~ (half the max command)^2 gives ~130 for vx/vy (0.175 m/s) and ~45
+    # for wz (0.3 rad/s). At the stage-1/2 values (50 / 20) standing still
+    # under a typical half-range command cost only ~0.16 reward per step, and
+    # the deterministic policy at 10.5k stepped in place under every command
+    # (forward 0.009 of 0.087 m/s, turn-right going the wrong way, 0.13 rad/s
+    # left drift at zero command) while its hip-pitch residual (~13-15 deg)
+    # cancelled the reference stride.
+    position_reward_scale: float = 150.0
+    heading_reward_scale: float = 45.0
 
 
 class QminiLegEnv(DirectRLEnv):
