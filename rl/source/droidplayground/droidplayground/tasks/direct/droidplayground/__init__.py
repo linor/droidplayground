@@ -34,3 +34,15 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_qmini_leg_ppo_cfg:QMiniWalkPPORunnerCfg",
     },
 )
+
+# Walking stage 2: resume from a stage-1 run with the four late penalties back
+# on and the exploration std capped at 0.5 (see QminiWalkStage2EnvCfg).
+gym.register(
+    id="DroidPlayground-QMini-Walk-Stage2",
+    entry_point=f"{__name__}.qmini_leg_env:QminiLegEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.qmini_leg_env:QminiWalkStage2EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_qmini_leg_ppo_cfg:QMiniWalkStage2PPORunnerCfg",
+    },
+)

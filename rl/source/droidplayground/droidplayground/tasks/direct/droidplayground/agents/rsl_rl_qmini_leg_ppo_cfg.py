@@ -19,9 +19,10 @@ from isaaclab_rl.rsl_rl import (
 import rsl_rl.runners.on_policy_runner as _rsl_rl_on_policy_runner
 
 from .capped_lr_ppo import CappedLrPPO
-from .clamped_actor_critic import ClampedActorCritic
+from .clamped_actor_critic import ClampedActorCritic, ClampedActorCriticWalk
 
 _rsl_rl_on_policy_runner.ClampedActorCritic = ClampedActorCritic
+_rsl_rl_on_policy_runner.ClampedActorCriticWalk = ClampedActorCriticWalk
 # Same mechanism for the algorithm class (runner does eval(alg_cfg.pop("class_name"))).
 _rsl_rl_on_policy_runner.CappedLrPPO = CappedLrPPO
 
@@ -264,3 +265,15 @@ class QMiniWalkPPORunnerCfg(QMiniLegPPORunnerCfg):
     FRESH START -- checkpoints from logs/rsl_rl/qmini-walk (absolute actions,
     warm-started via widen_checkpoint_obs.py) are not compatible."""
     experiment_name = "qmini-walk-residual"
+
+
+@configclass
+class QMiniWalkStage2PPORunnerCfg(QMiniWalkPPORunnerCfg):
+    """Walking stage 2 (resume from stage 1): exploration std capped at 0.5
+    (ClampedActorCriticWalk). Same experiment name, so --load_run finds the
+    stage-1 run."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.policy.class_name = "ClampedActorCriticWalk"
+

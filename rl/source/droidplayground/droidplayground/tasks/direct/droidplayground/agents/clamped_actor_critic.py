@@ -58,3 +58,13 @@ class ClampedActorCritic(ActorCritic):
             with torch.no_grad():
                 self.log_std.clamp_(max=torch.log(torch.tensor(self.max_action_std)))
         super().update_distribution(obs)
+
+
+class ClampedActorCriticWalk(ClampedActorCritic):
+    """Walking stage 2+ (2026-10-13): with residual actions at action_scale
+    0.25 the entropy bonus makes noise twice as cheap as in step-in-place, and
+    the fresh-start recipe has the step-limit penalty off, so the stage-1
+    walking run's std climbed to the 1.0 ceiling (~14 deg of random target per
+    joint per step). 0.5 = ~7 deg, about what the step-in-place policies ran
+    with. Same parameters as ClampedActorCritic, so checkpoints load either way."""
+    max_action_std: float = 0.5

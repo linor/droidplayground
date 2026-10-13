@@ -3024,6 +3024,23 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     command_range_scale: float = 0.5
 
 
+@configclass
+class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
+    """Walking stage 2: RESUME from a stage-1 (QminiWalkEnvCfg fresh-start)
+    checkpoint once foot_swing_reward has held ~1.5 for a couple of thousand
+    iterations and the video shows real stepping. Re-enables the four
+    post-breakthrough penalties at the values with a resume track record (the
+    same batch of four was re-enabled together on 2026-10-03), which also
+    reins in the stage-1 jerkiness (step_limit) and drifting/spinning
+    (heading/position deviation). Command range stays at half; full range is
+    stage 3. Use with task DroidPlayground-QMini-Walk-Stage2 (also caps the
+    exploration std at 0.5)."""
+    target_limit_penalty_weight: float = 15.0
+    step_limit_penalty_weight: float = 10.0
+    heading_deviation_penalty_weight: float = 1.0
+    position_deviation_penalty_weight: float = 1.0
+
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 
