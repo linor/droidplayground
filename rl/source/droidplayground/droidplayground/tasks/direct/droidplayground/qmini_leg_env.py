@@ -3126,8 +3126,14 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # under the 1 cm margin.
     stance_foot_flat_penalty_weight: float = 60.0
     # the limp (left hip pitch residual EMA ~ -1.0, knee +0.6 in action units)
-    # costs ~0.6 per step at 0.5, the same bias split over both legs ~0.3
-    residual_bias_penalty_weight: float = 0.5
+    # costs ~0.6 per step at 0.5, the same bias split over both legs ~0.3.
+    # RAISED 0.5 -> 1.0 (2026-10-15, resume from 2026-10-15_00-22-39 at 54.3k):
+    # in 2k iterations at 0.5 the penalty fell 0.85 -> 0.53 per step but only
+    # from the cheap joints (left knee residual +8 -> +5.7); the left hip pitch
+    # stayed at -13.7 deg from the phase-0 start (eval, model_54300) at
+    # ~0.46 per step. Same size of step as the flat-foot raise 20 -> 60
+    # (~+0.5 per step), which kept stepping intact.
+    residual_bias_penalty_weight: float = 1.0
     # Command-tracking sharpness sized to the command range (2026-10-13,
     # applied from 2026-10-13_19-18-29 at 10.5k): the usual rule
     # sigma ~ (half the max command)^2 gives ~130 for vx/vy (0.175 m/s) and ~45
