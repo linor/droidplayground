@@ -2990,6 +2990,18 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # allows 10). 0 for the stage-1 fresh start, on in stage 2 together with
     # the step-limit penalty (which penalizes the flipping itself).
     residual_bound_penalty_weight: float = 0.0
+    # Flat-foot stance penalty (2026-10-14): while the REFERENCE has a foot
+    # planted (reference foot height < 5 mm), weight * max(|heel_z - toe_z| -
+    # margin, 0) per foot, in metres. The stage-2 walking policy -- symmetric as
+    # a function after the mirror loss (symmetry loss 2 -> 0.08) -- still
+    # settled into a limp from the phase-0 start: left hip pitch / knee 15 / 11
+    # deg off the reference with the left foot on its toes (heel ~5 cm up, the
+    # foot tilted ~30 deg) through the whole stance; starting at phase 0.5
+    # moved part of it to the right leg. Nothing penalized tiptoe stance, and
+    # the +-14 deg residual on hip pitch and knee is enough for it. Toe-off and
+    # heel strike stay free (the reference foot is lifted there).
+    stance_foot_flat_penalty_weight: float = 0.0
+    stance_foot_flat_margin_m: float = 0.01
 
 
 @configclass
@@ -3080,6 +3092,9 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # comment): ~0.6 per step at the stage-1 saturation level, small next to
     # tracking_reward (~5)
     residual_bound_penalty_weight: float = 0.2
+    # 20 per metre beyond 1 cm: the 5 cm tiptoe stance costs ~0.8 per foot per
+    # step (tracking_reward ~3.6)
+    stance_foot_flat_penalty_weight: float = 20.0
     # Command-tracking sharpness sized to the command range (2026-10-13,
     # applied from 2026-10-13_19-18-29 at 10.5k): the usual rule
     # sigma ~ (half the max command)^2 gives ~130 for vx/vy (0.175 m/s) and ~45
@@ -4257,6 +4272,17 @@ class QminiLegEnv(DirectRLEnv):
             in_push_cooldown, torch.zeros_like(foot_overswing_penalty), foot_overswing_penalty
         )
 
+        # flat foot while the reference has it planted (cfg.stance_foot_flat_penalty_weight)
+        ref_stance_left = torch.minimum(foot_height_reference[:, 0], foot_height_reference[:, 1]) < 0.005
+        ref_stance_right = torch.minimum(foot_height_reference[:, 2], foot_height_reference[:, 3]) < 0.005
+        tilt_left = (left_heel_pos_w[:, 2] - left_toe_pos_w[:, 2]).abs()
+        tilt_right = (right_heel_pos_w[:, 2] - right_toe_pos_w[:, 2]).abs()
+        margin = self.cfg.stance_foot_flat_margin_m
+        stance_foot_flat_penalty = self.cfg.stance_foot_flat_penalty_weight * (
+            ref_stance_left.float() * torch.clamp(tilt_left - margin, min=0.0)
+            + ref_stance_right.float() * torch.clamp(tilt_right - margin, min=0.0)
+        )
+
         # Track commanded base xy velocity (currently always zero -- stay
         # in place) -- see cfg.position_reward_weight's comment for why
         # this is velocity, not a position anchor.
@@ -4380,6 +4406,7 @@ class QminiLegEnv(DirectRLEnv):
             - foot_overswing_penalty
             - step_limit_penalty
             - residual_bound_penalty
+            - stance_foot_flat_penalty
         )
 
         # ---------------------------------
@@ -4402,6 +4429,9 @@ class QminiLegEnv(DirectRLEnv):
             "tracking/step_limit_penalty": step_limit_penalty.mean(),
             "tracking/residual_bound_penalty": residual_bound_penalty.mean(),
             "tracking/residual_saturation": residual_saturation,
+            "tracking/stance_foot_flat_penalty": stance_foot_flat_penalty.mean(),
+            "motion/stance_tilt_left_cm": (tilt_left * ref_stance_left).sum() / ref_stance_left.sum().clamp_min(1) * 100.0,
+            "motion/stance_tilt_right_cm": (tilt_right * ref_stance_right).sum() / ref_stance_right.sum().clamp_min(1) * 100.0,
             "tracking/step_over_rate": step_over_rate,
             "tracking/mean_max_step_deg": mean_max_step_deg,
             # Logged as the MINIMUM of heel/toe height (the bottleneck that
