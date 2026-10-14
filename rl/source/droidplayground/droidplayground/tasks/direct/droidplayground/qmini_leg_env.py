@@ -3002,6 +3002,20 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # heel strike stay free (the reference foot is lifted there).
     stance_foot_flat_penalty_weight: float = 0.0
     stance_foot_flat_margin_m: float = 0.01
+    # Residual BIAS penalty (2026-10-15): weight * sum over joints of the
+    # squared running mean (EMA, time constant residual_bias_tau_s ~ one gait
+    # cycle) of the clamped residual action. The stage-2 policy at 52k is
+    # mirror-symmetric as a function (symmetry loss 0.04) but limps on
+    # whichever leg swings first: from phase 0 the LEFT hip-pitch residual sits
+    # at -13.8 deg (the +-14.3 clip) with the right at ~0, from phase 0.5 the
+    # RIGHT one at -11.6 (mirrored) with the left at -2 -- and it only strafes
+    # toward the limping side. Library v3 moved half the bias into the
+    # reference; the policy kept the same residual on top. Nothing penalized a
+    # constant offset over the whole cycle. Squared, so a bias the gait really
+    # needs is cheapest split evenly over both legs (2 x 7 deg costs half of
+    # 14 + 0) and per-step corrections (zero mean) are free.
+    residual_bias_penalty_weight: float = 0.0
+    residual_bias_tau_s: float = 2.0
 
 
 @configclass
@@ -3111,6 +3125,9 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # tilt cost only ~0.17 per step. At 60 ~0.5 per step; the right foot stays
     # under the 1 cm margin.
     stance_foot_flat_penalty_weight: float = 60.0
+    # the limp (left hip pitch residual EMA ~ -1.0, knee +0.6 in action units)
+    # costs ~0.6 per step at 0.5, the same bias split over both legs ~0.3
+    residual_bias_penalty_weight: float = 0.5
     # Command-tracking sharpness sized to the command range (2026-10-13,
     # applied from 2026-10-13_19-18-29 at 10.5k): the usual rule
     # sigma ~ (half the max command)^2 gives ~130 for vx/vy (0.175 m/s) and ~45
@@ -3446,6 +3463,8 @@ class QminiLegEnv(DirectRLEnv):
         left_knee_stance = float(self.robot.data.default_joint_pos[0, left_knee_idx])
         right_knee_stance = float(self.robot.data.default_joint_pos[0, right_knee_idx])
         self._left_knee_idx = left_knee_idx
+        self._left_pitch_act_idx = self.robot.joint_names.index("Revolute_left_pitch")
+        self._right_pitch_act_idx = self.robot.joint_names.index("Revolute_right_pitch")
         self._right_knee_idx = right_knee_idx
         self._left_knee_stance_rad = left_knee_stance
         self._left_knee_swing_extreme_rad = _swing_extreme(clip_values[:, left_knee_idx], left_knee_stance)
@@ -3580,6 +3599,7 @@ class QminiLegEnv(DirectRLEnv):
         # doesn't (see robot_deploy.py's --action-smoothing flag, added as
         # a deploy-side diagnostic for this same symptom).
         self._prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._residual_ema = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
 
         # --- IMU realism state ---------------------------------------------
         # Per-env, per-axis gyro bias -- constant for an episode, resampled
@@ -4067,6 +4087,9 @@ class QminiLegEnv(DirectRLEnv):
             residual_bound_penalty = torch.zeros(self.num_envs, device=self.device)
             residual_saturation = torch.zeros((), device=self.device)
         step_over_rate = (step_delta_rad > math.radians(self.cfg.step_limit_threshold_deg)).any(dim=1).float().mean()
+        # residual bias: running mean of the (clamped) residual over ~one cycle
+        self._residual_ema += (self.step_dt / self.cfg.residual_bias_tau_s) * (self.actions - self._residual_ema)
+        residual_bias_penalty = self.cfg.residual_bias_penalty_weight * (self._residual_ema ** 2).sum(dim=1)
         mean_max_step_deg = torch.rad2deg(step_delta_rad.max(dim=1).values).mean()
         self._prev_actions = self.actions.clone()
 
@@ -4449,6 +4472,7 @@ class QminiLegEnv(DirectRLEnv):
             - step_limit_penalty
             - residual_bound_penalty
             - stance_foot_flat_penalty
+            - residual_bias_penalty
         )
 
         # ---------------------------------
@@ -4472,6 +4496,12 @@ class QminiLegEnv(DirectRLEnv):
             "tracking/residual_bound_penalty": residual_bound_penalty.mean(),
             "tracking/residual_saturation": residual_saturation,
             "tracking/stance_foot_flat_penalty": stance_foot_flat_penalty.mean(),
+            "tracking/residual_bias_penalty": residual_bias_penalty.mean(),
+            # cycle-mean residual in degrees (left convention: right negated);
+            # the limp shows as one hip pitch near -14 and the other near 0
+            "motion/residual_bias_left_pitch_deg": math.degrees(self.cfg.action_scale) * self._residual_ema[:, self._left_pitch_act_idx].mean(),
+            "motion/residual_bias_right_pitch_deg": -math.degrees(self.cfg.action_scale) * self._residual_ema[:, self._right_pitch_act_idx].mean(),
+            "motion/residual_bias_max_deg": math.degrees(self.cfg.action_scale) * self._residual_ema.abs().max(dim=1).values.mean(),
             "motion/stance_tilt_left_cm": (tilt_left * ref_stance_left).sum() / ref_stance_left.sum().clamp_min(1) * 100.0,
             "motion/stance_tilt_right_cm": (tilt_right * ref_stance_right).sum() / ref_stance_right.sum().clamp_min(1) * 100.0,
             "tracking/step_over_rate": step_over_rate,
@@ -4668,6 +4698,7 @@ class QminiLegEnv(DirectRLEnv):
         # which is fine and intentional -- zero is a neutral "no offset
         # from default_joint_pos" action).
         self._prev_actions[env_ids] = 0.0
+        self._residual_ema[env_ids] = 0.0
 
         # Force a fresh foot-swing stance-height capture for these envs on
         # their next _get_rewards() call -- see that flag's __init__
