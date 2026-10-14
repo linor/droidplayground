@@ -3017,7 +3017,18 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     # strafe). Fixed in samples.py; v2's full-grid mirror mismatch is 0.10 deg
     # (v1 13.7). Policies trained on v1 (runs up to 2026-10-13_21-44-20) must
     # be exported / evaluated with gait_library_2x.npz.
-    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x_v2.npz")
+    # v3 (2026-10-14): v2 + a larger stance offset, from what the stage-2 policy
+    # kept adding itself: its mean residual (target - reference), left-leg
+    # convention with the right leg mirrored, was hip pitch -7.2, knee -5.5,
+    # ankle -7.9, yaw -4.0, roll -0.55 deg per leg -- identical whichever leg it
+    # limped on (left-first and right-first starts) -- but it put all of it into
+    # ONE leg (hip pitch at the -15 deg residual bound): the limp. With the
+    # correction in the reference, both legs can sit near zero residual.
+    # (gen_gait_library.py --extra-offset "pitch=-7.2,knee=-5.5,ankle=-7.9,
+    # yaw=-4.0,roll=-0.55"). Hip pitch reaches its limit only at full-speed
+    # backward walking (vx -0.175), outside the half range.
+    # Policies trained on v2 (up to 2026-10-14_18-39-45): gait_library_2x_v2.npz.
+    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x_v3.npz")
     observation_space = 31
     residual_actions: bool = True
     residual_action_clip: float | None = 1.0

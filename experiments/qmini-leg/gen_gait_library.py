@@ -143,6 +143,9 @@ def main():
     ap.add_argument("--wz", default="-0.6,-0.3,0,0.3,0.6")
     ap.add_argument("--check", type=int, default=6, help="random off-grid commands to check interpolation against")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument("--extra-offset", default="",
+                    help="additional stance offset per joint type in the LEFT leg's (PhysX) convention, mirrored onto the "
+                         "right leg (negated), e.g. 'pitch=-7.2,knee=-5.5,ankle=-7.9,yaw=-4.0,roll=-0.55'")
     a = ap.parse_args()
 
     g = GO.apply(SM.build(), GP.OVERRIDES_JSON if os.path.isfile(GP.OVERRIDES_JSON) else None)
@@ -151,7 +154,10 @@ def main():
     assert [EX.SKEL2PHYS[nm].removeprefix("Revolute_") for nm in EX.ORDER] == JOINT_ORDER
     lo = np.array([math.degrees(limits["Revolute_" + j][0]) for j in JOINT_ORDER]) + LIMIT_MARGIN_DEG
     hi = np.array([math.degrees(limits["Revolute_" + j][1]) for j in JOINT_ORDER]) - LIMIT_MARGIN_DEG
-    off = np.array([STANCE_OFFSET_DEG.get(j, 0.0) for j in JOINT_ORDER])
+    extra = {k: float(v) for k, v in (kv.split("=") for kv in a.extra_offset.split(",") if kv)}
+    off = np.array([STANCE_OFFSET_DEG.get(j, 0.0) + (1.0 if j.startswith("left_") else -1.0) * extra.get(j.split("_", 1)[1], 0.0)
+                    for j in JOINT_ORDER])
+    print("stance offset (deg):", dict(zip(JOINT_ORDER, np.round(off, 2))))
 
     VX, VY, WZ = (np.array([float(v) for v in s.split(",")]) for s in (a.vx, a.vy, a.wz))
     shape = (len(VX), len(VY), len(WZ))
