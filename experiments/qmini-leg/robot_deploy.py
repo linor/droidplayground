@@ -246,14 +246,9 @@ class JointConfig:
     # 'default' move and the soft-stop ramp (see Deployment.run()). The
     # policy's action anchor stays default_pos_deg -- that one must match
     # training. 2026-10-09: ankles 3 deg forward so the robot stands on its
-    # own before the policy starts / after a soft stop.
-    walk_startup_offset_deg: float = 0.0
-    # The same, for RESIDUAL walking bundles, whose rest pose is the bundle's
-    # gait reference at zero command, phase 0 (both feet down) plus this --
-    # not default_pos_deg + startup_offset_deg. 2026-10-14: library v3's
-    # stance only stands on its own with the ankles 3-6 deg forward in sim
-    # (check_static_pose_stability.py --from-gait-library --ankle-offsets):
-    # 0 / -2 tips over backward, -4 holds 0 deg pitch, -6.5 tips forward.
+    # own before the policy starts / after a soft stop. For RESIDUAL walking
+    # bundles it is added to the bundle's gait reference stance instead (zero
+    # command, phase 0), see robot_config_qmini_walk.json.
 
 
 @dataclass
@@ -1226,13 +1221,13 @@ class Deployment:
         # Where the robot stands while the policy is NOT running (startup
         # move, soft stop): default_pos_deg + startup_offset_deg, or for a
         # residual walking bundle the reference stance the policy starts on
-        # (zero command, phase 0) + walk_startup_offset_deg.
+        # (zero command, phase 0) + startup_offset_deg.
         if self.ref_gait is not None:
             stance = self.ref_gait.joint_ref([0.0, 0.0, 0.0], 0.0)
             self.rest_pose_rad = {
-                j.name: stance[j.name] + math.radians(j.walk_startup_offset_deg) for j in robot_cfg.joints
+                j.name: stance[j.name] + math.radians(j.startup_offset_deg) for j in robot_cfg.joints
             }
-            self.logger.info("Rest pose = reference stance + walk_startup_offset_deg: %s", "  ".join(
+            self.logger.info("Rest pose = reference stance + startup_offset_deg: %s", "  ".join(
                 f"{j.name}={math.degrees(self.rest_pose_rad[j.name]):+.1f}" for j in robot_cfg.joints))
         else:
             self.rest_pose_rad = {
