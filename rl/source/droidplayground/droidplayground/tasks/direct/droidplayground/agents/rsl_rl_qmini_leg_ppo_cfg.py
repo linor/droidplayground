@@ -4,6 +4,7 @@ from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlPpoActorCriticCfg,
     RslRlPpoAlgorithmCfg,
+    RslRlSymmetryCfg,
 )
 
 # rsl_rl's OnPolicyRunner resolves the policy class via a plain
@@ -20,6 +21,7 @@ import rsl_rl.runners.on_policy_runner as _rsl_rl_on_policy_runner
 
 from .capped_lr_ppo import CappedLrPPO
 from .clamped_actor_critic import ClampedActorCritic, ClampedActorCriticWalk
+from .qmini_symmetry import qmini_mirror
 
 _rsl_rl_on_policy_runner.ClampedActorCritic = ClampedActorCritic
 _rsl_rl_on_policy_runner.ClampedActorCriticWalk = ClampedActorCriticWalk
@@ -307,4 +309,16 @@ class QMiniWalkStage2PPORunnerCfg(QMiniWalkPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
         self.policy.class_name = "ClampedActorCriticWalk"
+        # Left/right mirror loss (2026-10-14, see qmini_symmetry.py): the stage-2
+        # policy limped -- left hip pitch/knee 15/11 deg off the reference, left
+        # foot on its toes -- with a mirror-symmetric reference and robot.
+        # Mirror LOSS (not data augmentation) because this resumes onto an
+        # asymmetric policy: augmented samples would have near-zero likelihood
+        # under it. Watch Loss/symmetry in tensorboard (should fall).
+        self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+            use_data_augmentation=False,
+            use_mirror_loss=True,
+            mirror_loss_coeff=0.2,
+            data_augmentation_func=qmini_mirror,
+        )
 
