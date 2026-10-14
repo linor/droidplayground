@@ -3093,8 +3093,13 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # tracking_reward (~5)
     residual_bound_penalty_weight: float = 0.2
     # 20 per metre beyond 1 cm: the 5 cm tiptoe stance costs ~0.8 per foot per
-    # step (tracking_reward ~3.6)
-    stance_foot_flat_penalty_weight: float = 20.0
+    # step (tracking_reward ~3.6). RAISED 20 -> 60 (2026-10-14, resume from
+    # 2026-10-14_12-04-52 at ~44k): at 20 the left stance tilt dropped 4.3 ->
+    # ~2.0 cm in 3k iterations and then plateaued for 7k (right foot ~0.8 cm),
+    # with the left hip-pitch residual still pinned at -15 deg; the remaining
+    # tilt cost only ~0.17 per step. At 60 ~0.5 per step; the right foot stays
+    # under the 1 cm margin.
+    stance_foot_flat_penalty_weight: float = 60.0
     # Command-tracking sharpness sized to the command range (2026-10-13,
     # applied from 2026-10-13_19-18-29 at 10.5k): the usual rule
     # sigma ~ (half the max command)^2 gives ~130 for vx/vy (0.175 m/s) and ~45
