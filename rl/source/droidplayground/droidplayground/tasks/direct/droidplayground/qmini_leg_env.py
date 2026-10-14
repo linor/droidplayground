@@ -3453,9 +3453,8 @@ class QminiLegEnv(DirectRLEnv):
         self._right_knee_swing_extreme_rad = _swing_extreme(clip_values[:, right_knee_idx], right_knee_stance)
 
         # Walking mode: references from the gait library at each env's own
-        # command (cfg.gait_library_path). The knee swing extremes above stay
-        # from the step-in-place clip (only used to normalize the swing
-        # target, which is clamped).
+        # command (cfg.gait_library_path); the reset pose and the knee swing
+        # target are re-anchored on the library's stance below.
         self._gait_lib = None
         if self.cfg.gait_library_path:
             self._gait_lib = GaitLibrary(self.cfg.gait_library_path, self.robot.joint_names[: self.num_joints], self.device)
@@ -3468,6 +3467,33 @@ class QminiLegEnv(DirectRLEnv):
             self._path_yaw = torch.zeros(self.num_envs, device=self.device)
             self.motion = LibraryMotion(self._gait_lib, lambda: self._cmd, "joints")
             self.foot_height_motion = LibraryMotion(self._gait_lib, lambda: self._cmd, "feet")
+            # Anchor on the library's own stance (zero command, phase 0, both
+            # feet down) instead of the step-in-place pose (2026-10-14). The
+            # residual target is reference + action_scale * action whatever
+            # default_joint_pos is (it cancels in _pre_physics_step /
+            # _apply_action) and the observation is the absolute joint angle,
+            # so this changes exactly two things: episodes reset into the
+            # stance the deploy rests on (robot_config_qmini_walk.json), not
+            # 5-8 deg away from it, and the knee swing target below is
+            # measured from the library's stance knee. Library v3 straightened
+            # the stance knee by 5.5 deg, which against the old 22.6 deg anchor
+            # cut the swing target from mean 0.20 / peak 0.99 to 0.07 / 0.52
+            # (tracking/foot_swing_reward 1.76 -> 1.0); library-relative it is
+            # 0.18 / 1.0 for v2 and v3 alike.
+            nj = self.num_joints
+            zero_cmd = torch.zeros(1, 3, device=self.device)
+            stance = self._gait_lib.joint_ref(zero_cmd, torch.zeros(1, device=self.device))[0]
+            self.robot.data.default_joint_pos[:, :nj] = stance.unsqueeze(0)
+            cycle = self._gait_lib.joint_ref(zero_cmd.expand(self._gait_lib.nph, 3),
+                                             torch.arange(self._gait_lib.nph, device=self.device) / self._gait_lib.nph).cpu()
+            self._left_knee_stance_rad = float(stance[left_knee_idx])
+            self._right_knee_stance_rad = float(stance[right_knee_idx])
+            self._left_knee_swing_extreme_rad = _swing_extreme(cycle[:, left_knee_idx], self._left_knee_stance_rad)
+            self._right_knee_swing_extreme_rad = _swing_extreme(cycle[:, right_knee_idx], self._right_knee_stance_rad)
+            print(f"[QminiLegEnv] WALKING: reset pose = library stance (deg) "
+                  f"{[round(math.degrees(float(v)), 1) for v in stance]}, knee swing target "
+                  f"L {math.degrees(self._left_knee_stance_rad):.1f}->{math.degrees(self._left_knee_swing_extreme_rad):.1f} "
+                  f"R {math.degrees(self._right_knee_stance_rad):.1f}->{math.degrees(self._right_knee_swing_extreme_rad):.1f}", flush=True)
             print(f"[QminiLegEnv] WALKING: gait library {self.cfg.gait_library_path} grid {self._gait_lib.shape} "
                   f"x {self._gait_lib.nph}, vx {float(self._gait_lib.lo[0]):+.3f}..{float(self._gait_lib.hi[0]):+.3f} m/s, "
                   f"vy {float(self._gait_lib.lo[1]):+.3f}..{float(self._gait_lib.hi[1]):+.3f} m/s, "
