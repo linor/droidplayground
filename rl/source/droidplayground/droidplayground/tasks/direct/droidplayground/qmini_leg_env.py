@@ -3129,7 +3129,13 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # is still ~20 deg (eval p50 of each env's max; the deploy aborts above
     # max_step_deg 15). At 2.0 the penalty is ~0.9 per step, so 5.0 ~2.2 and
     # 10.0 ~4.4 of a ~6.9 tracking reward: 5.0 first, 10.0 once it settles.
-    step_limit_penalty_weight: float = 5.0
+    # RAISED 5.0 -> 10.0 (2026-10-15, resume from 2026-10-15_16-30-26 at
+    # 78.2k): at 5.0 the std dropped 0.28 -> 0.19, mean max step 12.3 -> 8.5
+    # deg, tracking reward 6.9 -> 8.0, the penalty itself back to ~0.85 per
+    # step (so 10.0 ~1.7). But each env's worst step over 12 s is still
+    # 14-21 deg (eval model_78200, p50 per command group), above the deploy's
+    # 15 deg abort.
+    step_limit_penalty_weight: float = 10.0
     heading_deviation_penalty_weight: float = 1.0
     position_deviation_penalty_weight: float = 1.0
     # pull the raw outputs back inside the +-1 residual bound (see the field's
