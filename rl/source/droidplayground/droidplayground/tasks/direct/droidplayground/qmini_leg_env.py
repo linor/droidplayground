@@ -3042,7 +3042,20 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     # yaw=-4.0,roll=-0.55"). Hip pitch reaches its limit only at full-speed
     # backward walking (vx -0.175), outside the half range.
     # Policies trained on v2 (up to 2026-10-14_18-39-45): gait_library_2x_v2.npz.
-    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x_v3.npz")
+    # v4 (2026-10-15): v3's hip-pitch part was the limp itself, not a needed
+    # stance. With the residual bias penalty the limp broke (~64.5k) and at
+    # 72.1k the policy's mean residual (left convention) is the same from both
+    # starts: hip pitch +7.75, knee -2.8, ankle -2.9, yaw +0.95, roll +0.1 --
+    # perfectly symmetric from the phase-0.5 start (+7.6 / +7.6 hip pitch),
+    # split +1.7 / +14.1 (the limp, now on the right) from phase 0. It undoes
+    # v3's -7.2 hip pitch and adds a little more knee / ankle in v3's direction.
+    # v4 = v3 + that: --extra-offset "pitch=0.55,knee=-8.3,ankle=-10.8,
+    # yaw=-3.05,roll=-0.45"; identical to v3 + the constant everywhere (no
+    # limit clipping), same IK reachability. Its stance stands on its own in
+    # sim without an ankle offset (+0.6 deg pitch; 0 .. -2 stand).
+    # Policies trained on v3 (2026-10-14_21-10-37 .. 2026-10-15_01-44-57):
+    # gait_library_2x_v3.npz.
+    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x_v4.npz")
     observation_space = 31
     residual_actions: bool = True
     residual_action_clip: float | None = 1.0
