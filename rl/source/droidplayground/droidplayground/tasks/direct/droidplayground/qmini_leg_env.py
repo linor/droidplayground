@@ -3129,7 +3129,17 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # pull the raw outputs back inside the +-1 residual bound (see the field's
     # comment): ~0.6 per step at the stage-1 saturation level, small next to
     # tracking_reward (~5)
-    residual_bound_penalty_weight: float = 0.2
+    # RAISED 0.2 -> 1.0 (2026-10-15, resume from 2026-10-15_13-15-44 at 74k):
+    # 0.2 never pulled hip pitch back in. Deterministic model_74000 (v4,
+    # phase 0): right hip pitch raw -1.6 on 96 % of steps (the limp), left hip
+    # pitch bang-bang between -1.6 and +1.5 (88 % beyond the bound; that flip is
+    # the 20-28 deg per-step target jumps), knees beyond on 30-40 %, yaw / roll
+    # / ankles inside. Beyond the bound every raw value acts the same, so the
+    # residual bias penalty, the step limit and the v3 / v4 reference shifts
+    # had nothing to act on -- the residuals stayed the same across both
+    # library switches. Pulling the raw mean back to the bound changes no
+    # behaviour, so this costs reward (~1.7 per step at first) but no skill.
+    residual_bound_penalty_weight: float = 1.0
     # 20 per metre beyond 1 cm: the 5 cm tiptoe stance costs ~0.8 per foot per
     # step (tracking_reward ~3.6). RAISED 20 -> 60 (2026-10-14, resume from
     # 2026-10-14_12-04-52 at ~44k): at 20 the left stance tilt dropped 4.3 ->
