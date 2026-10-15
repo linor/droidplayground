@@ -46,3 +46,14 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_qmini_leg_ppo_cfg:QMiniWalkStage2PPORunnerCfg",
     },
 )
+
+# Walking stage 3: the full command range, resumed from stage 2 (same runner).
+gym.register(
+    id="DroidPlayground-QMini-Walk-Stage3",
+    entry_point=f"{__name__}.qmini_leg_env:QminiLegEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.qmini_leg_env:QminiWalkStage3EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_qmini_leg_ppo_cfg:QMiniWalkStage2PPORunnerCfg",
+    },
+)

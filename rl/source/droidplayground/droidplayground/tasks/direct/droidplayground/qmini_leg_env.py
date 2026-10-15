@@ -3205,6 +3205,25 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     velocity_avg_window_s: float | None = 2.0
 
 
+@configclass
+class QminiWalkStage3EnvCfg(QminiWalkStage2EnvCfg):
+    """Stage 3 (2026-10-16): the FULL command range (vx +-0.175 m/s, vy +-0.08
+    m/s, wz +-0.3 rad/s), resumed from stage 2. At 90.4k the half-range policy
+    has no limp, residuals within +-2 deg, worst per-step target changes
+    12-15 deg and no falls, but undershoots forward (0.036-0.042 of 0.087),
+    strafes only toward the side whose foot lifts first (left from phase 0,
+    right from phase 0.5) and over-turns ~33 %. The strafe probe at 0.08 m/s
+    already responded better (0.05 m/s) than at 0.04 -- larger commands give
+    a clearer signal. The reference itself moves at most 5.3 deg per control
+    step at full speed (2.4 at half range); commands the library cannot reach
+    (6 grid corners, IK error > 5 mm) are scaled back by
+    _sample_command_targets as before."""
+    command_range_scale: float = 1.0
+    # the tracking-sharpness rule for the full range (see the stage-2 fields)
+    position_reward_scale: float = 150.0
+    heading_reward_scale: float = 45.0
+
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 
