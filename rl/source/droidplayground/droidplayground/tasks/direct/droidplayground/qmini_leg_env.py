@@ -3123,7 +3123,13 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # noise alone (~2x the whole per-step reward) -- the kind of shock that
     # has collapsed stepping on resume before. Raise to 10.0 in a later
     # resume once the std / flipping have come down.
-    step_limit_penalty_weight: float = 2.0
+    # RAISED 2.0 -> 5.0 (2026-10-15, resume from 2026-10-15_14-31-08 at 77.2k):
+    # with the residual back inside its bound (saturation 0.28 -> 0.04) the
+    # std is 0.30 and the limp is gone, but the worst per-step target change
+    # is still ~20 deg (eval p50 of each env's max; the deploy aborts above
+    # max_step_deg 15). At 2.0 the penalty is ~0.9 per step, so 5.0 ~2.2 and
+    # 10.0 ~4.4 of a ~6.9 tracking reward: 5.0 first, 10.0 once it settles.
+    step_limit_penalty_weight: float = 5.0
     heading_deviation_penalty_weight: float = 1.0
     position_deviation_penalty_weight: float = 1.0
     # pull the raw outputs back inside the +-1 residual bound (see the field's
