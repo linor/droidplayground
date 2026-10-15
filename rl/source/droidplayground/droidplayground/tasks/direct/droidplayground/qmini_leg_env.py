@@ -2954,6 +2954,16 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # sideways sway (~0.55 Hz at the 2x time scale), which an EMA with a
     # ~1 s time constant attenuates ~3.6x.
     velocity_ema_tau_s: float = 1.0
+    # Boxcar average over this window instead of the EMA (None = EMA). Added
+    # 2026-10-15: a window of one gait cycle cancels the sway exactly, the EMA
+    # leaves ~30 % of it. At zero command the stage-2 policy (model_87100)
+    # already scored a 3.1 cm/s "velocity error" from sway + drift, about the
+    # size of the 4 cm/s strafe command; a strafing gait sways more, and with
+    # the tracking sharpness at 400 that cost more than the strafe earned --
+    # strafe fell 0.028 -> 0.018 m/s after the sharpening and the policy's
+    # residual cancelled 20-50 % of the reference's strafe hip roll. Same lag
+    # as the EMA (half a window ~ tau).
+    velocity_avg_window_s: float | None = None
     # RESIDUAL actions (walking, 2026-10-13): joint target = reference(phase,
     # command) + action_scale * action instead of default_joint_pos +
     # action_scale * action. With absolute actions the network had to
@@ -3191,6 +3201,8 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # Stage 3 (full range) should go back to 150 / 45.
     position_reward_scale: float = 400.0
     heading_reward_scale: float = 120.0
+    # one gait cycle (~2.0 s at zero command), see the field's comment
+    velocity_avg_window_s: float | None = 2.0
 
 
 class QminiLegEnv(DirectRLEnv):
@@ -3534,6 +3546,12 @@ class QminiLegEnv(DirectRLEnv):
             self._cmd_steps_left = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
             self._cmd_ramp = torch.tensor(self.cfg.command_ramp_rate, device=self.device) * self.step_dt
             self._vel_ema = torch.zeros(self.num_envs, 3, device=self.device)        # yaw-frame v_left, v_rear, wz
+            if self.cfg.velocity_avg_window_s:
+                n_win = max(1, round(self.cfg.velocity_avg_window_s / self.step_dt))
+                self._vel_hist = torch.zeros(self.num_envs, n_win, 3, device=self.device)
+                self._vel_hist_sum = torch.zeros(self.num_envs, 3, device=self.device)
+                self._vel_hist_count = torch.zeros(self.num_envs, 1, device=self.device)
+                self._vel_hist_ptr = 0
             self._path_pos_xy = torch.zeros(self.num_envs, 2, device=self.device)
             self._path_yaw = torch.zeros(self.num_envs, device=self.device)
             self.motion = LibraryMotion(self._gait_lib, lambda: self._cmd, "joints")
@@ -4448,9 +4466,18 @@ class QminiLegEnv(DirectRLEnv):
             cy, sy = torch.cos(current_yaw), torch.sin(current_yaw)
             vw = self.robot.data.root_lin_vel_w[:, :2]
             v_yaw = torch.stack((cy * vw[:, 0] + sy * vw[:, 1], -sy * vw[:, 0] + cy * vw[:, 1]), dim=1)   # base axes (+X left, +Y rear)
-            ema_a = min(1.0, self.step_dt / self.cfg.velocity_ema_tau_s)
             cur = torch.cat((v_yaw, self.robot.data.root_ang_vel_w[:, 2:3]), dim=1)
-            self._vel_ema += ema_a * (cur - self._vel_ema)
+            if self.cfg.velocity_avg_window_s:
+                # boxcar over the last window (shorter right after a reset)
+                n_win = self._vel_hist.shape[1]
+                self._vel_hist_sum += cur - self._vel_hist[:, self._vel_hist_ptr]
+                self._vel_hist[:, self._vel_hist_ptr] = cur
+                self._vel_hist_ptr = (self._vel_hist_ptr + 1) % n_win
+                self._vel_hist_count = torch.clamp(self._vel_hist_count + 1, max=n_win)
+                self._vel_ema = self._vel_hist_sum / self._vel_hist_count
+            else:
+                ema_a = min(1.0, self.step_dt / self.cfg.velocity_ema_tau_s)
+                self._vel_ema += ema_a * (cur - self._vel_ema)
             commanded_lin_vel_xy = torch.stack((self._cmd[:, 1], -self._cmd[:, 0]), dim=1)
             base_vel_error = torch.sum((self._vel_ema[:, :2] - commanded_lin_vel_xy) ** 2, dim=1)
             position_reward = torch.exp(-self.cfg.position_reward_scale * base_vel_error)
@@ -4741,6 +4768,10 @@ class QminiLegEnv(DirectRLEnv):
             self._cmd[env_ids] = 0.0
             self._sample_command_targets(env_ids)
             self._vel_ema[env_ids] = 0.0
+            if self.cfg.velocity_avg_window_s:
+                self._vel_hist[env_ids] = 0.0
+                self._vel_hist_sum[env_ids] = 0.0
+                self._vel_hist_count[env_ids] = 0.0
             self._path_pos_xy[env_ids] = default_root_state[:, :2]
             self._path_yaw[env_ids] = reset_yaw
 
