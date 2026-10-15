@@ -3178,8 +3178,19 @@ class QminiWalkStage2EnvCfg(QminiWalkEnvCfg):
     # (forward 0.009 of 0.087 m/s, turn-right going the wrong way, 0.13 rad/s
     # left drift at zero command) while its hip-pitch residual (~13-15 deg)
     # cancelled the reference stride.
-    position_reward_scale: float = 150.0
-    heading_reward_scale: float = 45.0
+    # RAISED 150 / 45 -> 400 / 120 (2026-10-15, resume from 2026-10-15_17-13-31
+    # at 82.5k): those values follow the rule for the FULL range, but stage 2
+    # samples the half range (command_range_scale 0.5: vx 0.0875, wz 0.15),
+    # where the rule gives ~520 / ~180. After the step-limit stage the
+    # deterministic policy (model_82500, residuals within +-2 deg, worst steps
+    # 10-12 deg) walks forward 0.046 of 0.087 m/s (0.088 at 72k), back 0.042,
+    # strafes right 0.007 of -0.04 (wrong way) and over-turns 0.21 of 0.15
+    # rad/s -- the same at friction 0.5. Forward at half speed kept ~78 % of
+    # the velocity reward at 150 (0.53 at 400); the 40 % turn overshoot ~85 %
+    # at 45 (0.65 at 120). Slightly under the rule to soften the resume.
+    # Stage 3 (full range) should go back to 150 / 45.
+    position_reward_scale: float = 400.0
+    heading_reward_scale: float = 120.0
 
 
 class QminiLegEnv(DirectRLEnv):
