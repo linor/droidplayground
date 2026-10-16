@@ -3026,6 +3026,17 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # 14 + 0) and per-step corrections (zero mean) are free.
     residual_bias_penalty_weight: float = 0.0
     residual_bias_tau_s: float = 2.0
+    # Body pitch penalty (2026-10-16): weight * max(|pitch| - margin, 0)^2,
+    # pitch in radians from the projected gravity (either direction). The
+    # first walking hardware test (deploy_bundle_2026-10-16_walk_s3_106200)
+    # fell backwards once while walking back at ~0.12 m/s; the same policy in
+    # sim leans back just as far (pitch mean +8.2 / p95 +11.8 deg at -0.175,
+    # hardware +6.1 / +11.9) -- the lean is the gait, not a sim/real gap, and
+    # it leaves little margin (the stance tips over backwards within a few
+    # degrees). orientation_reward (margin 6 deg, scale 12) costs < 2 % at
+    # 8 deg, so nothing discouraged it. Forward walking leans 4-6 deg.
+    body_pitch_penalty_weight: float = 0.0
+    body_pitch_margin_deg: float = 3.0
 
 
 @configclass
@@ -3222,6 +3233,9 @@ class QminiWalkStage3EnvCfg(QminiWalkStage2EnvCfg):
     # the tracking-sharpness rule for the full range (see the stage-2 fields)
     position_reward_scale: float = 150.0
     heading_reward_scale: float = 45.0
+    # 8 deg of lean (5 over the margin) costs ~0.5 per step, like the residual
+    # bias penalty that resumed cleanly (see the field's comment)
+    body_pitch_penalty_weight: float = 60.0
 
 
 class QminiLegEnv(DirectRLEnv):
@@ -4276,6 +4290,10 @@ class QminiLegEnv(DirectRLEnv):
         roll_error = torch.clamp(roll_sin - roll_margin_sin, min=0.0) ** 2
         roll_reward = torch.exp(-self.cfg.orientation_reward_scale * roll_error)
 
+        body_pitch = torch.asin(projected_gravity[:, 1].clamp(-1.0, 1.0))           # base +Y rear: + = leaning back
+        body_pitch_excess = torch.clamp(body_pitch.abs() - math.radians(self.cfg.body_pitch_margin_deg), min=0.0)
+        body_pitch_penalty = self.cfg.body_pitch_penalty_weight * body_pitch_excess ** 2
+
         # Foot-height swing reward -- see cfg.foot_swing_reward_weight's
         # comment for the full rationale. left/right_swing_target is how
         # much the reference clip's own knee angle says this foot should
@@ -4571,6 +4589,7 @@ class QminiLegEnv(DirectRLEnv):
             - residual_bound_penalty
             - stance_foot_flat_penalty
             - residual_bias_penalty
+            - body_pitch_penalty
         )
 
         # ---------------------------------
@@ -4595,6 +4614,9 @@ class QminiLegEnv(DirectRLEnv):
             "tracking/residual_saturation": residual_saturation,
             "tracking/stance_foot_flat_penalty": stance_foot_flat_penalty.mean(),
             "tracking/residual_bias_penalty": residual_bias_penalty.mean(),
+            "tracking/body_pitch_penalty": body_pitch_penalty.mean(),
+            "orientation/pitch_deg": torch.rad2deg(body_pitch).mean(),                # signed, + = back
+            "orientation/abs_pitch_deg": torch.rad2deg(body_pitch.abs()).mean(),
             # cycle-mean residual in degrees (left convention: right negated);
             # the limp shows as one hip pitch near -14 and the other near 0
             "motion/residual_bias_left_pitch_deg": math.degrees(self.cfg.action_scale) * self._residual_ema[:, self._left_pitch_act_idx].mean(),
