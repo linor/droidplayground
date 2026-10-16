@@ -131,6 +131,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import hashlib
 import json
 import logging
@@ -1586,6 +1587,14 @@ class Deployment:
             # reaches the next of self.soft_stop_phases, then ramp to the rest
             # pose and ask whether to release. Ctrl+C stays the immediate stop.
             soft_stop_requested = False
+            # A full (generation-2) garbage collection walks every tracked
+            # object -- torch, the logging machinery -- and stalled the loop
+            # ~95 ms (5 control steps) once per run on the Pi, at the same CSV
+            # row (4429, t 88.9 s) in all three 2026-10-16 walking runs. Collect
+            # now and move the survivors to the permanent generation so later
+            # collections only see objects created during the run.
+            gc.collect()
+            gc.freeze()
             print("Policy running.  Enter = soft stop (finish the step, back to the rest pose)   "
                   "Ctrl+C = immediate stop (motors off)", flush=True)
             if self.walking:
