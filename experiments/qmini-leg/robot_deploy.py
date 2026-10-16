@@ -1197,7 +1197,12 @@ class Deployment:
                 self.imu.axis_remap,
             )
 
-        if keyframes_path is None:
+        # Walking bundles take phase and reference from the gait library; the
+        # keyframe clip is only needed for step-in-place / open-loop runs.
+        if keyframes_path is None and self.walking and not open_loop_ref:
+            self.motion = None
+            self.logger.info("Walking bundle: no keyframe clip (phase and reference from the gait library).")
+        elif keyframes_path is None:
             raise ValueError(
                 "keyframes_path is required -- pass --keyframes pointing at "
                 "the clip this robot_config.json's joints were tuned "
@@ -1205,8 +1210,9 @@ class Deployment:
                 "There is no built-in default clip: a stale/wrong joint "
                 "count here would silently drift from what training used."
             )
-        self.motion = MotionReference.from_json(keyframes_path, n_joints=len(robot_cfg.joints))
-        self.logger.info("Loaded keyframes from %s", keyframes_path)
+        else:
+            self.motion = MotionReference.from_json(keyframes_path, n_joints=len(robot_cfg.joints))
+            self.logger.info("Loaded keyframes from %s", keyframes_path)
         self.motion_time = 0.0
 
         # Fixed anchor pose each joint's action is decoded relative to --
@@ -1292,6 +1298,8 @@ class Deployment:
             # robot_cfg.json lists its joints in (grouped by leg), not the
             # policy's training order. Unlike build_obs/run() above, there
             # is no meta.json here to source a name-verified order from.
+            if self.motion is None:
+                raise ValueError("--startup-pose keyframe needs --keyframes")
             ref = self.motion.sample(0.0)
             return {joint.name: ref[i] for i, joint in enumerate(self.robot_cfg.joints)}
         else:
@@ -1507,7 +1515,6 @@ class Deployment:
         return dt / self.cmd_table.period_s(self.cmd_input.cmd) if self.walking else dt
 
     def build_obs(self, readings: dict) -> torch.Tensor:
-        ref = self.motion.sample(self.motion_time)
         obs = []
         # Walk policy_joint_order (NOT robot_cfg.joints) so the obs vector
         # is indexed exactly the way the policy was trained, regardless of
@@ -1636,7 +1643,7 @@ class Deployment:
                         f"  imu_ms={imu_ms:.1f}"
                     )
 
-                ref = self.motion.sample(self.motion_time)
+                ref = self.motion.sample(self.motion_time) if self.motion is not None else None
 
                 policy_start = time.perf_counter()
                 if self.open_loop_ref:
