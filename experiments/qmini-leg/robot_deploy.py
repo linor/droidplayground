@@ -2076,7 +2076,16 @@ def main():
     robot_cfg = RobotConfig.load(args.config)
 
     if not args.record_stand_pose and args.keyframes is None:
-        parser.error("--keyframes is required (except with --record-stand-pose).")
+        # walking bundles (meta "command" block) take phase and reference from
+        # the gait library -- the clip is only needed for step-in-place runs
+        walking_meta = False
+        if args.policy_meta and not args.open_loop_ref:
+            try:
+                walking_meta = "command" in json.loads(Path(args.policy_meta).read_text())
+            except (OSError, ValueError):
+                walking_meta = False
+        if not walking_meta:
+            parser.error("--keyframes is required (except with --record-stand-pose or a walking policy bundle).")
     if args.record_stand_pose:
         rec_logger = logging.getLogger("robot_deploy.record")
         rec_logger.addHandler(logging.StreamHandler(sys.stdout)); rec_logger.setLevel(logging.INFO)
