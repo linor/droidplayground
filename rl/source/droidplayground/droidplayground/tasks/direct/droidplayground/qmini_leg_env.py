@@ -3076,7 +3076,18 @@ class QminiWalkEnvCfg(QminiLegEnvCfg):
     # sim without an ankle offset (+0.6 deg pitch; 0 .. -2 stand).
     # Policies trained on v3 (2026-10-14_21-10-37 .. 2026-10-15_01-44-57):
     # gait_library_2x_v3.npz.
-    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x_v4.npz")
+    # v5 (2026-10-16): with the body pitch penalty (stage 3, model_123200) the
+    # policy holds a constant, SYMMETRIC, unsaturated residual on both legs --
+    # left convention hip pitch +4.2, knee -5.25, ankle -1.45 (the same from
+    # both start phases, 4-5 % of outputs beyond the clip) -- to stand more
+    # upright, paying ~0.42 per step of residual_bias_penalty for it. v5 = v4
+    # + that: --extra-offset "pitch=4.75,knee=-13.55,ankle=-12.25,yaw=-3.05,
+    # roll=-0.45"; v4 + the constant everywhere, same IK reachability, mirror
+    # exact. Its stance stands in sim with ankle offset 0 (+0.1..+0.3 deg;
+    # 0 .. -2 stand, +1 tips backward), like v4.
+    # Policies trained on v4 (2026-10-15_13-15-44 .. 2026-10-16_13-49-00):
+    # gait_library_2x_v4.npz.
+    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x_v5.npz")
     observation_space = 31
     residual_actions: bool = True
     residual_action_clip: float | None = 1.0
