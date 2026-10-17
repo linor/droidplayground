@@ -3275,6 +3275,32 @@ class QminiWalkStage4EnvCfg(QminiWalkStage3EnvCfg):
     velocity_avg_window_s: float | None = 1.65
 
 
+_V7_DOC = """Gait library v7 (2026-10-17): v5's stance offsets plus a 3.5 cm lateral
+    pelvis sway toward the support foot (qmini-gait samples.PELVIS_SWAY, c87df75;
+    gen_gait_library.py --pelvis-sway 0.035, authored +-2 deg pelvis lean kept).
+    The authored gaits never shifted the weight sideways, so the policy did it
+    by rocking the whole robot on its laterally rounded soles (~42 mm radius;
+    hardware body roll ~6 deg rms at zero command). The sway makes the
+    reference do the shift with both legs tilting through the hip roll joints
+    and the body (nearly) level. Hip roll headroom: zero command -4.3..+3.7
+    deg (v5 -3.2..+2.2), full strafe 11.6, whole grid <= 12.8 (limit 14), no
+    limit clipping; a level pelvis (lean scale 0) would need +-6.9 and clips
+    at full strafe, 5 cm clips too. Same stance at phase 0 (pelvis centred),
+    so the deploy rest pose is unchanged."""
+
+
+@configclass
+class QminiWalkStage5EnvCfg(QminiWalkStage3EnvCfg):
+    __doc__ = "Stage 3 (2x cadence) on gait library v7. " + _V7_DOC
+    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_2x_v7.npz")
+
+
+@configclass
+class QminiWalkStage5Cadence15EnvCfg(QminiWalkStage4EnvCfg):
+    __doc__ = "Stage 4 (1.5x cadence, command_range_scale 0.75) on gait library v7. " + _V7_DOC
+    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_1p5x_v7.npz")
+
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 

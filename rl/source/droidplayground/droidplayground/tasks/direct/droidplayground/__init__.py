@@ -47,6 +47,27 @@ gym.register(
     },
 )
 
+# Walking stage 5: gait library v7 (lateral pelvis sway) at the 2x cadence
+# (from stage 3) and at the 1.5x cadence (from stage 4).
+gym.register(
+    id="DroidPlayground-QMini-Walk-Stage5",
+    entry_point=f"{__name__}.qmini_leg_env:QminiLegEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.qmini_leg_env:QminiWalkStage5EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_qmini_leg_ppo_cfg:QMiniWalkStage2PPORunnerCfg",
+    },
+)
+gym.register(
+    id="DroidPlayground-QMini-Walk-Stage5-Cadence15",
+    entry_point=f"{__name__}.qmini_leg_env:QminiLegEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.qmini_leg_env:QminiWalkStage5Cadence15EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_qmini_leg_ppo_cfg:QMiniWalkStage2PPORunnerCfg",
+    },
+)
+
 # Walking stage 4: stage 3 at the 1.5x cadence (less body roll), same commands.
 gym.register(
     id="DroidPlayground-QMini-Walk-Stage4",

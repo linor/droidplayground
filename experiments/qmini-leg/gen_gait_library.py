@@ -119,8 +119,15 @@ def solve_cycle(g, cmd, nph, signs):
 _G = _SIGNS = None
 
 
-def _worker_init():
+def _set_pelvis_style(sway, roll_scale):
+    # module-level in stylized_gait.samples so overrides.apply() (which re-runs
+    # build()) sees the same values; see samples.PELVIS_SWAY
+    SM.PELVIS_SWAY, SM.PELVIS_ROLL_SCALE = float(sway), float(roll_scale)
+
+
+def _worker_init(sway=0.0, roll_scale=1.0):
     global _G, _SIGNS
+    _set_pelvis_style(sway, roll_scale)
     _G = GO.apply(SM.build(), GP.OVERRIDES_JSON if os.path.isfile(GP.OVERRIDES_JSON) else None)
     sg, _ = EX.joint_signs_and_limits()
     _SIGNS = np.array([sg[EX.SKEL2PHYS[nm]] for nm in EX.ORDER], float)
@@ -146,7 +153,13 @@ def main():
     ap.add_argument("--extra-offset", default="",
                     help="additional stance offset per joint type in the LEFT leg's (PhysX) convention, mirrored onto the "
                          "right leg (negated), e.g. 'pitch=-7.2,knee=-5.5,ankle=-7.9,yaw=-4.0,roll=-0.55'")
+    ap.add_argument("--pelvis-sway", type=float, default=0.0,
+                    help="lateral pelvis translation toward the support foot, m (stylized_gait samples.PELVIS_SWAY); "
+                         "0 = the authored gaits")
+    ap.add_argument("--pelvis-roll-scale", type=float, default=1.0,
+                    help="scale on the authored pelvis lean toward the support foot (samples.PELVIS_ROLL_SCALE)")
     a = ap.parse_args()
+    _set_pelvis_style(a.pelvis_sway, a.pelvis_roll_scale)
 
     g = GO.apply(SM.build(), GP.OVERRIDES_JSON if os.path.isfile(GP.OVERRIDES_JSON) else None)
     sg, limits = EX.joint_signs_and_limits()
@@ -181,7 +194,7 @@ def main():
     jobs = [((ix, iy, iz), (vx, vy, wz), a.nph) for ix, vx in enumerate(VX) for iy, vy in enumerate(VY) for iz, wz in enumerate(WZ)]
     jobs += [(("check", k), c, a.nph) for k, c in enumerate(checks)]
     check_res = {}; worst_ik_cmd = None
-    with mp.Pool(a.workers, initializer=_worker_init) as pool:
+    with mp.Pool(a.workers, initializer=_worker_init, initargs=(a.pelvis_sway, a.pelvis_roll_scale)) as pool:
         for done, (key, cmd, (T, q, fh, ct, ws, ik)) in enumerate(pool.imap_unordered(_solve, jobs), 1):
             if ik > worst_ik:
                 worst_ik, worst_ik_cmd = ik, cmd
@@ -223,7 +236,8 @@ def main():
             "joint_pos_deg": "PhysX sign convention, JOINT_ORDER, stance offset applied, clipped to limits -1 deg",
             "foot_height_m": "lowest sole corner above the ground per foot (L, R), generator geometry, no offset",
             "ik_err": "worst leg-IK residual over the cycle (m or rad); > ~0.005 = target unreachable (joint limits)",
-            "smooth_sigma_samples": a.smooth_sigma, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "smooth_sigma_samples": a.smooth_sigma,
+            "pelvis_sway_m": a.pelvis_sway, "pelvis_roll_scale": a.pelvis_roll_scale, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         })),
     )
     print(f"\nwrote {a.out}  grid {shape} x {a.nph} phase samples, time scale {ts}")
