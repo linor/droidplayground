@@ -31,8 +31,11 @@ class CommandTable:
         self.axes = [list(map(float, meta_command[k])) for k in ("vx", "vy", "wz")]
         self.period = meta_command["period_s"]
         self.ik = meta_command.get("ik_err")
-        self.lo = [a[0] for a in self.axes]
-        self.hi = [a[-1] for a in self.axes]
+        # the command range the policy was trained on: the library range x
+        # the env's command_range_scale (meta "range_scale", 1.0 if absent)
+        self.range_scale = float(meta_command.get("range_scale", 1.0))
+        self.lo = [a[0] * self.range_scale for a in self.axes]
+        self.hi = [a[-1] * self.range_scale for a in self.axes]
         self.time_scale = float(meta_command.get("time_scale", 1.0))
 
     def _corners(self, cmd):

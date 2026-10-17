@@ -3249,6 +3249,32 @@ class QminiWalkStage3EnvCfg(QminiWalkStage2EnvCfg):
     body_pitch_penalty_weight: float = 60.0
 
 
+@configclass
+class QminiWalkStage4EnvCfg(QminiWalkStage3EnvCfg):
+    """Stage 4 (2026-10-17): the same commands at a faster cadence, to reduce
+    the side-to-side body roll. The stance is very wide for the robot's height
+    (0.317 m feet apart at 0.42 m base height) and there is no ankle roll, so
+    the weight shift onto the stance foot comes from rolling the body; at the
+    2x time scale each single-support phase lasts ~0.77 s. A linear inverted
+    pendulum (omega = sqrt(g / 0.42)) gives a lateral sway amplitude of
+    1 - 1/cosh(omega T_ss / 2) of the half stance width: 0.70 at 2x, 0.53 at
+    1.5x, 0.32 at 1x -> ~25 % less sway at 1.5x. 1x would need up to 10.6 deg
+    per control step from the reference alone at full speed (the robot's
+    rate limit is 10); 1.5x needs 7.0. Zero-command roll today: hardware
+    ~6 deg rms, sim ~7.
+
+    gait_library_1p5x_v6.npz = v5 (same stance offsets) at time scale 1.5:
+    period 1.65 s at zero command. The library's speed range grows with the
+    time scale (vx +-0.233, vy +-0.107, wz +-0.40), so command_range_scale
+    0.75 keeps the commands exactly those of stage 3 (+-0.175 / +-0.08 /
+    +-0.30) -- only the cadence (and so the stride) changes. Export with
+    --gait-library gait_library_1p5x_v6.npz --command-range-scale 0.75."""
+    gait_library_path: str | None = str(Path(__file__).parent / "gait_library_1p5x_v6.npz")
+    command_range_scale: float = 0.75
+    # one gait cycle at zero command (1.65 s), so the sway still cancels
+    velocity_avg_window_s: float | None = 1.65
+
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 

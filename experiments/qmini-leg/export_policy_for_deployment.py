@@ -198,6 +198,11 @@ def main():
         "does for --action-scale.",
     )
     parser.add_argument(
+        "--command-range-scale", type=float, default=1.0,
+        help="Walking: the env's command_range_scale during training (e.g. 0.75 for the 1.5x-cadence "
+             "stage-4 task). robot_deploy.py maps full stick to this fraction of the library range.",
+    )
+    parser.add_argument(
         "--gait-library", type=Path, default=None,
         help="Walking policies (DroidPlayground-QMini-Walk): the gait_library_*.npz the policy was "
              "trained with. Adds the 3 command inputs (vx, vy, wz) to the obs and embeds the command "
@@ -246,6 +251,9 @@ def main():
             "vx": [float(v) for v in lib["vx"]], "vy": [float(v) for v in lib["vy"]], "wz": [float(v) for v in lib["wz"]],
             "period_s": np.asarray(lib["period_s"], float).round(5).tolist(),   # [vx][vy][wz], trilinear
             "ik_err": np.asarray(lib["ik_err"], float).round(6).tolist() if "ik_err" in lib.files else None,
+            # = QminiLegEnvCfg.command_range_scale the policy was trained with:
+            # full stick on the robot = this fraction of the library range
+            "range_scale": float(args.command_range_scale),
         }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
