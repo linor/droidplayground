@@ -3037,6 +3037,27 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # 8 deg, so nothing discouraged it. Forward walking leans 4-6 deg.
     body_pitch_penalty_weight: float = 0.0
     body_pitch_margin_deg: float = 3.0
+    # Joint target RATE LIMIT (2026-10-18), mirroring robot_deploy.py's
+    # --max-target-step-deg: each joint's final target may move at most this
+    # far per policy step from the target actually commanded the step before
+    # (then the joint-limit clamp, same order as the deploy). None = off. The
+    # first stage-5 hardware test (1.5x cadence) capped a knee at 10 deg on
+    # nearly every swing onset (right knee 151x, left 68x in 2.5 min) -- the
+    # policy commands 11-17 deg jumps there that sim never limited, so every
+    # real swing differed from the trained one.
+    max_target_step_deg: float | None = None
+    # Body roll BIAS penalty (2026-10-18): weight * EMA(body roll)^2, roll in
+    # rad from the projected gravity, EMA time constant ~ one gait cycle. The
+    # stage-5 policy leans left on average (sim roll mean +1.1 deg at zero
+    # command, hardware +2..+2.3 deg) and the loaded left foot barely lifts
+    # (hardware 1.3 vs 5.1 cm). Zero-mean rocking is free; only a sustained
+    # lean costs.
+    roll_bias_penalty_weight: float = 0.0
+    roll_bias_tau_s: float = 1.65
+    # Per-SHAPE friction spread (2026-10-18): each collision shape's friction
+    # is the env's sampled value x uniform(1 - s, 1 + s), independently -- so
+    # the two feet differ. 0 = all shapes equal (as before).
+    friction_shape_spread: float = 0.0
 
 
 @configclass
@@ -3299,6 +3320,34 @@ class QminiWalkStage5EnvCfg(QminiWalkStage3EnvCfg):
 class QminiWalkStage5Cadence15EnvCfg(QminiWalkStage4EnvCfg):
     __doc__ = "Stage 4 (1.5x cadence, command_range_scale 0.75) on gait library v7. " + _V7_DOC
     gait_library_path: str | None = str(Path(__file__).parent / "gait_library_1p5x_v7.npz")
+
+
+@configclass
+class QminiWalkStage6EnvCfg(QminiWalkStage5Cadence15EnvCfg):
+    """Stage 6 (2026-10-18): stage 5 (v7 sway, 1.5x) + three fixes from the
+    first stage-5 hardware test (deploy_bundle_2026-10-18_walk_v7_184600):
+    - the deploy's 10 deg per-step target rate limit, trained (the knees hit it
+      at nearly every swing onset on the robot, never in sim);
+    - a body-roll BIAS penalty (the policy leans left: sim +1.1 deg, hardware
+      +2..+2.3 deg at zero command, so the loaded left foot lifts 1.3 cm vs
+      5.1 cm for the right);
+    - more left/right asymmetry in the randomization -- hip yaw / roll
+      calibration offsets +-2 deg (was 1) and +-20 % friction per collision
+      shape (each foot its own): on the robot forward walking veered LEFT at
+      0.22-0.30 rad/s (sim: right, -0.14), strafe right turned (-0.15 rad/s),
+      i.e. the yaw coupling depends on small asymmetries the policy was never
+      made to correct."""
+    max_target_step_deg: float | None = 10.0
+    # a 2 deg sustained lean costs ~0.37 per step, the 1.1 deg sim lean ~0.11
+    roll_bias_penalty_weight: float = 300.0
+    joint_zero_offset_range_deg: dict = {
+        "yaw": 2.0,
+        "roll": 2.0,
+        "pitch": 2.0,
+        "knee": 2.0,
+        "ankle": 3.0,
+    }
+    friction_shape_spread: float = 0.2
 
 
 class QminiLegEnv(DirectRLEnv):
@@ -3766,6 +3815,11 @@ class QminiLegEnv(DirectRLEnv):
         # a deploy-side diagnostic for this same symptom).
         self._prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._residual_ema = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._roll_ema = torch.zeros(self.num_envs, device=self.device)
+        # rate limit: final target commanded at the previous policy step / this one
+        self._rate_prev_targets = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._rate_last_targets = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._rate_clamped = torch.zeros(self.num_envs, self.cfg.action_space, dtype=torch.bool, device=self.device)
 
         # --- IMU realism state ---------------------------------------------
         # Per-env, per-axis gyro bias -- constant for an episode, resampled
@@ -3926,6 +3980,8 @@ class QminiLegEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
         self._actions_raw = self.actions.clone()      # for residual_bound_penalty / saturation logging
+        # rate limit reference = the target actually commanded last policy step
+        self._rate_prev_targets.copy_(self._rate_last_targets)
         if self.cfg.residual_action_clip is not None:
             self.actions.clamp_(-self.cfg.residual_action_clip, self.cfg.residual_action_clip)
         if self._gait_lib is not None:
@@ -4166,6 +4222,14 @@ class QminiLegEnv(DirectRLEnv):
         # inside the joint limits (the USD limits equal the hardware
         # min/max for all 10 joints). The penalty above keeps seeing the
         # raw target.
+        if self.cfg.max_target_step_deg is not None:
+            # = robot_deploy.py --max-target-step-deg (before the limit clamp)
+            lim = math.radians(self.cfg.max_target_step_deg)
+            prev = self._rate_prev_targets
+            limited = torch.clamp(position_targets, prev - lim, prev + lim)
+            self._rate_clamped = limited != position_targets
+            position_targets = limited
+
         if self.cfg.target_clamp_margin_deg is not None:
             limits = self.robot.data.joint_pos_limits[:, :num_actions, :]
             margin = math.radians(self.cfg.target_clamp_margin_deg)
@@ -4173,6 +4237,7 @@ class QminiLegEnv(DirectRLEnv):
             believed = position_targets - offset
             position_targets = torch.clamp(believed, limits[..., 0] + margin, limits[..., 1] - margin) + offset
 
+        self._rate_last_targets = position_targets
         self.robot.set_joint_position_target(
             position_targets,
             joint_ids=joint_ids,
@@ -4356,6 +4421,9 @@ class QminiLegEnv(DirectRLEnv):
         body_pitch = torch.asin(projected_gravity[:, 1].clamp(-1.0, 1.0))           # base +Y rear: + = leaning back
         body_pitch_excess = torch.clamp(body_pitch.abs() - math.radians(self.cfg.body_pitch_margin_deg), min=0.0)
         body_pitch_penalty = self.cfg.body_pitch_penalty_weight * body_pitch_excess ** 2
+        body_roll = torch.asin(projected_gravity[:, 0].clamp(-1.0, 1.0))
+        self._roll_ema += (self.step_dt / self.cfg.roll_bias_tau_s) * (body_roll - self._roll_ema)
+        roll_bias_penalty = self.cfg.roll_bias_penalty_weight * self._roll_ema ** 2
 
         # Foot-height swing reward -- see cfg.foot_swing_reward_weight's
         # comment for the full rationale. left/right_swing_target is how
@@ -4653,6 +4721,7 @@ class QminiLegEnv(DirectRLEnv):
             - stance_foot_flat_penalty
             - residual_bias_penalty
             - body_pitch_penalty
+            - roll_bias_penalty
         )
 
         # ---------------------------------
@@ -4678,6 +4747,10 @@ class QminiLegEnv(DirectRLEnv):
             "tracking/stance_foot_flat_penalty": stance_foot_flat_penalty.mean(),
             "tracking/residual_bias_penalty": residual_bias_penalty.mean(),
             "tracking/body_pitch_penalty": body_pitch_penalty.mean(),
+            "tracking/roll_bias_penalty": roll_bias_penalty.mean(),
+            "orientation/roll_bias_deg": torch.rad2deg(self._roll_ema).mean(),          # signed, + = leaning left
+            "orientation/abs_roll_bias_deg": torch.rad2deg(self._roll_ema.abs()).mean(),
+            "tracking/rate_clamp_frac": self._rate_clamped.float().mean(),
             "orientation/pitch_deg": torch.rad2deg(body_pitch).mean(),                # signed, + = back
             "orientation/abs_pitch_deg": torch.rad2deg(body_pitch.abs()).mean(),
             # cycle-mean residual in degrees (left convention: right negated);
@@ -4886,6 +4959,7 @@ class QminiLegEnv(DirectRLEnv):
         # from default_joint_pos" action).
         self._prev_actions[env_ids] = 0.0
         self._residual_ema[env_ids] = 0.0
+        self._roll_ema[env_ids] = 0.0
 
         # Force a fresh foot-swing stance-height capture for these envs on
         # their next _get_rewards() call -- see that flag's __init__
@@ -4906,6 +4980,8 @@ class QminiLegEnv(DirectRLEnv):
             self.robot.data.default_joint_pos[env_ids_t, :self.cfg.action_space]
             + self._joint_zero_offset_rad[env_ids_t, :self.cfg.action_space]
         )
+        # the rate limit starts from the reset pose (the deploy: the rest pose)
+        self._rate_last_targets[env_ids_t] = self._smoothed_position_targets[env_ids_t]
 
         self._randomize_action_delay(env_ids)
         self._randomize_actuator_gains(env_ids)
@@ -4958,6 +5034,9 @@ class QminiLegEnv(DirectRLEnv):
         ids = (env_ids if torch.is_tensor(env_ids) else torch.as_tensor(list(env_ids))).to(materials.device)
         n = ids.numel()
         static = sample_uniform(*self.cfg.friction_randomization_range, (n, 1), device=materials.device)
+        if self.cfg.friction_shape_spread > 0.0:
+            sp = self.cfg.friction_shape_spread
+            static = static * sample_uniform(1.0 - sp, 1.0 + sp, (n, materials.shape[1]), device=materials.device)
         dynamic = static * sample_uniform(*self.cfg.dynamic_friction_ratio_range, (n, 1), device=materials.device)
         materials[ids, :, 0] = static
         materials[ids, :, 1] = dynamic
