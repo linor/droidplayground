@@ -5038,6 +5038,13 @@ class QminiLegEnv(DirectRLEnv):
             sp = self.cfg.friction_shape_spread
             static = static * sample_uniform(1.0 - sp, 1.0 + sp, (n, materials.shape[1]), device=materials.device)
         dynamic = static * sample_uniform(*self.cfg.dynamic_friction_ratio_range, (n, 1), device=materials.device)
+        # PhysX creates one material per distinct (static, dynamic, restitution)
+        # and stops at 64K: per-shape values (friction_shape_spread) for 4096
+        # envs x ~29 shapes exceeded it ("createMaterial: limit of 64K
+        # materials reached"). Snap to a 0.01 grid, like Isaac Lab's bucketed
+        # material randomization -- at most a few thousand distinct materials.
+        static = torch.round(static * 100.0) / 100.0
+        dynamic = torch.round(dynamic * 100.0) / 100.0
         materials[ids, :, 0] = static
         materials[ids, :, 1] = dynamic
         self.robot.root_physx_view.set_material_properties(materials, ids)
