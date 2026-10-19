@@ -3058,6 +3058,31 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # is the env's sampled value x uniform(1 - s, 1 + s), independently -- so
     # the two feet differ. 0 = all shapes equal (as before).
     friction_shape_spread: float = 0.0
+    # Swing SYMMETRY penalty (2026-10-19): per foot, the running mean (EMA,
+    # ~one gait cycle) of swing_target * actual lift and of swing_target *
+    # reference lift -- lift = min(heel, toe) height above the captured stance
+    # height, uncapped -- and their ratio (how much of its reference swing
+    # each foot really lifts); weight * (ratio_L - ratio_R)^2. The capped
+    # clearance in foot_swing_reward cannot see a foot lifting 6 cm against
+    # 10 cm when both clear their targets, and as a sum it lets one foot give
+    # up its half cheaply: stage 6 lifts 10.5 / 6.0 cm (L / R, p95) with
+    # training commands, 10.7 / 6.2 walking forward, and on the robot stage
+    # 5 lifted 1.3 / 5.1 cm. Normalised by the reference, so turns / strafes
+    # with legitimately different reference heights per foot do not count.
+    swing_symmetry_penalty_weight: float = 0.0
+    swing_symmetry_tau_s: float = 1.65
+    # Per-foot stance-height capture (2026-10-19). The foot-height baseline for
+    # foot_swing_reward (and the swing symmetry) is captured once per episode,
+    # foot_swing_stance_settle_steps after the reset -- for both feet at the
+    # same moment. Walking episodes start at phase 0 = left lift-off, so step
+    # 25 is phase 0.30 at the 1.5x cadence (0.23 at 2x): the LEFT foot is
+    # still in the air, its baseline is recorded too high and its lift is
+    # under-measured for the whole episode; the policy compensates by lifting
+    # the left foot higher (stage 6: 10.5 vs 6.0 cm). True: each foot is
+    # captured separately at the first step after the settle time where the
+    # reference has it planted (< 2 mm) while the other foot swings (> 1 cm),
+    # i.e. mid single support; fallback after settle + 200 steps.
+    stance_capture_per_foot: bool = False
 
 
 @configclass
@@ -3350,6 +3375,21 @@ class QminiWalkStage6EnvCfg(QminiWalkStage5Cadence15EnvCfg):
     friction_shape_spread: float = 0.2
 
 
+@configclass
+class QminiWalkStage7EnvCfg(QminiWalkStage6EnvCfg):
+    """Stage 7 (2026-10-19): stage 6 + the swing symmetry penalty (see the
+    field). Stage 6 removed the standing lean (roll bias +0.35 deg in
+    training) and the forward veer in sim, but one foot now lifts ~40 % less
+    than the other while walking (10.5 / 6.0 cm with training commands,
+    10.7 / 6.2 forward), and foot_swing_reward slid 1.75 -> 1.55."""
+    # with stage-6 model_219500 (per-foot capture on) ratio L / R and penalty
+    # at weight 1: zero 0.85 / 1.49 (0.58), forward 3.94 / 0.75 (3.7), back
+    # 1.45 / 0.74 (0.72), turn 0.23, strafe 0.28 -> 0.5 halves that; the
+    # per-foot capture alone already removes the old left-overswing incentive
+    swing_symmetry_penalty_weight: float = 0.5
+    stance_capture_per_foot: bool = True
+
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 
@@ -3462,6 +3502,7 @@ class QminiLegEnv(DirectRLEnv):
         # literally every episode instead -- exactly what per-episode
         # startup randomization is.
         self._foot_stance_height_captured = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._foot_captured_lr = torch.zeros(self.num_envs, 2, dtype=torch.bool, device=self.device)   # cfg.stance_capture_per_foot
         # "_foot_stance_height" (no "heel"/"toe" in the name) refers to the
         # HEEL specifically, kept as-is for continuity with existing code
         # (including compare_policies_isaaclab.py, which reads these exact
@@ -3816,6 +3857,9 @@ class QminiLegEnv(DirectRLEnv):
         self._prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._residual_ema = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._roll_ema = torch.zeros(self.num_envs, device=self.device)
+        # swing symmetry: EMAs of swing_target * lift and swing_target * ref lift, (envs, L/R)
+        self._swing_lift_ema = torch.zeros(self.num_envs, 2, device=self.device)
+        self._swing_ref_ema = torch.zeros(self.num_envs, 2, device=self.device)
         # rate limit: final target commanded at the previous policy step / this one
         self._rate_prev_targets = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._rate_last_targets = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
@@ -4482,7 +4526,23 @@ class QminiLegEnv(DirectRLEnv):
         needs_capture = (~self._foot_stance_height_captured) & (
             self._steps_since_reset >= self.cfg.foot_swing_stance_settle_steps
         )
-        if needs_capture.any():
+        if self.cfg.stance_capture_per_foot:
+            ref_h = self.foot_height_motion.sample(self.motion_time)      # [L heel, L toe, R heel, R toe]
+            ref_l = torch.maximum(ref_h[:, 0], ref_h[:, 1]); ref_r = torch.maximum(ref_h[:, 2], ref_h[:, 3])
+            settled = self._steps_since_reset >= self.cfg.foot_swing_stance_settle_steps
+            late = self._steps_since_reset >= self.cfg.foot_swing_stance_settle_steps + 200
+            cap_l = (~self._foot_captured_lr[:, 0]) & settled & (((ref_l < 0.002) & (ref_r > 0.01)) | late)
+            cap_r = (~self._foot_captured_lr[:, 1]) & settled & (((ref_r < 0.002) & (ref_l > 0.01)) | late)
+            if cap_l.any():
+                self._left_foot_stance_height[cap_l] = left_heel_pos_w[cap_l, 2]
+                self._left_toe_stance_height[cap_l] = left_toe_pos_w[cap_l, 2]
+                self._foot_captured_lr[cap_l, 0] = True
+            if cap_r.any():
+                self._right_foot_stance_height[cap_r] = right_heel_pos_w[cap_r, 2]
+                self._right_toe_stance_height[cap_r] = right_toe_pos_w[cap_r, 2]
+                self._foot_captured_lr[cap_r, 1] = True
+            self._foot_stance_height_captured = self._foot_captured_lr.all(dim=1)
+        elif needs_capture.any():
             self._left_foot_stance_height[needs_capture] = left_heel_pos_w[needs_capture, 2]
             self._right_foot_stance_height[needs_capture] = right_heel_pos_w[needs_capture, 2]
             self._left_toe_stance_height[needs_capture] = left_toe_pos_w[needs_capture, 2]
@@ -4519,6 +4579,19 @@ class QminiLegEnv(DirectRLEnv):
             self.cfg.foot_swing_left_weight * left_swing_target * left_clearance
             + self.cfg.foot_swing_right_weight * right_swing_target * right_clearance
         )
+        # swing symmetry (cfg.swing_symmetry_penalty_weight)
+        lift = torch.stack((torch.minimum(left_heel_height, left_toe_height),
+                            torch.minimum(right_heel_height, right_toe_height)), 1).clamp(min=0.0)
+        ref_lift = torch.stack((torch.minimum(target_left_heel, target_left_toe),
+                                torch.minimum(target_right_heel, target_right_toe)), 1)
+        sw = torch.stack((left_swing_target, right_swing_target), 1)
+        a_sw = (self.step_dt / self.cfg.swing_symmetry_tau_s) * self._foot_stance_height_captured.float().unsqueeze(1)
+        self._swing_lift_ema += a_sw * (sw * lift - self._swing_lift_ema)
+        self._swing_ref_ema += a_sw * (sw * ref_lift - self._swing_ref_ema)
+        swing_ratio = self._swing_lift_ema / self._swing_ref_ema.clamp(min=1e-4)
+        swing_valid = (self._swing_ref_ema > 3e-4).all(dim=1)       # both feet have swung recently
+        swing_asym = torch.where(swing_valid, (swing_ratio[:, 0] - swing_ratio[:, 1]).clamp(-2.0, 2.0), torch.zeros_like(swing_ratio[:, 0]))
+        swing_symmetry_penalty = self.cfg.swing_symmetry_penalty_weight * swing_asym ** 2
         # Withhold entirely during the push-recovery cooldown window -- see
         # cfg.foot_swing_push_cooldown_steps' comment for why. Per-env now
         # (see cfg.push_interval_range_s's comment) -- pushes no longer
@@ -4722,6 +4795,7 @@ class QminiLegEnv(DirectRLEnv):
             - residual_bias_penalty
             - body_pitch_penalty
             - roll_bias_penalty
+            - swing_symmetry_penalty
         )
 
         # ---------------------------------
@@ -4748,6 +4822,10 @@ class QminiLegEnv(DirectRLEnv):
             "tracking/residual_bias_penalty": residual_bias_penalty.mean(),
             "tracking/body_pitch_penalty": body_pitch_penalty.mean(),
             "tracking/roll_bias_penalty": roll_bias_penalty.mean(),
+            "tracking/swing_symmetry_penalty": swing_symmetry_penalty.mean(),
+            "motion/swing_ratio_left": swing_ratio[:, 0][swing_valid].mean() if swing_valid.any() else torch.zeros((), device=self.device),
+            "motion/swing_ratio_right": swing_ratio[:, 1][swing_valid].mean() if swing_valid.any() else torch.zeros((), device=self.device),
+            "motion/abs_swing_asym": swing_asym.abs()[swing_valid].mean() if swing_valid.any() else torch.zeros((), device=self.device),
             "orientation/roll_bias_deg": torch.rad2deg(self._roll_ema).mean(),          # signed, + = leaning left
             "orientation/abs_roll_bias_deg": torch.rad2deg(self._roll_ema.abs()).mean(),
             "tracking/rate_clamp_frac": self._rate_clamped.float().mean(),
@@ -4960,6 +5038,8 @@ class QminiLegEnv(DirectRLEnv):
         self._prev_actions[env_ids] = 0.0
         self._residual_ema[env_ids] = 0.0
         self._roll_ema[env_ids] = 0.0
+        self._swing_lift_ema[env_ids] = 0.0
+        self._swing_ref_ema[env_ids] = 0.0
 
         # Force a fresh foot-swing stance-height capture for these envs on
         # their next _get_rewards() call -- see that flag's __init__
@@ -4970,6 +5050,7 @@ class QminiLegEnv(DirectRLEnv):
         # directly (mirrors _randomize_base_mass's same env_ids handling).
         env_ids_t = env_ids if torch.is_tensor(env_ids) else torch.as_tensor(list(env_ids), device=self.device)
         self._foot_stance_height_captured[env_ids_t] = False
+        self._foot_captured_lr[env_ids_t] = False
         self._steps_since_reset[env_ids_t] = 0
 
         # Reset EMA smoothing state to this pipeline's own anchor pose (see

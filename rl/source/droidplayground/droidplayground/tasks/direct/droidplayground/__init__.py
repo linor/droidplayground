@@ -68,6 +68,17 @@ gym.register(
     },
 )
 
+# Walking stage 7: stage 6 + a left/right swing symmetry penalty.
+gym.register(
+    id="DroidPlayground-QMini-Walk-Stage7",
+    entry_point=f"{__name__}.qmini_leg_env:QminiLegEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.qmini_leg_env:QminiWalkStage7EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_qmini_leg_ppo_cfg:QMiniWalkStage2PPORunnerCfg",
+    },
+)
+
 # Walking stage 6: stage 5 (1.5x, v7) + the deploy's rate limit, a roll-bias
 # penalty and more left/right asymmetry in the randomization.
 gym.register(
