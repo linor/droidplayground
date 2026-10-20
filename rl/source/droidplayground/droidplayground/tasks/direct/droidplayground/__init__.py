@@ -68,6 +68,17 @@ gym.register(
     },
 )
 
+# Walking stage 8: stage 7 with foot heights from the ground (no stance capture).
+gym.register(
+    id="DroidPlayground-QMini-Walk-Stage8",
+    entry_point=f"{__name__}.qmini_leg_env:QminiLegEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.qmini_leg_env:QminiWalkStage8EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_qmini_leg_ppo_cfg:QMiniWalkStage2PPORunnerCfg",
+    },
+)
+
 # Walking stage 7: stage 6 + a left/right swing symmetry penalty.
 gym.register(
     id="DroidPlayground-QMini-Walk-Stage7",

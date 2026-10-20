@@ -3083,6 +3083,17 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # reference has it planted (< 2 mm) while the other foot swings (> 1 cm),
     # i.e. mid single support; fallback after settle + 200 steps.
     stance_capture_per_foot: bool = False
+    # GROUND baseline (2026-10-20): measure the foot heights for
+    # foot_swing_reward / the swing symmetry from the (flat, z = env origin)
+    # ground instead of a captured "stance height". Any snapshot capture is
+    # fragile with the soft soles: a loaded heel sinks up to ~16 mm in single
+    # support, and how far depends on the lean at that instant -- stage 7
+    # captured the left heel at -17.9 mm while it stands at -4..-10, so the
+    # left lift read ~1 cm too high (swing ratio L 1.8 vs R 1.25) while the
+    # left foot barely swung (heel -2..-10 mm during its reference swing,
+    # right +25..+38). From the ground a planted foot reads ~0 (or slightly
+    # negative, clamped), a swinging one its true height, the same for both.
+    stance_height_from_ground: bool = False
 
 
 @configclass
@@ -3388,6 +3399,18 @@ class QminiWalkStage7EnvCfg(QminiWalkStage6EnvCfg):
     # per-foot capture alone already removes the old left-overswing incentive
     swing_symmetry_penalty_weight: float = 0.5
     stance_capture_per_foot: bool = True
+
+
+@configclass
+class QminiWalkStage8EnvCfg(QminiWalkStage7EnvCfg):
+    """Stage 8 (2026-10-20): stage 7 with foot heights measured from the
+    ground (stance_height_from_ground) instead of the per-foot capture, which
+    read the left lift ~1 cm too high and let the swing symmetry penalty push
+    the left foot DOWN: stage 7 lifts the left foot least of all (whole-foot
+    p95, training commands: L 2.4 vs R 6.7 cm; stage 5 4.4 vs 6.7). The swing
+    symmetry penalty (0.5) stays and now measures the real lift."""
+    stance_capture_per_foot: bool = False
+    stance_height_from_ground: bool = True
 
 
 class QminiLegEnv(DirectRLEnv):
@@ -4526,7 +4549,13 @@ class QminiLegEnv(DirectRLEnv):
         needs_capture = (~self._foot_stance_height_captured) & (
             self._steps_since_reset >= self.cfg.foot_swing_stance_settle_steps
         )
-        if self.cfg.stance_capture_per_foot:
+        if self.cfg.stance_height_from_ground:
+            g = self.scene.env_origins[:, 2]
+            self._left_foot_stance_height[:] = g; self._right_foot_stance_height[:] = g
+            self._left_toe_stance_height[:] = g; self._right_toe_stance_height[:] = g
+            settled = self._steps_since_reset >= self.cfg.foot_swing_stance_settle_steps
+            self._foot_stance_height_captured = settled
+        elif self.cfg.stance_capture_per_foot:
             ref_h = self.foot_height_motion.sample(self.motion_time)      # [L heel, L toe, R heel, R toe]
             ref_l = torch.maximum(ref_h[:, 0], ref_h[:, 1]); ref_r = torch.maximum(ref_h[:, 2], ref_h[:, 3])
             settled = self._steps_since_reset >= self.cfg.foot_swing_stance_settle_steps
