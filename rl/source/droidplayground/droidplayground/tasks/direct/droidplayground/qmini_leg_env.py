@@ -3094,6 +3094,18 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # right +25..+38). From the ground a planted foot reads ~0 (or slightly
     # negative, clamped), a swinging one its true height, the same for both.
     stance_height_from_ground: bool = False
+    # Knee swing-target anchor (2026-10-20). Walking mode took each leg's
+    # "stance" knee from the library at phase 0 and its "swing extreme" as the
+    # direction the knee moves farthest from there. Phase 0 is the LEFT
+    # lift-off, so the left knee is already bent: for the 1.5x v7 library left
+    # 10.5 deg with a cycle range of 1.8..17.6, the farthest direction is
+    # straightening (1.8) -- the left swing target was active during the left
+    # STANCE / push-off (77 % of the cycle) and ~0 in its real swing, while
+    # the right one (-8.9 -> -17.6) was right. foot_swing_reward never paid
+    # for the left swing. True: each leg's stance knee is taken at the middle
+    # of its own stance (the other foot's highest reference point) --
+    # mirror-exact, +-7.4 -> +-17.6 for v7 1.5x.
+    swing_target_mid_stance: bool = False
 
 
 @configclass
@@ -3411,6 +3423,16 @@ class QminiWalkStage8EnvCfg(QminiWalkStage7EnvCfg):
     symmetry penalty (0.5) stays and now measures the real lift."""
     stance_capture_per_foot: bool = False
     stance_height_from_ground: bool = True
+
+
+@configclass
+class QminiWalkStage9EnvCfg(QminiWalkStage8EnvCfg):
+    """Stage 9 (2026-10-20): stage 8 with the knee swing target anchored at
+    each leg's mid stance (swing_target_mid_stance): the left leg's swing
+    target was active in its stance and ~0 in its swing (see the field), so
+    the left swing was never rewarded -- stage 8 at +4k still lifts the left
+    foot 3.8 vs 6.6 cm (whole foot, training conditions)."""
+    swing_target_mid_stance: bool = True
 
 
 class QminiLegEnv(DirectRLEnv):
@@ -3784,8 +3806,16 @@ class QminiLegEnv(DirectRLEnv):
             self.robot.data.default_joint_pos[:, :nj] = stance.unsqueeze(0)
             cycle = self._gait_lib.joint_ref(zero_cmd.expand(self._gait_lib.nph, 3),
                                              torch.arange(self._gait_lib.nph, device=self.device) / self._gait_lib.nph).cpu()
-            self._left_knee_stance_rad = float(stance[left_knee_idx])
-            self._right_knee_stance_rad = float(stance[right_knee_idx])
+            if self.cfg.swing_target_mid_stance:
+                ph = torch.arange(self._gait_lib.nph, device=self.device) / self._gait_lib.nph
+                feet = self._gait_lib.foot_ref(zero_cmd.expand(self._gait_lib.nph, 3), ph).cpu()   # [L heel, L toe, R heel, R toe]
+                left_mid_stance = int(torch.argmax(feet[:, 2]))      # right foot highest
+                right_mid_stance = int(torch.argmax(feet[:, 0]))     # left foot highest
+                self._left_knee_stance_rad = float(cycle[left_mid_stance, left_knee_idx])
+                self._right_knee_stance_rad = float(cycle[right_mid_stance, right_knee_idx])
+            else:
+                self._left_knee_stance_rad = float(stance[left_knee_idx])
+                self._right_knee_stance_rad = float(stance[right_knee_idx])
             self._left_knee_swing_extreme_rad = _swing_extreme(cycle[:, left_knee_idx], self._left_knee_stance_rad)
             self._right_knee_swing_extreme_rad = _swing_extreme(cycle[:, right_knee_idx], self._right_knee_stance_rad)
             print(f"[QminiLegEnv] WALKING: reset pose = library stance (deg) "
