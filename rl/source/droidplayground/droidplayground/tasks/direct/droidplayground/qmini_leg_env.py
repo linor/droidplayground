@@ -3054,6 +3054,15 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # lean costs.
     roll_bias_penalty_weight: float = 0.0
     roll_bias_tau_s: float = 1.65
+    # Body roll ROCKING penalty (2026-10-21): weight * (|roll - EMA(roll)| -
+    # margin)^2, the EMA being roll_bias_tau_s's, so a sustained lean is left
+    # to the bias penalty and rocking up to the margin is free (lifting a foot
+    # on the rounded soles needs some). Stage 9 lifts both feet (7.0 / 7.3 cm)
+    # but rocks roll rms 5.3-7.5 deg in sim vs 3.6-5.2 for v7_184600 (which
+    # barely lifted the left foot); falls doubled (0.059 -> 0.113 per
+    # env-minute), mostly sideways during turns.
+    roll_rock_penalty_weight: float = 0.0
+    roll_rock_margin_deg: float = 3.0
     # Per-SHAPE friction spread (2026-10-18): each collision shape's friction
     # is the env's sampled value x uniform(1 - s, 1 + s), independently -- so
     # the two feet differ. 0 = all shapes equal (as before).
@@ -3433,6 +3442,21 @@ class QminiWalkStage9EnvCfg(QminiWalkStage8EnvCfg):
     the left swing was never rewarded -- stage 8 at +4k still lifts the left
     foot 3.8 vs 6.6 cm (whole foot, training conditions)."""
     swing_target_mid_stance: bool = True
+
+
+@configclass
+class QminiWalkStage10EnvCfg(QminiWalkStage9EnvCfg):
+    """Stage 10 (2026-10-21): stage 9 + the roll ROCKING penalty (see
+    roll_rock_penalty_weight). Stage 9 fixed the left foot, but the sideways
+    rocking came back with it (sim roll rms 5.3-7.5 deg, falls 0.113 per
+    env-minute vs 0.059 for v7_184600). A resume on stage-9 model_304599, so
+    the weight is small; watch foot_swing_reward / swing ratios for the
+    "barely steps so barely tilts" trap."""
+    # model_304599 at weight 100: mean |roll - average| 5.1-6.3 deg, penalty
+    # 0.50 zero / 0.61 forward / 0.66 turn / 0.41 strafe (foot_swing_reward
+    # 2.3-3.4) -> 50 keeps the jump small, ~0.2-0.33 per step
+    roll_rock_penalty_weight: float = 50.0
+    roll_rock_margin_deg: float = 3.0
 
 
 class QminiLegEnv(DirectRLEnv):
@@ -4521,6 +4545,9 @@ class QminiLegEnv(DirectRLEnv):
         body_roll = torch.asin(projected_gravity[:, 0].clamp(-1.0, 1.0))
         self._roll_ema += (self.step_dt / self.cfg.roll_bias_tau_s) * (body_roll - self._roll_ema)
         roll_bias_penalty = self.cfg.roll_bias_penalty_weight * self._roll_ema ** 2
+        roll_rock = (body_roll - self._roll_ema).abs()
+        roll_rock_excess = torch.clamp(roll_rock - math.radians(self.cfg.roll_rock_margin_deg), min=0.0)
+        roll_rock_penalty = self.cfg.roll_rock_penalty_weight * roll_rock_excess ** 2
 
         # Foot-height swing reward -- see cfg.foot_swing_reward_weight's
         # comment for the full rationale. left/right_swing_target is how
@@ -4854,6 +4881,7 @@ class QminiLegEnv(DirectRLEnv):
             - residual_bias_penalty
             - body_pitch_penalty
             - roll_bias_penalty
+            - roll_rock_penalty
             - swing_symmetry_penalty
         )
 
@@ -4887,6 +4915,8 @@ class QminiLegEnv(DirectRLEnv):
             "motion/abs_swing_asym": swing_asym.abs()[swing_valid].mean() if swing_valid.any() else torch.zeros((), device=self.device),
             "orientation/roll_bias_deg": torch.rad2deg(self._roll_ema).mean(),          # signed, + = leaning left
             "orientation/abs_roll_bias_deg": torch.rad2deg(self._roll_ema.abs()).mean(),
+            "tracking/roll_rock_penalty": roll_rock_penalty.mean(),
+            "orientation/roll_rock_deg": torch.rad2deg(roll_rock).mean(),               # mean |roll - its cycle average|
             "tracking/rate_clamp_frac": self._rate_clamped.float().mean(),
             "orientation/pitch_deg": torch.rad2deg(body_pitch).mean(),                # signed, + = back
             "orientation/abs_pitch_deg": torch.rad2deg(body_pitch.abs()).mean(),
