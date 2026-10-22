@@ -583,6 +583,15 @@ class QminiLegEnvCfg(DirectRLEnvCfg):
     # materials); None = rigid contact.
     foot_contact_stiffness: float | None = 4000.0
     foot_contact_damping_ratio: float = 0.5
+    # Per joint-type scale on the nominal (qmini.py DEFAULT_GAINS) actuator
+    # STIFFNESS, applied before gain_randomization_range (2026-10-22). The
+    # real joints track worse than the sim at the same kp: zero-command
+    # |actual - target| (hardware, one-step aligned) yaw 0.7-1.1 / roll
+    # 1.0-1.2 / pitch 1.6-2.0 / knee 4.3-4.7 / ankle 2.4-2.7 deg vs sim
+    # 0.3-0.4 / 0.7-0.8 / 1.1-1.3 / 3.6-4.4 / 1.5-1.8. Deploy gains stay
+    # as they are: this models the real effective softness (printed parts,
+    # friction, motor behaviour), it is not a gain change. None = off.
+    actuator_stiffness_scale: dict | None = None
 
     # Push disturbances: every push_interval_range_s (independently
     # randomized and re-randomized per env, see that cfg's comment for why
@@ -3459,6 +3468,29 @@ class QminiWalkStage10EnvCfg(QminiWalkStage9EnvCfg):
     roll_rock_margin_deg: float = 3.0
 
 
+@configclass
+class QminiWalkStage11EnvCfg(QminiWalkStage10EnvCfg):
+    """Stage 11 (2026-10-22): stage 10 on a sim fitted to the stage-10
+    hardware test (control_loop_20261022_145225 / 150058). On the robot the
+    loaded foot barely lifts (zero command: L 4.9-5.6 / R 2.4 cm, 95 % of
+    the cycles one-sided, corr(cycle lean, L-R lift) -0.9) because the body
+    does not shift its weight off the swing foot (roll at phase 0.60 ~0 deg,
+    sim +7.5; roll rms 3.4-3.7 vs sim 5.3, only 4-12 % of it at the gait
+    frequency vs sim 56 %). The same policy in this sim (stiffer soles +
+    softer joints, fitted to the hardware tracking errors) shows that
+    failure: roll rms 3.2, 15 % at 1x, roll at 0.60 -0.7, lift L 3.6 / R
+    2.6 cm, 19 % one-sided cycles, joint errors within ~0.3 deg of the
+    hardware. Resume on stage-10 model_330700."""
+    foot_contact_stiffness: float | None = 8000.0
+    actuator_stiffness_scale: dict | None = {
+        "yaw": 0.5,
+        "roll": 0.6,
+        "pitch": 0.6,
+        "knee": 0.9,
+        "ankle": 0.55,
+    }
+
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 
@@ -4015,6 +4047,11 @@ class QminiLegEnv(DirectRLEnv):
                 "damping": actuator.damping.clone(),
                 "armature": actuator.armature.clone(),
             }
+            for col, joint_name in enumerate(actuator.joint_names):
+                for suffix, scale in (self.cfg.actuator_stiffness_scale or {}).items():
+                    if joint_name.endswith(suffix):
+                        self._default_actuator_gains[name]["stiffness"][:, col] *= scale
+            actuator.stiffness[:] = self._default_actuator_gains[name]["stiffness"]
 
         # all_env_ids = torch.arange(
         #     self.num_envs,
