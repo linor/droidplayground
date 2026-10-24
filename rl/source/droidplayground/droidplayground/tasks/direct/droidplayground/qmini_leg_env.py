@@ -3491,6 +3491,36 @@ class QminiWalkStage11EnvCfg(QminiWalkStage10EnvCfg):
     }
 
 
+@configclass
+class QminiWalkStage12EnvCfg(QminiWalkStage11EnvCfg):
+    """Stage 12 (2026-10-24): stage 11 refitted to the RESPONSE GAIN per joint
+    (slope of actual(i+1) on target(i), zero command) instead of the
+    tracking error, which overstated the softness of the hip joints. On the
+    stage-11 hardware test (control_loop_20261024_163553) the real hip pitch
+    followed the policy's enlarged commands with gain 0.77 (stage-11 sim
+    0.53-0.56), so the robot over-moved: roll rms 4.5 at zero command, 8-9
+    turning (stage 10: 3-4 / 5-6), falls backwards when stepping in place.
+    Hardware gains (3 runs, 2 policies) yaw 0.22-0.41 / roll 0.76-0.84 /
+    pitch 0.67-0.84 / knee 0.45-0.55 / ankle 0.04-0.29; this sim with the
+    stage-10 / stage-11 policies: yaw 0.35-0.74 / roll 0.76-0.82 / pitch
+    0.77-0.90 / knee 0.41-0.48 / ankle 0.07-0.21. It reproduces the
+    stage-10 failure (zero command: lift L 5.1 / R 3.1 cm, hw 5.5 / 2.5;
+    roll at phase 0.60 -0.1, hw ~0; roll rms 3.4, hw 3.1-3.7) but is still
+    kinder to stage 11 than the robot (roll at 0.60 +7.7 vs hw +2.7). Hip
+    yaw is friction-like on the robot (low gain at any amplitude, right
+    weaker than left), which a stiffness scale does not capture. Resume on
+    stage-11 model_372899; roll_rock_penalty_weight halved because stage 11
+    slid into "lift less to rock less" at 50 before recovering."""
+    actuator_stiffness_scale: dict | None = {
+        "yaw": 0.4,
+        "roll": 0.85,
+        "pitch": 1.0,
+        "knee": 0.9,
+        "ankle": 0.45,
+    }
+    roll_rock_penalty_weight: float = 25.0
+
+
 class QminiLegEnv(DirectRLEnv):
     cfg: QminiLegEnvCfg
 
