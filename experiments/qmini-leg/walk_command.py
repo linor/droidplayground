@@ -78,7 +78,7 @@ class CommandTable:
 
 
 class CommandInput:
-    """Left stick: forward/back + strafe, right stick X: turn. Full deflection
+    """Left stick: forward/back + turn, right stick X: strafe. Full deflection
     = the library maximum in that direction. The output command ramps toward
     the stick target at COMMAND_RAMP_RATE (what the policy was trained with)."""
 
@@ -94,7 +94,7 @@ class CommandInput:
         if self.pad and connected and not self.hold_zero:
             lx, ly = gp.deadzone2(self.pad.axis(gp.AXIS_LX), self.pad.axis(gp.AXIS_LY), 0.12)
             rx = gp.deadzone(self.pad.axis(gp.AXIS_RX), 0.14)
-            fwd, left, ccw = -ly, -lx, -rx          # stick up = forward, left = left, right stick left = CCW
+            fwd, ccw, left = -ly, -lx, -rx          # left stick up = forward, left stick left = CCW, right stick left = left
             pick = lambda u, k: u * (self.table.hi[k] if u > 0 else -self.table.lo[k])
             self.target = self.table.clamp([pick(fwd, 0), pick(left, 1), pick(ccw, 2)])
         else:

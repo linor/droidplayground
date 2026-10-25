@@ -1395,20 +1395,30 @@ class Deployment:
         sys.stdin.readline()
         return True
 
-    def _hold_and_ask(self, targets: dict, question: str):
+    def _hold_and_ask(self, targets: dict, question: str, pad_answer: Optional[str] = None):
         """Keeps commanding `targets` every control step (with the usual limit
         and motor checks) while waiting for an answer on the terminal, instead
         of a blocking input(): Ctrl+C still works here (the SIGINT handler only
         sets self._stop, which a blocking input() would never look at).
+        pad_answer: if set (walking), a gamepad B or A press answers with it.
         Returns (answer or None on Ctrl+C/SIGTERM, last readings)."""
         dt = self.robot_cfg.control_dt
         print(question, end="", flush=True)
+        pad = self.cmd_input.pad if (pad_answer is not None and self.walking) else None
+        if pad is not None:
+            # drop presses from before the hold (the B that started the soft stop)
+            pad.poll(); pad.pressed(gp.BTN_B); pad.pressed(gp.BTN_A)
         readings = {}
         while not self._stop:
             step_start = time.perf_counter()
             self._validate_targets_all(targets, self.robot_cfg.max_step_deg)
             readings = self._send_targets_all(targets)
             check_motor_safety(readings, self.robot_cfg.motor_temp_limit_c)
+            if pad is not None and pad.poll():
+                b, a = pad.pressed(gp.BTN_B), pad.pressed(gp.BTN_A)
+                if b or a:
+                    print(f"[pad {'B' if b else 'A'}]", flush=True)
+                    return pad_answer, readings
             ready, _, _ = select.select([sys.stdin], [], [], 0)
             if ready:
                 return sys.stdin.readline().strip().lower(), readings
@@ -1426,7 +1436,8 @@ class Deployment:
                           label="rest", tilt_guard=True)
         answer, readings = self._hold_and_ask(
             self.rest_pose_rad,
-            "Soft stop: holding the rest pose. Release motors? [Y/n] (n = start the policy again) ",
+            "Soft stop: holding the rest pose. Release motors? [Y/n] (n or gamepad B/A = start the policy again) ",
+            pad_answer="n",
         )
         if answer is None or answer in ("", "y", "yes"):
             self.logger.info("Soft stop finished, releasing motors.")
@@ -1598,8 +1609,9 @@ class Deployment:
             print("Policy running.  Enter = soft stop (finish the step, back to the rest pose)   "
                   "Ctrl+C = immediate stop (motors off)", flush=True)
             if self.walking:
-                print("Gamepad: left stick = forward/back + strafe, right stick = turn, B = soft stop "
-                      "(the command ramps to zero first)", flush=True)
+                print("Gamepad: left stick = forward/back + turn, right stick = strafe, B = soft stop "
+                      "(the command ramps to zero first), B or A while holding the rest pose = start again",
+                      flush=True)
                 self.cmd_input.pad.poll()
                 self.cmd_input.pad.pressed(gp.BTN_B)      # drop a B press from before the start
             status_due = run_start + 1.0
